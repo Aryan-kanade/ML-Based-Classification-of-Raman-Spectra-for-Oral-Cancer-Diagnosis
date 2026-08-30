@@ -1358,6 +1358,40 @@ class MainWindow(QtWidgets.QMainWindow):
             "patient's own normal (Dieterle 2006).")
         cv.addWidget(self.combo_mode)
         cv.addSpacing(4)
+        # ---- 3SSE card: run button + live search status ----------------
+        seq_card, scv = self.card(
+            "3SSE — sequential architecture search",
+            "Screens every chain (single → 2-model → 3-model), then "
+            "nested-validates the top 20 per level; the overall winner "
+            "becomes THE trained model (Save → Predict like any "
+            "training).")
+        self.seq_card = seq_card
+        self.seq_counts = QtWidgets.QLabel("")
+        self.seq_counts.setObjectName("CardHint")
+        self.seq_counts.setWordWrap(True)
+        scv.addWidget(self.seq_counts)
+        self.b_3sse_run = QtWidgets.QPushButton(
+            "Run 3SSE architecture search now")
+        self.b_3sse_run.setObjectName("Primary")
+        self.b_3sse_run.setToolTip(
+            "Runs the full search on the loaded data with the checked "
+            "models (paired data when patient groups exist, standard "
+            "otherwise). Takes a while — progress is shown below and "
+            "the app stays responsive.")
+        self.b_3sse_run.clicked.connect(self.run_3sse_now)
+        scv.addWidget(self.b_3sse_run)
+        self.seq_counter = QtWidgets.QLabel("")
+        self.seq_counter.setStyleSheet(
+            "font-size:15pt; font-weight:700; color:#312e81;")
+        self.seq_phase = QtWidgets.QLabel(
+            "Ready — press Run (or pick a 3SSE mode and Start training).")
+        self.seq_phase.setObjectName("CardHint")
+        self.seq_best = QtWidgets.QLabel("")
+        self.seq_best.setWordWrap(True)
+        self.seq_best.setStyleSheet("color:#475569;")
+        scv.addWidget(self.seq_counter)
+        scv.addWidget(self.seq_phase)
+        scv.addWidget(self.seq_best)
         self.b_3sse_view = QtWidgets.QPushButton(
             "View saved 3SSE results (last architecture search)…")
         self.b_3sse_view.setFlat(True)
@@ -1366,32 +1400,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "and the overall winner) of the last completed 3SSE search "
             "in study_run_3sse/ — no re-run needed.")
         self.b_3sse_view.clicked.connect(self.view_saved_3sse)
-        cv.addWidget(self.b_3sse_view)
-        cv.addSpacing(4)
-        # ---- 3SSE status card (visible only for 3SSE modes) ----------
-        seq_card, scv = self.card(
-            "3SSE — sequential architecture search",
-            "Start training screens every chain, then nested-validates "
-            "the top 20 per level; the overall winner becomes THE "
-            "trained model (Save → Predict like any training).")
-        self.seq_card = seq_card
-        self.seq_counts = QtWidgets.QLabel("")
-        self.seq_counts.setObjectName("CardHint")
-        self.seq_counts.setWordWrap(True)
-        scv.addWidget(self.seq_counts)
-        self.seq_counter = QtWidgets.QLabel("0 / 0")
-        self.seq_counter.setStyleSheet(
-            "font-size:17pt; font-weight:700; color:#312e81;")
-        self.seq_phase = QtWidgets.QLabel("Ready — press Start training.")
-        self.seq_phase.setObjectName("CardHint")
-        self.seq_best = QtWidgets.QLabel("")
-        self.seq_best.setWordWrap(True)
-        self.seq_best.setStyleSheet("color:#475569;")
-        scv.addWidget(self.seq_counter)
-        scv.addWidget(self.seq_phase)
-        scv.addWidget(self.seq_best)
+        scv.addWidget(self.b_3sse_view)
         cv.addWidget(seq_card)
-        seq_card.hide()
         self.combo_mode.currentIndexChanged.connect(
             self._update_seq_card)
         cv.addSpacing(4)
@@ -1407,6 +1417,7 @@ class MainWindow(QtWidgets.QMainWindow):
             grid.addWidget(cb, i // 2, i % 2)
             cb.toggled.connect(self._update_seq_card)
         cv.addLayout(grid)
+        self._update_seq_card()               # initial counts
         sel_row = QtWidgets.QHBoxLayout()
         b_all = QtWidgets.QPushButton("All")
         b_all.setFlat(True)
@@ -4904,24 +4915,47 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ================================================== 3SSE handlers
     def _update_seq_card(self, *_args):
-        """Show/hide the 3SSE card and refresh the architecture counts
-        for the currently checked models."""
-        on = self.combo_mode.currentIndex() >= 3
-        self.seq_card.setVisible(on)
-        if not on:
-            return
+        """Refresh the 3SSE card's architecture counts for the
+        currently checked models (card is always visible)."""
         checked = [n for n, cb in self.model_checks.items()
                    if cb.isChecked()]
         base = [n for n in checked if n != "Ensemble (top-3)"]
         n = len(base) + (1 if "Ensemble (top-3)" in checked else 0)
         n = max(n, 2)
         singles, pairs, triples = n, n * (n - 1), n * (n - 1) * (n - 2)
+        data_note = ("paired data" if self.groups is not None
+                     else "standard data (no patient groups loaded)")
         self.seq_counts.setText(
             f"Search space: {singles:,} single models · "
             f"{pairs:,} two-model chains · {triples:,} three-model "
             f"chains = {singles + pairs + triples:,} architectures "
-            "(ordered, no repeats; probabilities chained between "
-            "layers, patient-grouped OOF).")
+            f"(ordered, no repeats; probabilities chained between "
+            f"layers, patient-grouped OOF). Will run on {data_note}.")
+
+    def run_3sse_now(self):
+        """Run button: pick the right 3SSE mode for the loaded data and
+        start the search through the normal Start-training path."""
+        if not self.spectra:
+            QtWidgets.QMessageBox.information(
+                self, "No data yet",
+                "Load a spectra folder (or generate the demo dataset) "
+                "first — use the Start page.")
+            self.go_to(TAB_START)
+            return
+        if (self._seq_worker is not None
+                and self._seq_worker.isRunning()):
+            QtWidgets.QMessageBox.information(
+                self, "3SSE search already running",
+                "An architecture search is in progress — watch the "
+                "counter in this card; results open automatically.")
+            return
+        # paired whenever patient groups exist; the dropdown reflects it
+        self.combo_mode.setCurrentIndex(4 if self.groups is not None
+                                        else 3)
+        self.seq_counter.setText("0")
+        self.seq_phase.setText("Phase: screening — starting…")
+        self.seq_best.setText("")
+        self.start_training()
 
     def on_seq_search_progress(self, done: int, total: int, best: str,
                                f1: float, eta: float):

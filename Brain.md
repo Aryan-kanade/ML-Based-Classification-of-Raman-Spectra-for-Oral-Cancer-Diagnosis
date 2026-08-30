@@ -547,7 +547,13 @@ are possible and documented.
   "View saved 3SSE results…" opens the last run from
   `study_run_3sse/` (screening.jsonl + validated.json + winner.json;
   report.txt fallback) — save-button disabled for loaded runs (no
-  in-memory chain; winner.joblib already exists).
+  in-memory chain; winner.joblib already exists). The card is ALWAYS
+  visible and carries the primary **"Run 3SSE architecture search
+  now"** button (`run_3sse_now`): guards data + busy state, auto-picks
+  paired (groups present) vs standard 3SSE mode in the dropdown, then
+  calls `start_training()`. NOTE: ad-hoc driver scripts that call
+  `sequential.search` must live IN raman_app (loky main-module
+  pickling from a $TEMP __main__ segfaults; main.py is unaffected).
 - Tests (in test_all.py): space counts/order/no-repeats, search smoke,
   chain + joblib roundtrip for 1/2/3 layers, OOF-leakage probe
   (patient-unique offsets: in-sample ≈1, grouped OOF ≪ 1).
