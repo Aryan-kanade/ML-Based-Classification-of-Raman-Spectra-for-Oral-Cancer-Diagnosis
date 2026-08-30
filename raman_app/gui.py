@@ -1469,12 +1469,15 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl, cv = self.card("Controls")
         cv.addWidget(QtWidgets.QLabel("Classification mode:"))
         self.combo_mode = QtWidgets.QComboBox()
-        self.combo_mode.addItems([
-            "Standard — each spectrum independently",
-            "Margin mode — vs patient's own normal",
-            "Margin + PQN — scale-corrected (Dieterle 2006)",
-            "3SSE search — sequential stacking (standard data)",
-            "3SSE search — sequential stacking (paired data)"])
+        for label, role in (
+                ("Standard", "standard"),
+                ("Margin — vs patient's own normal", "paired"),
+                ("Margin + PQN (Dieterle 2006)", "paired-pqn"),
+                ("3SSE architecture search (standard data)",
+                 "seq-standard"),
+                ("3SSE architecture search (paired data)", "seq-paired")):
+            self.combo_mode.addItem(label, role)
+        self.combo_mode.insertSeparator(3)
         self.combo_mode.setToolTip(
             "Standard: every spectrum is classified on its own (works for "
             "any new spectrum).\nMargin mode (paired reference): features "
@@ -1488,7 +1491,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "patient's own normal (Dieterle 2006).")
         cv.addWidget(self.combo_mode)
         cv.addSpacing(4)
-        # ---- 3SSE card: run button + live search status ----------------
+        # ---- 3SSE card: collapsible, run button + live search status --
         seq_card, scv = self.card(
             "3SSE — sequential architecture search",
             "Screens every chain (single → 2-model → 3-model), then "
@@ -1496,10 +1499,30 @@ class MainWindow(QtWidgets.QMainWindow):
             "becomes THE trained model (Save → Predict like any "
             "training).")
         self.seq_card = seq_card
+        self._seq_body = QtWidgets.QWidget()
+        scv.addWidget(self._seq_body)
+        sb = QtWidgets.QVBoxLayout(self._seq_body)
+        sb.setContentsMargins(0, 0, 0, 0)
+        sb.setSpacing(6)
+        self.b_3sse_collapse = QtWidgets.QToolButton()
+        self.b_3sse_collapse.setText("▾  Search options & progress")
+        self.b_3sse_collapse.setCheckable(True)
+        self.b_3sse_collapse.setChecked(True)
+        self.b_3sse_collapse.setStyleSheet("border:none; "
+                                           "font-weight:600; "
+                                           "color:#475569;")
+        self.b_3sse_collapse.setCursor(qc.POINTING_HAND)
+        self.b_3sse_collapse.toggled.connect(
+            lambda on: (
+                self._seq_body.setVisible(on),
+                self.b_3sse_collapse.setText(
+                    "▾  Search options & progress" if on
+                    else "▸  Search options & progress")))
+        scv.insertWidget(0, self.b_3sse_collapse)
         self.seq_counts = QtWidgets.QLabel("")
         self.seq_counts.setObjectName("CardHint")
         self.seq_counts.setWordWrap(True)
-        scv.addWidget(self.seq_counts)
+        sb.addWidget(self.seq_counts)
         self.b_3sse_run = QtWidgets.QPushButton(
             "Run 3SSE architecture search now")
         self.b_3sse_run.setObjectName("Primary")
@@ -1509,7 +1532,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "otherwise). Takes a while — progress is shown below and "
             "the app stays responsive.")
         self.b_3sse_run.clicked.connect(self.run_3sse_now)
-        scv.addWidget(self.b_3sse_run)
+        sb.addWidget(self.b_3sse_run)
         run_row = QtWidgets.QHBoxLayout()
         self.chk_3sse_fast = QtWidgets.QCheckBox(
             "Fast screening (2-fold, skip 1D-CNN/CatBoost/XGBoost)")
@@ -1527,10 +1550,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_3sse_cancel.hide()
         run_row.addWidget(self.b_3sse_cancel)
         run_row.addStretch(1)
-        scv.addLayout(run_row)
+        sb.addLayout(run_row)
         self.seq_estimate = QtWidgets.QLabel("")
         self.seq_estimate.setObjectName("CardHint")
-        scv.addWidget(self.seq_estimate)
+        sb.addWidget(self.seq_estimate)
         self.seq_counter = QtWidgets.QLabel("")
         self.seq_counter.setStyleSheet(
             "font-size:15pt; font-weight:700; color:#312e81;")
@@ -1540,14 +1563,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seq_best = QtWidgets.QLabel("")
         self.seq_best.setWordWrap(True)
         self.seq_best.setStyleSheet("color:#475569;")
-        scv.addWidget(self.seq_counter)
-        scv.addWidget(self.seq_phase)
-        scv.addWidget(self.seq_best)
+        sb.addWidget(self.seq_counter)
+        sb.addWidget(self.seq_phase)
+        sb.addWidget(self.seq_best)
         self.seq_top5 = QtWidgets.QLabel("")
         self.seq_top5.setTextFormat(QtCore.Qt.RichText)
         self.seq_top5.setStyleSheet(
             "color:#334155; font-family:Consolas, monospace;")
-        scv.addWidget(self.seq_top5)
+        sb.addWidget(self.seq_top5)
         self.b_3sse_view = QtWidgets.QPushButton(
             "View saved 3SSE results (last architecture search)…")
         self.b_3sse_view.setFlat(True)
@@ -1556,54 +1579,66 @@ class MainWindow(QtWidgets.QMainWindow):
             "and the overall winner) of the last completed 3SSE search "
             "in study_run_3sse/ — no re-run needed.")
         self.b_3sse_view.clicked.connect(self.view_saved_3sse)
-        scv.addWidget(self.b_3sse_view)
+        sb.addWidget(self.b_3sse_view)
         self.combo_mode.currentIndexChanged.connect(
             self._update_seq_card)
         cv.addSpacing(4)
-        cv.addWidget(QtWidgets.QLabel("Models to compare "
-                                      "(best F1 wins — try all!):"))
+        head_row = QtWidgets.QHBoxLayout()
+        head_row.addWidget(QtWidgets.QLabel(
+            "Models to compare (best F1 wins):"))
+        self.models_count = QtWidgets.QLabel("")
+        self.models_count.setObjectName("CardHint")
+        head_row.addStretch(1)
+        head_row.addWidget(self.models_count)
+        cv.addLayout(head_row)
         self.model_checks: dict[str, QtWidgets.QCheckBox] = {}
         grid = QtWidgets.QGridLayout()
         grid.setVerticalSpacing(2)
+        grid.setHorizontalSpacing(18)
         for i, name in enumerate(modeling.ALL_MODEL_NAMES):
             cb = QtWidgets.QCheckBox(name)
             cb.setChecked(True)
             self.model_checks[name] = cb
-            grid.addWidget(cb, i // 2, i % 2)
-            cb.toggled.connect(self._update_seq_card)
+            grid.addWidget(cb, i // 3, i % 3)          # 3 columns
+            cb.toggled.connect(self._models_changed)
         cv.addLayout(grid)
-        self._update_seq_card()               # initial counts
         sel_row = QtWidgets.QHBoxLayout()
-        b_all = QtWidgets.QPushButton("All")
-        b_all.setFlat(True)
-        b_all.clicked.connect(
-            lambda: [cb.setChecked(True)
-                     for cb in self.model_checks.values()])
-        b_none = QtWidgets.QPushButton("None")
-        b_none.setFlat(True)
-        b_none.clicked.connect(
-            lambda: [cb.setChecked(False)
-                     for cb in self.model_checks.values()])
-        sel_row.addWidget(b_all)
-        sel_row.addWidget(b_none)
+        for label, preset in (("All", "all"), ("None", "none"),
+                              ("Classical", "classical"),
+                              ("Fast", "fast")):
+            b = QtWidgets.QPushButton(label)
+            b.setFlat(True)
+            b.setCursor(qc.POINTING_HAND)
+            b.setToolTip(
+                {"all": "Check every model",
+                 "none": "Uncheck every model",
+                 "classical": "PCA-based classical models + PLS-DA + "
+                              "Peak bands (interpretable chemometrics)",
+                 "fast": "Everything except the three slowest "
+                         "(1D-CNN, CatBoost, XGBoost)"}[preset])
+            b.clicked.connect(
+                lambda _=False, p=preset: self._apply_model_preset(p))
+            sel_row.addWidget(b)
         sel_row.addStretch(1)
         cv.addLayout(sel_row)
+        self._models_changed()               # initial counter + 3SSE card
+        cv.addWidget(self.section_label("CROSS-VALIDATION"))
+        cv_row = QtWidgets.QHBoxLayout()
         self.spin_folds = QtWidgets.QSpinBox()
         self.spin_folds.setRange(2, 10)
         self.spin_folds.setValue(5)
         self.spin_folds.setToolTip(TIPS["folds"])
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("CV folds"))
-        row.addWidget(self.spin_folds)
-        cv.addLayout(row)
+        cv_row.addWidget(QtWidgets.QLabel("Folds"))
+        cv_row.addWidget(self.spin_folds)
+        cv_row.addSpacing(12)
         self.spin_seed = QtWidgets.QSpinBox()
         self.spin_seed.setRange(0, 9999)
         self.spin_seed.setValue(42)
         self.spin_seed.setToolTip(TIPS["seed"])
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Random seed"))
-        row.addWidget(self.spin_seed)
-        cv.addLayout(row)
+        cv_row.addWidget(QtWidgets.QLabel("Seed"))
+        cv_row.addWidget(self.spin_seed)
+        cv_row.addStretch(1)
+        cv.addLayout(cv_row)
         self.chk_repeat = QtWidgets.QCheckBox("Repeat CV ×3 (stabler winner)")
         self.chk_repeat.setToolTip(
             "Repeats the whole cross-validation with three different fold "
@@ -1731,20 +1766,33 @@ class MainWindow(QtWidgets.QMainWindow):
             "Computes macro-F1 at 25/50/75/100% of the patients with the "
             "winning model — shows whether collecting more patients "
             "would improve results. Draws into the right chart.")
-        b_lc.clicked.connect(self.run_learning_curve)
         b_regions = QtWidgets.QPushButton("Spectral regions that matter")
         b_regions.setToolTip(
             "RandomForest importance mapped back onto the wavenumber "
             "axis, overlaid on the class-mean spectra — shows WHERE the "
             "discriminative signal lives. Draws into the right chart.")
-        b_regions.clicked.connect(self.run_region_importance)
+        self._diag_buttons: list[QtWidgets.QPushButton] = []
+
+        def diag(button, handler):
+            button.clicked.connect(handler)
+            self._diag_buttons.append(button)
+            button.setEnabled(False)      # until a winner exists
+            return button
+
+        chv.addWidget(self.section_label("DATA VALUE & SIGNAL"))
+        lc_row = QtWidgets.QHBoxLayout()
+        lc_row.addWidget(diag(b_lc, self.run_learning_curve))
+        lc_row.addWidget(diag(b_regions, self.run_region_importance))
+        lc_row.addStretch(1)
+        chv.addLayout(lc_row)
+        chv.addWidget(self.section_label("HONEST EVALUATION & STABILITY"))
+        lc2_row = QtWidgets.QHBoxLayout()
         b_honest = QtWidgets.QPushButton("Honest check (nested)")
         b_honest.setToolTip(
             "Re-chooses the preprocessing INSIDE every CV fold (training "
             "patients only) and reports the unbiased macro-F1 — removes "
             "the optimism from having tuned preprocessing on the same "
             "data. Takes a couple of minutes.")
-        b_honest.clicked.connect(self.run_honest_check)
         b_locked = QtWidgets.QPushButton("Locked test-set eval")
         b_locked.setToolTip(
             "TRIPOD-style final exam: splits the PATIENTS 70/15/15 "
@@ -1753,13 +1801,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "test patients. Honest but noisy — run it once per "
             "configuration, not repeatedly. Needs clinical data (7+ "
             "patients).")
-        b_locked.clicked.connect(self.run_locked_eval)
-        lc_row.addWidget(b_lc)
-        lc_row.addWidget(b_regions)
-        lc_row.addWidget(b_honest)
-        lc_row.addWidget(b_locked)
-        lc_row.addStretch(1)
-        chv.addLayout(lc_row)
+        lc2_row.addWidget(diag(b_honest, self.run_honest_check))
+        lc2_row.addWidget(diag(b_locked, self.run_locked_eval))
+        lc2_row.addStretch(1)
+        chv.addLayout(lc2_row)
         deep_row = QtWidgets.QHBoxLayout()
         b_lopo = QtWidgets.QPushButton("Leave-one-patient-out")
         b_lopo.setToolTip(
@@ -1767,22 +1812,19 @@ class MainWindow(QtWidgets.QMainWindow):
             "datasets: refit the winner once per left-out PATIENT "
             "(fixed parameters) and evaluate every patient unseen. "
             "Draws per-patient accuracy into the right chart.")
-        b_lopo.clicked.connect(self.run_lopo)
         b_seeds = QtWidgets.QPushButton("Seed stability")
         b_seeds.setToolTip(
             "Macro-F1 of the fixed winner across 5 CV seeds — "
             "quantifies how much the numbers move just by re-running. "
             "Boxplot into the right chart.")
-        b_seeds.clicked.connect(self.run_seed_stability)
         b_noise = QtWidgets.QPushButton("Noise robustness")
         b_noise.setToolTip(
             "Adds calibrated measurement noise (1/2/5% of signal "
             "scale) at inference and reports the macro-F1 degradation "
             "curve — the practical robustness statement.")
-        b_noise.clicked.connect(self.run_noise_check)
-        deep_row.addWidget(b_lopo)
-        deep_row.addWidget(b_seeds)
-        deep_row.addWidget(b_noise)
+        deep_row.addWidget(diag(b_lopo, self.run_lopo))
+        deep_row.addWidget(diag(b_seeds, self.run_seed_stability))
+        deep_row.addWidget(diag(b_noise, self.run_noise_check))
         deep_row.addStretch(1)
         chv.addLayout(deep_row)
         plots = QtWidgets.QSplitter(QT_HORIZONTAL)
@@ -1812,7 +1854,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "site-effect check, and a plausibility check of the "
             "model's discriminative bands against the literature. "
             "Uses the last training data (train first).")
-        b_bio.clicked.connect(self.run_biochemistry)
+        diag(b_bio, self.run_biochemistry)
         bio_row.addWidget(b_bio)
         bio_row.addStretch(1)
         bcv.addLayout(bio_row)
@@ -4887,11 +4929,13 @@ class MainWindow(QtWidgets.QMainWindow):
                                           "Select at least one model.")
             return
         self.b_train.setEnabled(False)
+        for b in getattr(self, "_diag_buttons", []):
+            b.setEnabled(False)      # winner is going stale
         self.progress.setValue(0)
         self.train_status.setText("Preprocessing spectra…")
-        mode_idx = self.combo_mode.currentIndex()
-        seq_mode = mode_idx >= 3                     # 3SSE search
-        paired_mode = mode_idx in (1, 2, 4)
+        mode_kind = self.mode_kind()
+        seq_mode = mode_kind.startswith("seq")
+        paired_mode = mode_kind in ("paired", "paired-pqn", "seq-paired")
         if paired_mode and self.groups is None:
             self.b_train.setEnabled(True)
             QtWidgets.QMessageBox.warning(
@@ -4911,12 +4955,13 @@ class MainWindow(QtWidgets.QMainWindow):
                                  and self.chk_exclude_flagged.isChecked()
                                  and not self.read_params().despike)
                              else None),
-                    use_pqn=(mode_idx == 2))
+                    use_pqn=(mode_kind == "paired-pqn"))
                 X, yy, gg = pd_.X, pd_.y, pd_.groups
                 self._lc_wn = pd_.wn
                 self._paired_mode = True
                 self.log(
-                    f"Paired-reference mode{' + PQN' if mode_idx == 2 else ''}: "
+                    f"Paired-reference mode"
+                    f"{' + PQN' if mode_kind == 'paired-pqn' else ''}: "
                     f"{pd_.n_patients} patients "
                     f"with both classes, {pd_.X.shape[0]} deviation "
                     f"spectra; {pd_.n_unpaired_excluded} patients "
@@ -4996,6 +5041,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._seq_worker.start()
             self.b_3sse_run.hide()
             self.b_3sse_cancel.show()
+            self.b_3sse_collapse.setChecked(True)   # show progress
             return
         self.worker = TrainWorker(X, yy, names, self.spin_folds.value(),
                                   self.spin_seed.value(), groups=gg,
@@ -5014,6 +5060,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_train_done(self, results, winner):
         self.results, self.winner = results, winner
         self.chain_flow.hide()          # 3SSE path re-shows with arch
+        for b in getattr(self, "_diag_buttons", []):
+            b.setEnabled(True)
         self.b_train.setEnabled(bool(self.spectra))
         self.progress.setValue(100)
         sens = winner.macro["sens"][0]
@@ -5079,6 +5127,44 @@ class MainWindow(QtWidgets.QMainWindow):
             "\n\nFull details are printed to the console.")
 
     # ================================================== 3SSE handlers
+    def mode_kind(self) -> str:
+        """Semantic role of the selected training mode ('standard',
+        'paired', 'paired-pqn', 'seq-standard', 'seq-paired') — index
+        positions are never relied on."""
+        return self.combo_mode.currentData() or "standard"
+
+    def set_mode_kind(self, role: str):
+        i = self.combo_mode.findData(role)
+        if i >= 0:
+            self.combo_mode.setCurrentIndex(i)
+
+    def _models_changed(self, *_args):
+        """Live 'N of M models selected' counter + 3SSE card refresh."""
+        total = len(self.model_checks)
+        n = sum(1 for cb in self.model_checks.values() if cb.isChecked())
+        self.models_count.setText(f"{n} of {total} models selected")
+        self.models_count.setStyleSheet(
+            "color:#b91c1c;" if n < 3 else "")
+        self._update_seq_card()
+
+    def _apply_model_preset(self, preset: str):
+        """Check/uncheck the model boxes per preset."""
+        if preset in ("all", "none"):
+            want = preset == "all"
+            for cb in self.model_checks.values():
+                cb.setChecked(want)
+            return
+        import sequential
+        if preset == "classical":
+            def pick(n):
+                return ((n.startswith("PCA +") and "MLP" not in n)
+                        or n == "PLS-DA" or n == "Peak bands + RF")
+        else:                                   # fast
+            def pick(n):
+                return n not in sequential.SLOW_MODELS
+        for name, cb in self.model_checks.items():
+            cb.setChecked(pick(name))
+
     def _seq_effective_models(self) -> list[str]:
         """Checked models, minus the fast-screening skips."""
         import sequential
@@ -5163,8 +5249,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "'All' button above the model list checks everything.")
             return
         # paired whenever patient groups exist; the dropdown reflects it
-        self.combo_mode.setCurrentIndex(4 if self.groups is not None
-                                        else 3)
+        self.set_mode_kind("seq-paired" if self.groups is not None
+                           else "seq-standard")
         self.seq_counter.setText("0")
         self.seq_phase.setText("Phase: screening — starting…")
         self.seq_best.setText("")
