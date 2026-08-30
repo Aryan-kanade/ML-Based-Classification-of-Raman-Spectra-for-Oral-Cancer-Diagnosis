@@ -882,6 +882,25 @@ def significance_of(validated, winner, board, X, y, groups, wavenumbers,
         return None
 
 
+def persist_run(out_dir: str, board: dict, validated: dict, winner,
+                significance: dict | None = None):
+    """Write validated.json / winner.json / significance.json so the
+    next app start can restore the winner into the Train page."""
+    def _dumpable(m):
+        out = {}
+        for k, v in m.items():
+            if isinstance(v, np.ndarray):
+                out[k] = v.tolist()
+            else:
+                out[k] = v
+        return out
+
+    if significance is not None:
+        with open(os.path.join(out_dir, "significance.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(significance, fh, indent=2)
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -953,10 +972,6 @@ def main(argv=None) -> int:
                 if args.mode.startswith("paired")
                 else {"Peak bands + RF (std baseline)": (0.594, 0.610)})
 
-    def _dumpable(m):
-        return {k: v for k, v in m.items()
-                if k not in ("oof_proba", "y_true", "cm")}
-
     with open(os.path.join(out_dir, "validated.json"), "w",
               encoding="utf-8") as fh:
         json.dump({str(lv): [{"arch": list(e["arch"]),
@@ -966,19 +981,18 @@ def main(argv=None) -> int:
     winner = pick_overall(validated)
     sig = None
     if winner is not None:
-        with open(os.path.join(out_dir, "winner.json"), "w",
-                  encoding="utf-8") as fh:
-            json.dump({"arch": list(winner["arch"]),
-                       "metrics": _dumpable(winner["metrics"])},
-                      fh, indent=2)
         sig = significance_of(validated, winner, board, X, y, g, wn,
                               seed=args.seed,
                               progress=lambda m: print(f"[3sse] {m}",
                                                        flush=True))
-        if sig is not None:
-            with open(os.path.join(out_dir, "significance.json"),
-                      "w", encoding="utf-8") as fh:
-                json.dump(sig, fh, indent=2)
+    # winner entry for persist_run: attach finalize's threshold/calib
+    persist_winner = None
+    if winner is not None:
+        persist_winner = {
+            "arch": winner["arch"], "metrics": winner["metrics"],
+            "threshold": None, "calibrator": None}
+    persist_run(out_dir, board, validated, persist_winner,
+                significance=sig)
     report = build_report(board, validated, baseline, significance=sig)
     print(report)
     with open(os.path.join(out_dir, "report.txt"), "w",

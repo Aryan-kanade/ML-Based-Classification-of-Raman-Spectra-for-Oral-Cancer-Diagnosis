@@ -16,6 +16,10 @@ import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
+# never spawn loky process pools in the harness: multiple QThreads +
+# joblib executors are a native access-violation race on Windows (see
+# Brain.md gotchas) — threading backend is slower but deterministic
+os.environ.setdefault("JOBLIB_MULTIPROCESSING", "0")
 os.environ.setdefault("MPLBACKEND", "QtAgg")
 
 import numpy as np
@@ -56,6 +60,18 @@ def _install_dialog_recorder():
                 return YES if kind == "question" else 1024
             return staticmethod(_box)
         setattr(QtWidgets.QMessageBox, n, make(n))
+    # native file dialogs would hang an unattended offscreen run; the
+    # restored 3SSE winner legitimately enables save/report paths, so
+    # they must return a harmless ("", "") instead
+    for n in ("getSaveFileName", "getOpenFileName",
+              "getExistingDirectory",
+              "getSaveFileNames", "getOpenFileNames"):
+        def make_fd(_n):
+            def _fd(*a, **k):
+                DIALOG_LOG.append(("filedialog", _n, str(a[1:2])))
+                return ("", "")
+            return staticmethod(_fd)
+        setattr(QtWidgets.QFileDialog, n, make_fd(n))
 
 
 def make_gui():

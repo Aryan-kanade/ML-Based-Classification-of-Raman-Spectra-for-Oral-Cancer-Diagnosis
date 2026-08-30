@@ -1271,6 +1271,18 @@ def save_bundle(path: str, winner: ModelResult, wavenumbers: np.ndarray,
 
 
 def load_bundle(path: str) -> dict:
+    # bundles saved by CLI scripts pickle their classes as __main__.*
+    # (e.g. sequential.SequentialChain saved from `python sequential.py`)
+    # — register them on __main__ so unpickling works everywhere
+    import __main__ as _main
+    try:
+        import sequential as _seq
+    except ImportError:
+        _seq = None
+    if _seq is not None:
+        for _name in ("SequentialChain", "_SpectralSlice"):
+            if hasattr(_seq, _name) and not hasattr(_main, _name):
+                setattr(_main, _name, getattr(_seq, _name))
     return joblib.load(path)
 
 

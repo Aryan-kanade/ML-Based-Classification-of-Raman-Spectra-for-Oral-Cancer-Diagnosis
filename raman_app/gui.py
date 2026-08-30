@@ -262,14 +262,11 @@ class SeqSearchWorker(QtCore.QThread):
                 validated, winner, board, self.X, self.y, self.groups,
                 self.wavenumbers, seed=self.seed,
                 progress=lambda m: self.progress.emit(-1, m))
-            if sig is not None and self.resume_path:
+            if self.resume_path:
                 try:
-                    import json as _json
-                    with open(os.path.join(
-                            os.path.dirname(self.resume_path),
-                            "significance.json"), "w",
-                            encoding="utf-8") as fh:
-                        _json.dump(sig, fh, indent=2)
+                    sequential.persist_run(
+                        os.path.dirname(self.resume_path), board,
+                        validated, winner, significance=sig)
                 except OSError:
                     pass
             # a completed run clears its checkpoint: the next Run starts
@@ -1020,6 +1017,114 @@ class MainWindow(QtWidgets.QMainWindow):
             self.load_folder(folder, quiet=True)
         self.update_welcome()
         self.refresh_nav()
+        # a completed 3SSE search fills the Train page immediately
+        self.restore_last_3sse()
+
+    def restore_last_3sse(self):
+        """
+        Load the last completed 3SSE run (study_run_3sse) into the
+        Train page: banner stats, model-comparison table, per-class
+        table, confusion/ROC plots, Save + diagnostics — exactly like a
+        fresh training, so results are never 'blank' after a restart.
+        """
+        import json as _json
+        folder = os.path.join(APP_DIR, "study_run_3sse")
+        wpath = os.path.join(folder, "winner.json")
+        if not os.path.isfile(wpath):
+            return
+        try:
+            with open(wpath, encoding="utf-8") as fh:
+                data = _json.load(fh)
+            m = data.get("metrics") or {}
+            if not m or "f1" not in m:
+                return
+            classes = sorted(set(self.labels)) or ["Normal", "Tumor"]
+            n_cls = len(classes)
+            winner = modeling.ModelResult(
+                name="3SSE: " + " → ".join(data["arch"]),
+                classes=classes)
+            winner.macro = {"sens": (m.get("sens", 0.0), 0.0),
+                            "spec": (m.get("spec", 0.0), 0.0),
+                            "f1": (m.get("f1", 0.0), 0.0),
+                            "prec": (m.get("prec", 0.0), 0.0)}
+            cm = m.get("cm")
+            if cm:
+                winner.cm = np.asarray(cm, dtype=int).reshape(
+                    n_cls, n_cls)
+                winner.per_class = {
+                    classes[int(k)]: {mk: (mv, 0.0)
+                                      for mk, mv in v.items()}
+                    for k, v in
+                    modeling.class_metrics_from_cm(winner.cm).items()}
+            oof = m.get("oof_proba")
+            if oof:
+                winner.oof_proba = np.asarray(oof, dtype=float)
+                winner.y_true_encoded = np.asarray(
+                    m.get("y_true"), dtype=int)
+                winner.groups = self.groups
+            winner.threshold = data.get("threshold")
+            # the fitted SequentialChain from the run's bundle
+            bpath = os.path.join(folder, "winner.joblib")
+            if os.path.isfile(bpath):
+                try:
+                    bundle = modeling.load_bundle(bpath)
+                    winner.pipeline = bundle["pipeline"]
+                    self._paired_mode = bool(bundle.get("paired"))
+                except Exception:
+                    pass
+            # comparison table: the run's validated single models
+            results = []
+            vpath = os.path.join(folder, "validated.json")
+            if os.path.isfile(vpath):
+                try:
+                    with open(vpath, encoding="utf-8") as fh:
+                        validated = _json.load(fh)
+                    for entry in validated.get("1", []):
+                        mm = entry.get("metrics") or {}
+                        if "f1" not in mm:
+                            continue
+                        r = modeling.ModelResult(
+                            name=entry["arch"][0], classes=classes)
+                        r.macro = {"sens": (mm.get("sens", 0.0), 0.0),
+                                   "spec": (mm.get("spec", 0.0), 0.0),
+                                   "f1": (mm.get("f1", 0.0), 0.0),
+                                   "prec": (mm.get("prec", 0.0), 0.0)}
+                        results.append(r)
+                except Exception:
+                    pass
+            if not results:
+                results = [winner]
+            self.on_train_done(results + [winner], winner)
+            self.chain_flow.set_arch(data["arch"])
+            # keep the 3SSE payload alive for the results dialog
+            spath = os.path.join(folder, "significance.json")
+            sig = None
+            if os.path.isfile(spath):
+                try:
+                    with open(spath, encoding="utf-8") as fh:
+                        sig = _json.load(fh)
+                except Exception:
+                    pass
+            self._seq_payload = {"board": {"singles": [
+                {"arch": (r.name,), "level": 1, "metrics": {
+                    "f1": r.macro["f1"][0], "sens": r.macro["sens"][0],
+                    "spec": r.macro["spec"][0], "acc": 0.0}}
+                for r in results if r is not winner],
+                "pairs": [], "triples": [], "total": 0, "pruned": 0},
+                "validated": {},
+                "winner": {"arch": data["arch"],
+                           "metrics": {k: m[k] for k in
+                                       ("f1", "sens", "spec", "auc",
+                                        "acc") if k in m}},
+                "significance": sig}
+            self.seq_phase.setText(
+                f"Last 3SSE winner restored: {' → '.join(data['arch'])} "
+                f"(nested F1 {m['f1']:.3f}).")
+            self.log("Restored last 3SSE winner "
+                     f"({' → '.join(data['arch'])}, F1 {m['f1']:.3f}) "
+                     "into the Train page")
+        except Exception as exc:
+            self.log(f"Could not restore last 3SSE run: {exc}")
 
     # ================================================================= UI
     def _build_ui(self):
