@@ -1,5 +1,9 @@
 # Agent rules for D:\BARC — Ponytail (lazy senior dev) mode
 
+**Read `Brain.md` first** — it is the project's memory (architecture,
+methodology, real results, gotchas, changelog). Update it after any
+non-trivial change instead of re-exploring the code.
+
 Source: https://github.com/DietrichGebert/ponytail (MIT) — skill `ponytail`.
 Default intensity: **full**. "stop ponytail" reverts.
 
