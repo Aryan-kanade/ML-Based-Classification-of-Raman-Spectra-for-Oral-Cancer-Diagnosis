@@ -199,6 +199,24 @@ python reproduce_study.py --demo --mini        :: quick synthetic check
 python reproduce_study.py --mode paired-pqn    :: margin mode + PQN
 ```
 
+### Real clinical dataset results (317 spectra / 72 subjects, 2026-08-30)
+
+5-fold patient-grouped CV ×3, seed 42, 18 quality-flagged spectra
+excluded; CIs are patient-level. Full tables in
+`study_run_standard/summary.txt` and `study_run_paired/summary.txt`.
+
+| Mode | Winner | macro-F1 (95% CI) | AUC (DeLong 95% CI) | LOPO |
+|---|---|---|---|---|
+| Standard | Peak bands + RF | 0.594 (0.54–0.65) | 0.610 (0.55–0.68) | F1 0.589 |
+| Paired (within-patient deviation) | Extra Trees | 0.702 (0.66–0.76) | 0.788 (0.74–0.84) | F1 0.703, AUC 0.792 |
+
+Paired referencing — each spectrum as its deviation from the same
+patient's normal reference — is the clinically realistic margin scenario
+and clearly outperforms pooled classification here. Literature SERS
+meta-analyses report ~0.89/0.85 sens/spec, but on spectrum-level splits;
+these patient-grouped numbers are the stricter standard and the honest
+current state of this single-centre dataset.
+
 `test_all.py` covers the clinical loader (dedupe / cross-class /
 references / patient grouping), cropping + spike scoring, peak-band
 features, grouped+repeated CV with the ensemble, the model-bundle

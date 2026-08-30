@@ -788,6 +788,86 @@ def test_fold_f1_populated():
             assert all(0 <= v <= 1 for v in r.fold_f1)
 
 
+def test_reproduce_study_clinical_path():
+    """reproduce_study must run end-to-end on a clinical-layout tree
+    (regression: load_clinical_dataset returns a dataclass, not a tuple,
+    and paired mode must not double-preprocess)."""
+    import reproduce_study as rs
+    with tempfile.TemporaryDirectory() as root:
+        _make_clinical_tree(root)
+        out = os.path.join(root, "..", "repro_out")
+        assert rs.main(["--data", root, "--mini", "--mode", "paired",
+                        "--out", out]) == 0
+        summary = open(os.path.join(out, "summary.txt"),
+                       encoding="utf-8").read()
+        assert "Winner" in summary
+        assert os.path.exists(os.path.join(out, "winner.joblib"))
+        assert os.path.exists(os.path.join(out, "data_report.txt"))
+
+
+def test_paired_features_preprocesses_once():
+    """paired_features takes RAW intensities and preprocesses exactly
+    once (reproduce_study once passed pre-processed X -> double
+    preprocessing, diverging from the GUI)."""
+    import dataset as ds
+    import paired
+    with tempfile.TemporaryDirectory() as root:
+        wn = _make_clinical_tree(root)
+        cd = cdata.load_clinical_dataset(root)
+        spectra = cd.spectra
+        grid = ds.common_grid(spectra)
+        X_raw, labels = ds.to_matrix(spectra, grid)
+        params = pp.PreprocessParams().validate()
+        pd_ = paired.paired_features(X_raw, labels, cd.groups, grid,
+                                     params)
+        # manual: one preprocessing pass, then deviation from the
+        # patient's own normal mean — must match exactly
+        Xp = pp.preprocess_matrix(X_raw, params, wn=grid)
+        by_patient: dict = {}
+        for i, (g, lab) in enumerate(zip(cd.groups, labels, strict=True)):
+            by_patient.setdefault(g, {}).setdefault(lab, []).append(i)
+        rows = []
+        for g, cls_idx in by_patient.items():
+            normals = cls_idx.get("Normal")
+            if not normals or not cls_idx.get("Tumor"):
+                continue
+            ref = Xp[normals].mean(axis=0)
+            for lab in ("Normal", "Tumor"):
+                for i in cls_idx[lab]:
+                    rows.append(Xp[i] - ref)
+        assert np.allclose(pd_.X, np.vstack(rows))
+        assert pd_.n_patients >= 1
+
+
+def test_oof_pooled_across_repeats():
+    """With repeats>1 the pooled OOF probabilities are the MEAN over
+    repeats (regression: they used to hold only the last repeat)."""
+    X, y, groups = _synthetic_ml(40, 10, seed=3)
+    kw = dict(model_names=["PCA + LDA"], k_folds=5, groups=list(groups))
+    singles = []
+    for rep in range(3):
+        res, _ = modeling.evaluate_models(X, list(y), seed=42 + rep * 100,
+                                          repeats=1, **kw)
+        singles.append(res[0].oof_proba)
+    res, _ = modeling.evaluate_models(X, list(y), seed=42, repeats=3, **kw)
+    assert np.allclose(res[0].oof_proba, np.mean(singles, axis=0),
+                       atol=1e-8)
+    assert res[0].groups == list(groups)
+
+
+def test_bootstrap_ci_patient_level():
+    """groups= switches bootstrap_ci to whole-group resampling: with a
+    single patient every resample draws the same rows -> zero-width CI,
+    while spectrum-level resampling on the same data varies."""
+    y_true = np.array([0, 0, 1, 1, 0, 0, 0, 1])
+    y_pred = np.array([0, 0, 1, 1, 0, 0, 1, 1])     # two wrong
+    lo_g, hi_g = modeling.bootstrap_ci(y_true, y_pred, n=200, seed=0,
+                                       groups=["P1"] * 8)
+    lo_s, hi_s = modeling.bootstrap_ci(y_true, y_pred, n=200, seed=0)
+    assert hi_g - lo_g == 0.0            # same rows every resample
+    assert hi_s - lo_s > hi_g - lo_g
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

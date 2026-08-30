@@ -18,6 +18,7 @@ raman_app/result_report.html
 raman_app/*.joblib
 raman_app/demo_data/
 raman_app/vit_outputs/
+raman_app/study_run*/
 *.zip
 
 # Python / tooling

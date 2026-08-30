@@ -172,6 +172,22 @@ class PipelineWorker(QtCore.QThread):
             self.failed.emit(traceback.format_exc())
 
 
+class FuncWorker(QtCore.QThread):
+    """Run any callable off the UI thread (diagnostics buttons)."""
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self._fn())
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
 class PredictWorker(QtCore.QThread):
     """
     Prediction in the background: the file loop, per-patient paired
@@ -573,6 +589,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.results: list | None = None
         self.winner = None
         self.worker: TrainWorker | None = None
+        self._analysis_worker: FuncWorker | None = None
         self.bundle: dict | None = None
         self._loading_table = False
         self._previewed_for: str | None = None
@@ -3500,10 +3517,57 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_optimize_failed(self, tb: str):
         self.optimize_status.setText("Optimization failed — see the log.")
         self.log(f"Optimization failed:\n{tb}")
+        QtWidgets.QMessageBox.warning(
+            self, "Optimization failed",
+            "Preprocessing optimization failed.\n\nTechnical details "
+            "are in session.log next to the app.")
         if getattr(self, "_opt_btn", None) is not None:
             self._opt_btn.setEnabled(True)
 
     # ========================================================= learning curve
+    def _run_async(self, label: str, fn, on_done):
+        """
+        Run fn() on a worker thread; on_done(result) back on the UI
+        thread. The triggering button (self.sender()) is disabled while
+        running so a double-click cannot queue a second job behind a
+        frozen UI. Failures land in a dialog + session.log.
+        """
+        if (self._analysis_worker is not None
+                and self._analysis_worker.isRunning()):
+            QtWidgets.QMessageBox.information(
+                self, "Busy",
+                "Another analysis is still running — wait for it to "
+                "finish.")
+            return
+        btn = self.sender()
+        has_btn = isinstance(btn, QtWidgets.QAbstractButton)
+        if has_btn:
+            btn.setEnabled(False)
+        self.train_status.setText(f"{label}…")
+        worker = FuncWorker(fn)
+
+        def finish(result):
+            self._analysis_worker = None
+            if has_btn:
+                btn.setEnabled(True)
+            on_done(result)
+
+        def fail(tb: str):
+            self._analysis_worker = None
+            if has_btn:
+                btn.setEnabled(True)
+            self.train_status.setText(f"{label} failed.")
+            self.log(f"{label} failed:\n{tb}")
+            QtWidgets.QMessageBox.warning(
+                self, f"{label} failed",
+                f"{label} failed.\n\nTechnical details are in "
+                "session.log next to the app.")
+
+        worker.done.connect(finish)
+        worker.failed.connect(fail)
+        self._analysis_worker = worker
+        worker.start()
+
     def run_learning_curve(self):
         """Macro-F1 vs number of patients — how much is more data worth?"""
         if self.winner is None or self._lc_data is None:
@@ -3521,35 +3585,36 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         classes = sorted(set(yy))
         ye = [classes.index(v) for v in yy]
-        self.train_status.setText("Computing learning curve…")
-        QtWidgets.QApplication.processEvents()
-        try:
-            busy(True)
-            sizes, means, stds = modeling.learning_curve_by_groups(
-                X, ye, gg, self.winner.pipeline,
-                k=self.spin_folds.value(), seed=self.spin_seed.value())
-        except Exception as exc:
-            busy(False)
-            self.friendly_error("Learning curve failed", exc)
-            return
-        busy(False)
-        ax = plotting.clear(self.roc_canvas)
-        ax.errorbar(sizes, means, yerr=stds, marker="o", ms=5, lw=1.6,
-                    capsize=4, color=plotting.COL_MAIN,
-                    ecolor=plotting.COL_RAW)
-        ax.set_xlabel("patients used")
-        ax.set_ylabel("macro-F1 (grouped CV)")
-        ax.set_title("Learning curve — the slope says what more "
-                     "data is worth")
-        ax.set_ylim(0, 1)
-        self.roc_canvas.draw_idle()
-        verdict = ("still rising — more patients should help"
-                   if means[-1] > means[0] + 0.02 else
-                   "flat — more of the same patients adds little")
-        self.log(f"Learning curve: {len(sizes)} points from "
-                 f"{sizes[0]} to {sizes[-1]} patients, F1 {means[0]:.3f} -> "
-                 f"{means[-1]:.3f} ({verdict})")
-        self.train_status.setText(f"Learning curve done — {verdict}.")
+        winner_pl, k, seed = (self.winner.pipeline,
+                              self.spin_folds.value(),
+                              self.spin_seed.value())
+
+        def fn():
+            return modeling.learning_curve_by_groups(
+                X, ye, gg, winner_pl, k=k, seed=seed)
+
+        def done(res):
+            sizes, means, stds = res
+            ax = plotting.clear(self.roc_canvas)
+            ax.errorbar(sizes, means, yerr=stds, marker="o", ms=5, lw=1.6,
+                        capsize=4, color=plotting.COL_MAIN,
+                        ecolor=plotting.COL_RAW)
+            ax.set_xlabel("patients used")
+            ax.set_ylabel("macro-F1 (grouped CV)")
+            ax.set_title("Learning curve — the slope says what more "
+                         "data is worth")
+            ax.set_ylim(0, 1)
+            self.roc_canvas.draw_idle()
+            verdict = ("still rising — more patients should help"
+                       if means[-1] > means[0] + 0.02 else
+                       "flat — more of the same patients adds little")
+            self.log(f"Learning curve: {len(sizes)} points from "
+                     f"{sizes[0]} to {sizes[-1]} patients, "
+                     f"F1 {means[0]:.3f} -> "
+                     f"{means[-1]:.3f} ({verdict})")
+            self.train_status.setText(f"Learning curve done — {verdict}.")
+
+        self._run_async("Computing learning curve", fn, done)
 
     def run_region_importance(self):
         """WHERE does the model look?  RF importance over the spectrum."""
@@ -3567,109 +3632,110 @@ class MainWindow(QtWidgets.QMainWindow):
                 "first so the wavenumber axis matches.")
             return
         self.train_status.setText("Computing region importances…")
-        QtWidgets.QApplication.processEvents()
         use_shap = False
         try:
             import shap  # noqa: F401
             use_shap = True
         except ImportError:
             pass
-        try:
-            busy(True)
+
+        def fn():
             if use_shap:
-                wn, signed, bands = modeling.region_importance_shap(
-                    X, yy, gg, self._lc_wn)
-            else:
-                wn, signed, bands = modeling.region_importance(
-                    X, yy, gg, self._lc_wn)
-        except Exception as exc:
-            busy(False)
-            if use_shap:
-                # SHAP failed (e.g. non-tree winner) -> Gini fallback
-                self.log(f"SHAP importance failed ({exc}); using Gini")
                 try:
-                    busy(True)
-                    wn, signed, bands = modeling.region_importance(
+                    wn_s, signed_s, bands_s = modeling.region_importance_shap(
                         X, yy, gg, self._lc_wn)
-                    use_shap = False
-                except Exception as exc2:
-                    busy(False)
-                    self.friendly_error("Region importance failed", exc2)
-                    return
+                    return True, wn_s, signed_s, bands_s, ""
+                except Exception as exc:
+                    # SHAP failed (e.g. non-tree winner) -> Gini fallback
+                    wn_g, imp_g, bands_g = modeling.region_importance(
+                        X, yy, gg, self._lc_wn)
+                    return (False, wn_g, imp_g, bands_g,
+                            f"SHAP importance failed ({exc}); using Gini")
+            wn_g, imp_g, bands_g = modeling.region_importance(
+                X, yy, gg, self._lc_wn)
+            return False, wn_g, imp_g, bands_g, ""
+
+        def done(res):
+            use_shap_w, wn, signed, bands, note = res
+            if note:
+                self.log(note)
+            # keep the top bands for the Result-page spectra overlay +
+            # bundle (center, share, name, sign toward the positive class)
+            if use_shap_w:
+                self._region_bands = [(float(c), float(sh), str(nm), int(s))
+                                      for c, sh, nm, s in bands]
             else:
-                self.friendly_error("Region importance failed", exc)
-                return
-        busy(False)
-        # keep the top bands for the Result-page spectra overlay + bundle
-        # (center, share, name, sign toward the positive class)
-        if use_shap:
-            self._region_bands = [(float(c), float(sh), str(nm), int(s))
-                                  for c, sh, nm, s in bands]
-        else:
-            self._region_bands = [(float(c), float(sh), "", 0)
-                                  for c, _w, sh in bands]
-        ax = plotting.clear(self.roc_canvas)
-        if use_shap:
-            # signed SHAP: red pushes toward the positive class, blue away
-            mag = np.abs(signed) / (np.abs(signed).max() or 1.0)
-            sgn = np.sign(signed)
-            ax.fill_between(wn, 0, mag * sgn, where=sgn >= 0,
-                            color="#dc2626", alpha=0.45,
-                            label=f"toward {sorted(set(yy))[1]}")
-            ax.fill_between(wn, 0, mag * sgn, where=sgn < 0,
-                            color="#2563eb", alpha=0.45,
-                            label=f"toward {sorted(set(yy))[0]}")
-            ax.axhline(0, color="#64748b", lw=0.8)
-            top_share = max(b[1] for b in bands) or 1.0
-            for center, share, name, s in bands[:3]:
-                ax.axvline(center, color="#b45309", lw=1.0, ls="--",
-                           alpha=0.8)
-                ax.annotate(f"{center:.0f}{name}\n{share / top_share:.0%}",
-                            xy=(center, 0.97 if s >= 0 else -0.97),
-                            ha="center",
-                            va="top" if s >= 0 else "bottom",
-                            fontsize=7.5, color="#b45309")
-            ax.set_ylim(-1.15, 1.15)
-            ax.set_ylabel("SHAP contribution (signed)")
-            ax.set_title("Which spectral regions drive the classification "
-                         "(SHAP)")
-        else:
-            # class-mean spectra (scaled to [0,1]) as context
-            for i, cls in enumerate(sorted(set(yy))):
-                m = np.asarray(X)[[j for j, c in enumerate(yy) if c == cls]]
-                mean = m.mean(axis=0)
-                lo, hi = mean.min(), mean.max()
-                scaled = (mean - lo) / (hi - lo) if hi > lo else mean * 0
-                ax.plot(wn, scaled, lw=1.0, alpha=0.55,
-                        color=plotting.class_color(i),
-                        label=f"mean {cls}")
-            hi_s = signed / (signed.max() or 1)
-            ax.fill_between(wn, 0, hi_s * 0.9, color="#4f46e5", alpha=0.30,
-                            label="importance")
-            ax.plot(wn, hi_s * 0.9, lw=1.2, color="#4f46e5")
-            top_share = max(s for _c, _w, s in bands) or 1.0
-            for center, _width, share in bands[:3]:
-                ax.axvline(center, color="#b45309", lw=1.0, ls="--",
-                           alpha=0.8)
-                ax.annotate(f"{center:.0f}\n{share / top_share:.0%}",
-                            xy=(center, 0.97), ha="center", va="top",
-                            fontsize=8, color="#b45309")
-            ax.set_ylim(0, 1.05)
-            ax.set_title("Which spectral regions drive the classification")
-        ax.set_xlabel("Raman shift (cm$^{-1}$)")
-        ax.legend(loc="upper right", fontsize=8)
-        self.roc_canvas.draw_idle()
-        if use_shap:
-            tops = ", ".join(f"{c:.0f} cm⁻¹{name} "
-                             f"({'+' if s >= 0 else '-'})"
-                             for c, _sh, name, s in bands[:3])
-        else:
-            tops = ", ".join(f"{c:.0f} cm⁻¹ ({sh / top_share:.0%})"
-                             for c, _w, sh in bands[:3])
-        self.log(f"Top discriminative regions "
-                 f"({'SHAP' if use_shap else 'Gini'}): {tops}")
-        self.train_status.setText(
-            f"Region importance done — top: {tops}.")
+                self._region_bands = [(float(c), float(sh), "", 0)
+                                      for c, _w, sh in bands]
+            ax = plotting.clear(self.roc_canvas)
+            if use_shap_w:
+                # signed SHAP: red pushes toward the positive class,
+                # blue away
+                mag = np.abs(signed) / (np.abs(signed).max() or 1.0)
+                sgn = np.sign(signed)
+                ax.fill_between(wn, 0, mag * sgn, where=sgn >= 0,
+                                color="#dc2626", alpha=0.45,
+                                label=f"toward {sorted(set(yy))[1]}")
+                ax.fill_between(wn, 0, mag * sgn, where=sgn < 0,
+                                color="#2563eb", alpha=0.45,
+                                label=f"toward {sorted(set(yy))[0]}")
+                ax.axhline(0, color="#64748b", lw=0.8)
+                top_share = max(b[1] for b in bands) or 1.0
+                for center, share, name, s in bands[:3]:
+                    ax.axvline(center, color="#b45309", lw=1.0, ls="--",
+                               alpha=0.8)
+                    ax.annotate(
+                        f"{center:.0f}{name}\n{share / top_share:.0%}",
+                        xy=(center, 0.97 if s >= 0 else -0.97),
+                        ha="center",
+                        va="top" if s >= 0 else "bottom",
+                        fontsize=7.5, color="#b45309")
+                ax.set_ylim(-1.15, 1.15)
+                ax.set_ylabel("SHAP contribution (signed)")
+                ax.set_title("Which spectral regions drive the "
+                             "classification (SHAP)")
+            else:
+                # class-mean spectra (scaled to [0,1]) as context
+                for i, cls in enumerate(sorted(set(yy))):
+                    m = np.asarray(X)[
+                        [j for j, c in enumerate(yy) if c == cls]]
+                    mean = m.mean(axis=0)
+                    lo, hi = mean.min(), mean.max()
+                    scaled = ((mean - lo) / (hi - lo)
+                              if hi > lo else mean * 0)
+                    ax.plot(wn, scaled, lw=1.0, alpha=0.55,
+                            color=plotting.class_color(i),
+                            label=f"mean {cls}")
+                hi_s = signed / (signed.max() or 1)
+                ax.fill_between(wn, 0, hi_s * 0.9, color="#4f46e5",
+                                alpha=0.30, label="importance")
+                ax.plot(wn, hi_s * 0.9, lw=1.2, color="#4f46e5")
+                top_share = max(s for _c, _w, s in bands) or 1.0
+                for center, _width, share in bands[:3]:
+                    ax.axvline(center, color="#b45309", lw=1.0, ls="--",
+                               alpha=0.8)
+                    ax.annotate(f"{center:.0f}\n{share / top_share:.0%}",
+                                xy=(center, 0.97), ha="center", va="top",
+                                fontsize=8, color="#b45309")
+                ax.set_ylim(0, 1.05)
+                ax.set_title("Which spectral regions drive the "
+                             "classification")
+            ax.set_xlabel("Raman shift (cm$^{-1}$)")
+            ax.legend(loc="upper right", fontsize=8)
+            self.roc_canvas.draw_idle()
+            if use_shap_w:
+                tops = ", ".join(f"{c:.0f} cm⁻¹{name} "
+                                 f"({'+' if s >= 0 else '-'})"
+                                 for c, _sh, name, s in bands[:3])
+            else:
+                tops = ", ".join(f"{c:.0f} cm⁻¹ ({sh / top_share:.0%})"
+                                 for c, _w, sh in bands[:3])
+            self.log(f"Top discriminative regions "
+                     f"({'SHAP' if use_shap_w else 'Gini'}): {tops}")
+            self.train_status.setText(
+                f"Region importance done — top: {tops}.")
+
+        self._run_async("Computing region importance", fn, done)
 
     def run_biochemistry(self):
         """
@@ -3690,168 +3756,186 @@ class MainWindow(QtWidgets.QMainWindow):
                 "The preprocessing changed since training — retrain "
                 "first so the wavenumber axis matches.")
             return
-        self.train_status.setText("Analyzing biochemistry…")
-        QtWidgets.QApplication.processEvents()
-        try:
-            busy(True)
+        seed = self.spin_seed.value()
+
+        def fn():
             # model bands needed for the plausibility check — compute
             # them here if the user hasn't run region importance yet
-            if not self._region_bands:
+            region_bands = self._region_bands
+            bands_note = ""
+            if not region_bands:
                 try:
                     _wn_s, _signed, bands_s = modeling.region_importance_shap(
                         X, yy, gg, wn)
-                    self._region_bands = [(float(c), float(sh), str(nm),
-                                           int(s))
-                                          for c, sh, nm, s in bands_s]
-                    self.log("Biochemistry: computed signed SHAP bands "
-                             "(region importance had not been run)")
+                    region_bands = [(float(c), float(sh), str(nm), int(s))
+                                    for c, sh, nm, s in bands_s]
+                    bands_note = ("Biochemistry: computed signed SHAP "
+                                  "bands (region importance had not been "
+                                  "run)")
                 except Exception:
                     try:
                         _wn_g, _imp, bands_g = modeling.region_importance(
                             X, yy, gg, wn)
-                        self._region_bands = [(float(c), float(sh), "", 0)
-                                              for c, _w, sh in bands_g]
-                        self.log("Biochemistry: computed Gini bands "
-                                 "(SHAP unavailable)")
+                        region_bands = [(float(c), float(sh), "", 0)
+                                        for c, _w, sh in bands_g]
+                        bands_note = ("Biochemistry: computed Gini bands "
+                                      "(SHAP unavailable)")
                     except Exception:
-                        self._region_bands = []
+                        region_bands = []
             class_rows, paired_rows = bio.ratio_table(wn, X, yy, gg)
-            _H, labels, W = bio.nmf_components(
-                X, wn, k=5, seed=self.spin_seed.value())
+            _H, labels, W = bio.nmf_components(X, wn, k=5, seed=seed)
             deltas = bio.component_deltas(W, yy, gg)
             ker_med, _mad, ker_flag, ker_tot = bio.keratin_flags(wn, X)
             # FDR-corrected patient-paired band statistics (2 classes
             # with patient groups only)
             band_rows = (sstats.band_stats_paired(X, yy, gg, wn)
                          if (gg and len(set(yy)) == 2) else [])
-            self._band_stats = band_rows or None
             plaus_rows, (agree, known) = bio.plausibility(
-                self._region_bands or [])
-        except Exception as exc:
-            busy(False)
-            self.friendly_error("Biochemistry analysis failed", exc)
-            return
-        busy(False)
+                region_bands or [])
+            return {"region_bands": region_bands, "bands_note": bands_note,
+                    "class_rows": class_rows, "paired_rows": paired_rows,
+                    "labels": labels, "deltas": deltas,
+                    "ker": (ker_med, ker_flag, ker_tot),
+                    "band_rows": band_rows,
+                    "plaus": (plaus_rows, agree, known)}
 
-        # left chart: paired marker deltas (tumor minus OWN normal) —
-        # vertical bars: short two-line labels never overlap
-        ax = plotting.clear(self.bio_canvas)
-        short = {"nucleic/protein": "nuc/protein", "collagen/protein":
-                 "coll/protein", "lipid/protein": "lipid/protein",
-                 "amide I/III": "amide I/III"}
-        expected = {"nucleic/protein": "↑", "collagen/protein": "↓",
-                    "lipid/protein": "·", "amide I/III": "↑"}
-        if paired_rows:
-            keys = [f"{short.get(k, k)}\n(exp {expected.get(k, '·')})"
-                    for k, _n, _d in paired_rows]
-            vals = [d for _k, _n, d in paired_rows]
-            bars = ax.bar(keys, vals,
-                          color=["#dc2626" if v >= 0 else "#2563eb"
-                                 for v in vals],
-                          edgecolor="white", linewidth=0.6, width=0.6)
-            ax.bar_label(bars, fmt="%+.2f", fontsize=9, fontweight="bold",
-                         color="#334155", padding=4)
-            n_pat = max(n for _k, n, _d in paired_rows)
-            ax.set_title(f"Marker deltas: tumor − own normal\n"
-                         f"({n_pat} patients)", fontsize=10)
-        else:
-            # no patient grouping -> class means side by side
-            classes = sorted(set(yy))
-            keys = [short.get(k, k) for k, _m, _means in class_rows]
-            x = np.arange(len(keys))
-            w_ = 0.8 / max(len(classes), 1)
-            for i, c in enumerate(classes):
-                vals = [means.get(c, 0) or 0
-                        for _k, _m, means in class_rows]
-                ax.bar(x + i * w_ - 0.4 + w_ / 2, vals, w_,
-                       color=plotting.class_color(i), label=c,
-                       edgecolor="white", linewidth=0.6)
-            ax.set_xticks(x, keys)
-            ax.legend(fontsize=8)
-            ax.set_title("Marker values per class (no pairing)",
-                         fontsize=10)
-        ax.axhline(0, color="#64748b", lw=0.8)
-        ax.set_ylabel("Δ marker (paired)")
-        ax.margins(y=0.18)
-        ax.tick_params(axis="x", labelsize=9)
+        def done(res):
+            if res["bands_note"]:
+                self.log(res["bands_note"])
+            if not self._region_bands:
+                self._region_bands = res["region_bands"]
+            self._band_stats = res["band_rows"] or None
+            class_rows = res["class_rows"]
+            paired_rows = res["paired_rows"]
+            labels = res["labels"]
+            deltas = res["deltas"]
+            ker_med, ker_flag, ker_tot = res["ker"]
+            plaus_rows, agree, known = res["plaus"]
 
-        # right chart: NMF biochemical component shifts (paired)
-        ax2 = plotting.clear(self.bio_comp_canvas)
-        comp_vals = [d for _c, _n, d in deltas]
-        x2 = np.arange(len(labels))
-        bars2 = ax2.bar(x2, comp_vals,
-                        color=["#dc2626" if v >= 0 else "#2563eb"
-                               for v in comp_vals],
-                        edgecolor="white", linewidth=0.6, width=0.6)
-        ax2.bar_label(bars2, fmt="%+.3f", fontsize=9, fontweight="bold",
-                      color="#334155", padding=4)
-        ax2.set_xticks(x2, labels, rotation=25, ha="right",
-                       fontsize=8.5)
-        ax2.axhline(0, color="#64748b", lw=0.8)
-        ax2.set_title("Biochemical components (NMF)\n"
-                      "paired deltas, tumor − own normal", fontsize=10)
-        ax2.set_ylabel("Δ component weight")
-        ax2.margins(y=0.18)
-        self.bio_canvas.draw_idle()
-        self.bio_comp_canvas.draw_idle()
+            # left chart: paired marker deltas (tumor minus OWN normal) —
+            # vertical bars: short two-line labels never overlap
+            ax = plotting.clear(self.bio_canvas)
+            short = {"nucleic/protein": "nuc/protein", "collagen/protein":
+                     "coll/protein", "lipid/protein": "lipid/protein",
+                     "amide I/III": "amide I/III"}
+            expected = {"nucleic/protein": "↑", "collagen/protein": "↓",
+                        "lipid/protein": "·", "amide I/III": "↑"}
+            if paired_rows:
+                keys = [f"{short.get(k, k)}\n(exp {expected.get(k, '·')})"
+                        for k, _n, _d in paired_rows]
+                vals = [d for _k, _n, d in paired_rows]
+                bars = ax.bar(keys, vals,
+                              color=["#dc2626" if v >= 0 else "#2563eb"
+                                     for v in vals],
+                              edgecolor="white", linewidth=0.6, width=0.6)
+                ax.bar_label(bars, fmt="%+.2f", fontsize=9,
+                             fontweight="bold",
+                             color="#334155", padding=4)
+                n_pat = max(n for _k, n, _d in paired_rows)
+                ax.set_title(f"Marker deltas: tumor − own normal\n"
+                             f"({n_pat} patients)", fontsize=10)
+            else:
+                # no patient grouping -> class means side by side
+                classes = sorted(set(yy))
+                keys = [short.get(k, k) for k, _m, _means in class_rows]
+                x = np.arange(len(keys))
+                w_ = 0.8 / max(len(classes), 1)
+                for i, c in enumerate(classes):
+                    vals = [means.get(c, 0) or 0
+                            for _k, _m, means in class_rows]
+                    ax.bar(x + i * w_ - 0.4 + w_ / 2, vals, w_,
+                           color=plotting.class_color(i), label=c,
+                           edgecolor="white", linewidth=0.6)
+                ax.set_xticks(x, keys)
+                ax.legend(fontsize=8)
+                ax.set_title("Marker values per class (no pairing)",
+                             fontsize=10)
+            ax.axhline(0, color="#64748b", lw=0.8)
+            ax.set_ylabel("Δ marker (paired)")
+            ax.margins(y=0.18)
+            ax.tick_params(axis="x", labelsize=9)
 
-        # plausibility table (literature reference panel when no model
-        # bands exist — the table is never left empty)
-        lit_txt = {1: "up in tumor", -1: "down in tumor", 0: "mixed"}
-        mod_txt = {1: "toward tumor", -1: "away", 0: "–"}
-        if plaus_rows:
-            table_rows = plaus_rows
-        else:
-            table_rows = [(c, mol, assign, direction, 0, "reference")
-                          for c, _hw, mol, assign, direction
-                          in bio.BANDS]
-        self.bio_table.setRowCount(len(table_rows))
-        for r, (center, mol, assign, direction, sign, verdict) in \
-                enumerate(table_rows):
-            for c, txt in enumerate((
-                    f"{center:.0f}", mol, assign, lit_txt.get(direction,
-                                                              "–"),
-                    mod_txt.get(sign, "–"), verdict)):
-                it = QtWidgets.QTableWidgetItem(txt)
-                if c != 2:
-                    it.setTextAlignment(ALIGN_CENTER)
-                if c == 5:                    # color the verdict
-                    col = {"agree": "#15803d", "opposite": "#b91c1c",
-                           "unknown-sign": "#b45309",
-                           "unassigned": "#64748b",
-                           "reference": "#475569"}.get(verdict, "#334155")
-                    it.setForeground(qc.QtGui.QColor(col))
-                    f = it.font()
-                    f.setBold(True)
-                    it.setFont(f)
-                self.bio_table.setItem(r, c, it)
+            # right chart: NMF biochemical component shifts (paired)
+            ax2 = plotting.clear(self.bio_comp_canvas)
+            comp_vals = [d for _c, _n, d in deltas]
+            x2 = np.arange(len(labels))
+            bars2 = ax2.bar(x2, comp_vals,
+                            color=["#dc2626" if v >= 0 else "#2563eb"
+                                   for v in comp_vals],
+                            edgecolor="white", linewidth=0.6, width=0.6)
+            ax2.bar_label(bars2, fmt="%+.3f", fontsize=9,
+                          fontweight="bold",
+                          color="#334155", padding=4)
+            ax2.set_xticks(x2, labels, rotation=25, ha="right",
+                           fontsize=8.5)
+            ax2.axhline(0, color="#64748b", lw=0.8)
+            ax2.set_title("Biochemical components (NMF)\n"
+                          "paired deltas, tumor − own normal", fontsize=10)
+            ax2.set_ylabel("Δ component weight")
+            ax2.margins(y=0.18)
+            self.bio_canvas.draw_idle()
+            self.bio_comp_canvas.draw_idle()
 
-        bits = []
-        if known:
-            bits.append(f"plausibility: {agree} of {known} model bands "
-                        "match the literature direction")
-        elif self._region_bands:
-            bits.append("plausibility: no model band fell inside a "
-                        "literature window")
-        else:
-            bits.append("model bands unavailable — literature reference "
-                        "panel shown")
-        if ker_tot and np.isfinite(ker_med):
-            bits.append(f"keratin: {ker_flag} of {ker_tot} spectra "
-                        "keratin-high (possible site effect)")
-        sig_bands = [r for r in (self._band_stats or []) if r[6]]
-        if sig_bands:
-            txt = ", ".join(
-                f"{r[0]:.0f} {r[1]} "
-                f"({'up' if r[4] > 0 else 'down'})"
-                for r in sig_bands[:4])
-            bits.append(f"FDR-significant bands (p<0.05): {txt}")
-        self.bio_label.setText(
-            " · ".join(bits) + "\n"
-            "Red = higher in tumor, blue = lower · exp ↑/↓ = literature "
-            "direction")
-        self.train_status.setText("Biochemistry done.")
-        self.log("Biochemistry: " + " · ".join(bits))
+            # plausibility table (literature reference panel when no model
+            # bands exist — the table is never left empty)
+            lit_txt = {1: "up in tumor", -1: "down in tumor", 0: "mixed"}
+            mod_txt = {1: "toward tumor", -1: "away", 0: "–"}
+            if plaus_rows:
+                table_rows = plaus_rows
+            else:
+                table_rows = [(c, mol, assign, direction, 0, "reference")
+                              for c, _hw, mol, assign, direction
+                              in bio.BANDS]
+            self.bio_table.setRowCount(len(table_rows))
+            for r, (center, mol, assign, direction, sign, verdict) in \
+                    enumerate(table_rows):
+                for c, txt in enumerate((
+                        f"{center:.0f}", mol, assign,
+                        lit_txt.get(direction, "–"),
+                        mod_txt.get(sign, "–"), verdict)):
+                    it = QtWidgets.QTableWidgetItem(txt)
+                    if c != 2:
+                        it.setTextAlignment(ALIGN_CENTER)
+                    if c == 5:                    # color the verdict
+                        col = {"agree": "#15803d", "opposite": "#b91c1c",
+                               "unknown-sign": "#b45309",
+                               "unassigned": "#64748b",
+                               "reference": "#475569"}.get(verdict,
+                                                           "#334155")
+                        it.setForeground(qc.QtGui.QColor(col))
+                        f = it.font()
+                        f.setBold(True)
+                        it.setFont(f)
+                    self.bio_table.setItem(r, c, it)
+
+            bits = []
+            if known:
+                bits.append(f"plausibility: {agree} of {known} model "
+                            "bands match the literature direction")
+            elif self._region_bands:
+                bits.append("plausibility: no model band fell inside a "
+                            "literature window")
+            else:
+                bits.append("model bands unavailable — literature "
+                            "reference panel shown")
+            if ker_tot and np.isfinite(ker_med):
+                bits.append(f"keratin: {ker_flag} of {ker_tot} spectra "
+                            "keratin-high (possible site effect)")
+            sig_bands = [r for r in (self._band_stats or []) if r[6]]
+            if sig_bands:
+                txt = ", ".join(
+                    f"{r[0]:.0f} {r[1]} "
+                    f"({'up' if r[4] > 0 else 'down'})"
+                    for r in sig_bands[:4])
+                bits.append(f"FDR-significant bands (p<0.05): {txt}")
+            self.bio_label.setText(
+                " · ".join(bits) + "\n"
+                "Red = higher in tumor, blue = lower · exp ↑/↓ = "
+                "literature direction")
+            self.train_status.setText("Biochemistry done.")
+            self.log("Biochemistry: " + " · ".join(bits))
+
+        self._run_async("Analyzing biochemistry", fn, done)
 
     def run_honest_check(self):
         """Nested evaluation: preprocessing re-chosen inside each fold."""
@@ -3902,6 +3986,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.b_honest_btn.setEnabled(True)
         self.log(f"Honest evaluation failed:\n{tb}")
         self.train_status.setText("Honest evaluation failed — see log.")
+        QtWidgets.QMessageBox.warning(
+            self, "Honest evaluation failed",
+            "Nested honest evaluation failed.\n\nTechnical details are "
+            "in session.log next to the app.")
 
     def run_locked_eval(self):
         """
@@ -3910,9 +3998,6 @@ class MainWindow(QtWidgets.QMainWindow):
         untouched test patients.  Honest but noisy — guard against
         re-running until the numbers look good.
         """
-        from datetime import datetime
-        from sklearn.base import clone
-
         if self.winner is None or self.winner.pipeline is None:
             QtWidgets.QMessageBox.information(
                 self, "Train first",
@@ -3940,63 +4025,64 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
         if ans != QtWidgets.QMessageBox.Yes:
             return
-        self.train_status.setText("Locked evaluation…")
-        QtWidgets.QApplication.processEvents()
-        try:
-            busy(True)
+        X, yy, gg = self._lc_data
+        groups_l, labels_l = list(self.groups), list(self.labels)
+        winner_pl, winner_classes, seed = (self.winner.pipeline,
+                                           list(self.winner.classes),
+                                           self.spin_seed.value())
+
+        def fn():
+            from datetime import datetime
+            from sklearn.base import clone
             # patient sets from the ORIGINAL labels/groups (works for
             # spike-excluded / replicate-averaged / paired matrices)
             tr_idx, _va, te_idx = cdata.patient_split(
-                list(self.groups), list(self.labels),
-                seed=self.spin_seed.value())
-            tr_pats = {self.groups[i] for i in tr_idx}
-            te_pats = {self.groups[i] for i in te_idx}
-            X, yy, gg = self._lc_data
+                groups_l, labels_l, seed=seed)
+            tr_pats = {groups_l[i] for i in tr_idx}
+            te_pats = {groups_l[i] for i in te_idx}
             rows_tr = [i for i in range(len(yy)) if gg[i] in tr_pats]
             rows_te = [i for i in range(len(yy)) if gg[i] in te_pats]
             if not rows_tr or not rows_te:
                 raise RuntimeError(
                     "the split left an empty side — too few patients")
-            est = clone(self.winner.pipeline).fit(
+            est = clone(winner_pl).fit(
                 np.asarray(X)[rows_tr], [yy[i] for i in rows_tr])
             X_te = np.asarray(X)[rows_te]
             y_te = [yy[i] for i in rows_te]
             pred = est.predict(X_te)
-            classes = list(self.winner.classes)
             from sklearn.metrics import confusion_matrix, f1_score
-            cm = confusion_matrix(y_te, pred, labels=classes)
+            cm = confusion_matrix(y_te, pred, labels=winner_classes)
             f1 = float(f1_score(y_te, pred, average="macro"))
             out = {"when": f"{datetime.now():%Y-%m-%d %H:%M}",
                    "n_test_patients": len(te_pats),
                    "n_test_spectra": len(rows_te),
-                   "f1": f1, "cm": cm, "classes": classes,
-                   "model": self.winner.name}
-            if len(classes) == 2:
+                   "f1": f1, "cm": cm, "classes": winner_classes}
+            if len(winner_classes) == 2:
                 tp = int(cm[1, 1]); fn_ = int(cm[1].sum()) - tp
                 tn = int(cm[0, 0]); fp_ = int(cm[0].sum()) - tn
                 out["sens"] = tp / (tp + fn_) if tp + fn_ else float("nan")
                 out["spec"] = tn / (tn + fp_) if tn + fp_ else float("nan")
                 proba = est.predict_proba(X_te)[:, 1]
-                yv = (np.asarray(y_te) == classes[1]).astype(int)
+                yv = (np.asarray(y_te) == winner_classes[1]).astype(int)
                 _a, _se, lo, hi = clin.delong_auc_ci(yv, proba)
                 out["auc"] = float(_a)
                 out["auc_ci"] = (float(lo), float(hi))
+            return out
+
+        def done(out):
             self._locked_result = out
             self.log(f"Locked FINAL evaluation ({out['when']}): "
                      f"{out['n_test_spectra']} spectra / "
                      f"{out['n_test_patients']} unseen patients — "
-                     f"macro-F1 {f1:.3f}"
+                     f"macro-F1 {out['f1']:.3f}"
                      + (f", AUC {out.get('auc', float('nan')):.3f}"
                         if "auc" in out else ""))
             self.train_status.setText(
-                f"Locked FINAL: macro-F1 {f1:.3f} on "
+                f"Locked FINAL: macro-F1 {out['f1']:.3f} on "
                 f"{out['n_test_patients']} unseen patients")
-        except Exception as exc:
-            self.friendly_error("Locked evaluation failed", exc)
-            return
-        finally:
-            busy(False)
-        self.render_locked_result()
+            self.render_locked_result()
+
+        self._run_async("Locked evaluation", fn, done)
 
     def render_locked_result(self):
         """Fill the FINAL card on the Result page from _locked_result."""
@@ -4045,47 +4131,48 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         from sklearn.base import clone
         X, yy, gg = self._lc_data
-        self.train_status.setText("Leave-one-patient-out…")
-        QtWidgets.QApplication.processEvents()
-        try:
-            busy(True)
-            out = sstats.lopo_evaluate(
-                X, yy, gg, clone(self.winner.pipeline), {},
-                list(self.winner.classes), seed=self.spin_seed.value())
-        except Exception as exc:
-            busy(False)
-            self.friendly_error("LOPO evaluation failed", exc)
-            return
-        busy(False)
-        self._lopo_result = out
-        worst = sorted(out["per_patient"], key=lambda r: r[2])[:3]
-        self.log(f"LOPO ({out['n_patients']} patients): macro-F1 "
-                 f"{out['f1']:.3f}"
-                 + (f", AUC {out['auc']:.3f}" if np.isfinite(out["auc"])
-                    else "")
-                 + f", mean per-patient accuracy "
-                 f"{np.mean(out['accs']):.3f}")
-        self.log("  hardest: " + ", ".join(
-            f"{p} ({a:.0%})" for p, _n, a, _pp, _t in worst))
-        self.train_status.setText(
-            f"LOPO: macro-F1 {out['f1']:.3f} over "
-            f"{out['n_patients']} unseen patients")
-        ax = plotting.clear(self.roc_canvas)
-        pp = sorted(out["per_patient"], key=lambda r: r[2])
-        names = [r[0] for r in pp]
-        accs = [r[2] for r in pp]
-        ax.bar(names, accs, color=["#dc2626" if a < 0.5 else "#2563eb"
-                                   for a in accs],
-               edgecolor="white", linewidth=0.6)
-        ax.axhline(np.mean(accs), color="#64748b", lw=1.0, ls="--",
-                   label=f"mean {np.mean(accs):.2f}")
-        ax.set_ylabel("per-patient accuracy")
-        ax.set_title(f"Leave-one-patient-out ({len(pp)} patients, "
-                     f"F1 {out['f1']:.3f})", fontsize=10)
-        ax.set_ylim(0, 1.05)
-        ax.tick_params(axis="x", rotation=60, labelsize=7)
-        ax.legend(loc="lower right", fontsize=8)
-        self.roc_canvas.draw_idle()
+        winner_pl, winner_classes, seed = (self.winner.pipeline,
+                                           list(self.winner.classes),
+                                           self.spin_seed.value())
+
+        def fn():
+            return sstats.lopo_evaluate(
+                X, yy, gg, clone(winner_pl), {}, winner_classes,
+                seed=seed)
+
+        def done(out):
+            self._lopo_result = out
+            worst = sorted(out["per_patient"], key=lambda r: r[2])[:3]
+            self.log(f"LOPO ({out['n_patients']} patients): macro-F1 "
+                     f"{out['f1']:.3f}"
+                     + (f", AUC {out['auc']:.3f}"
+                        if np.isfinite(out["auc"]) else "")
+                     + f", mean per-patient accuracy "
+                     f"{np.mean(out['accs']):.3f}")
+            self.log("  hardest: " + ", ".join(
+                f"{p} ({a:.0%})" for p, _n, a, _pp, _t in worst))
+            self.train_status.setText(
+                f"LOPO: macro-F1 {out['f1']:.3f} over "
+                f"{out['n_patients']} unseen patients")
+            ax = plotting.clear(self.roc_canvas)
+            pp = sorted(out["per_patient"], key=lambda r: r[2])
+            names = [r[0] for r in pp]
+            accs = [r[2] for r in pp]
+            ax.bar(names, accs,
+                   color=["#dc2626" if a < 0.5 else "#2563eb"
+                          for a in accs],
+                   edgecolor="white", linewidth=0.6)
+            ax.axhline(np.mean(accs), color="#64748b", lw=1.0, ls="--",
+                       label=f"mean {np.mean(accs):.2f}")
+            ax.set_ylabel("per-patient accuracy")
+            ax.set_title(f"Leave-one-patient-out ({len(pp)} patients, "
+                         f"F1 {out['f1']:.3f})", fontsize=10)
+            ax.set_ylim(0, 1.05)
+            ax.tick_params(axis="x", rotation=60, labelsize=7)
+            ax.legend(loc="lower right", fontsize=8)
+            self.roc_canvas.draw_idle()
+
+        self._run_async("Leave-one-patient-out", fn, done)
 
     def run_seed_stability(self):
         """How much do the winner's numbers move just by re-running?"""
@@ -4093,33 +4180,33 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         from sklearn.base import clone
         X, yy, gg = self._lc_data
-        self.train_status.setText("Seed stability (5 seeds)…")
-        QtWidgets.QApplication.processEvents()
-        try:
-            busy(True)
-            f1s = sstats.seed_stability(
-                X, yy, gg, clone(self.winner.pipeline), {},
-                list(self.winner.classes), seeds=(0, 1, 2, 3, 4),
-                k=self.spin_folds.value())
-        except Exception as exc:
-            busy(False)
-            self.friendly_error("Seed-stability check failed", exc)
-            return
-        busy(False)
-        self._seed_result = f1s
-        self.log(f"Seed stability: macro-F1 {np.mean(f1s):.3f} ± "
-                 f"{np.std(f1s):.3f} over 5 seeds "
-                 f"(min {min(f1s):.3f}, max {max(f1s):.3f})")
-        self.train_status.setText(
-            f"Seed stability: {np.mean(f1s):.3f} ± {np.std(f1s):.3f}")
-        ax = plotting.clear(self.roc_canvas)
-        ax.boxplot([f1s], tick_labels=["winner"], showmeans=True,
-                   widths=0.35)
-        ax.scatter([1]*len(f1s), f1s, color="#2563eb", zorder=3, s=18)
-        ax.set_ylabel("macro-F1 (grouped CV)")
-        ax.set_title(f"Seed stability — {np.mean(f1s):.3f} ± "
-                     f"{np.std(f1s):.3f} (5 seeds)", fontsize=10)
-        self.roc_canvas.draw_idle()
+        winner_pl, winner_classes, k = (self.winner.pipeline,
+                                        list(self.winner.classes),
+                                        self.spin_folds.value())
+
+        def fn():
+            return sstats.seed_stability(
+                X, yy, gg, clone(winner_pl), {}, winner_classes,
+                seeds=(0, 1, 2, 3, 4), k=k)
+
+        def done(f1s):
+            self._seed_result = f1s
+            self.log(f"Seed stability: macro-F1 {np.mean(f1s):.3f} ± "
+                     f"{np.std(f1s):.3f} over 5 seeds "
+                     f"(min {min(f1s):.3f}, max {max(f1s):.3f})")
+            self.train_status.setText(
+                f"Seed stability: {np.mean(f1s):.3f} ± {np.std(f1s):.3f}")
+            ax = plotting.clear(self.roc_canvas)
+            ax.boxplot([f1s], tick_labels=["winner"], showmeans=True,
+                       widths=0.35)
+            ax.scatter([1] * len(f1s), f1s, color="#2563eb", zorder=3,
+                       s=18)
+            ax.set_ylabel("macro-F1 (grouped CV)")
+            ax.set_title(f"Seed stability — {np.mean(f1s):.3f} ± "
+                         f"{np.std(f1s):.3f} (5 seeds)", fontsize=10)
+            self.roc_canvas.draw_idle()
+
+        self._run_async("Seed stability check", fn, done)
 
     def run_noise_check(self):
         """Calibrated measurement noise at inference: F1 degradation."""
@@ -4127,43 +4214,40 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         from sklearn.base import clone
         X, yy, gg = self._lc_data
-        self.train_status.setText("Noise robustness…")
-        QtWidgets.QApplication.processEvents()
-        try:
-            busy(True)
-            curve = sstats.noise_robustness(
-                X, yy, gg, clone(self.winner.pipeline), {},
-                list(self.winner.classes), levels=(0.0, 0.01, 0.02,
-                                                   0.05),
-                k=self.spin_folds.value(),
-                seed=self.spin_seed.value())
-        except Exception as exc:
-            busy(False)
-            self.friendly_error("Noise-robustness check failed", exc)
-            return
-        busy(False)
-        self._noise_result = curve
-        drop = curve[0][1] - curve[-1][1]
-        self.log("Noise robustness: " + " -> ".join(
-            f"{int(lv * 100)}%: {f:.3f}" for lv, f in curve)
-            + f" (drop {drop:.3f} at 5% noise)")
-        self.train_status.setText(
-            f"Noise check: F1 {curve[0][1]:.3f} -> {curve[-1][1]:.3f} "
-            "at 5% noise")
-        ax = plotting.clear(self.roc_canvas)
-        lv = [f"{int(l * 100)}%" for l, _f in curve]
-        fv = [f for _l, f in curve]
-        ax.plot(lv, fv, "o-", color="#dc2626", lw=1.8, ms=6)
-        for x, y in zip(lv, fv, strict=True):
-            ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points",
-                        xytext=(0, 8), ha="center", fontsize=8.5,
-                        color="#334155")
-        ax.set_xlabel("added noise (fraction of signal scale)")
-        ax.set_ylabel("macro-F1")
-        ax.set_ylim(min(fv) - 0.05, max(fv) + 0.05)
-        ax.set_title(f"Noise robustness — drop {drop:.3f} at 5% "
-                     "noise", fontsize=10)
-        self.roc_canvas.draw_idle()
+        winner_pl, winner_classes, k, seed = (
+            self.winner.pipeline, list(self.winner.classes),
+            self.spin_folds.value(), self.spin_seed.value())
+
+        def fn():
+            return sstats.noise_robustness(
+                X, yy, gg, clone(winner_pl), {}, winner_classes,
+                levels=(0.0, 0.01, 0.02, 0.05), k=k, seed=seed)
+
+        def done(curve):
+            self._noise_result = curve
+            drop = curve[0][1] - curve[-1][1]
+            self.log("Noise robustness: " + " -> ".join(
+                f"{int(lv * 100)}%: {f:.3f}" for lv, f in curve)
+                + f" (drop {drop:.3f} at 5% noise)")
+            self.train_status.setText(
+                f"Noise check: F1 {curve[0][1]:.3f} -> {curve[-1][1]:.3f} "
+                "at 5% noise")
+            ax = plotting.clear(self.roc_canvas)
+            lv = [f"{int(l * 100)}%" for l, _f in curve]
+            fv = [f for _l, f in curve]
+            ax.plot(lv, fv, "o-", color="#dc2626", lw=1.8, ms=6)
+            for x, y in zip(lv, fv, strict=True):
+                ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points",
+                            xytext=(0, 8), ha="center", fontsize=8.5,
+                            color="#334155")
+            ax.set_xlabel("added noise (fraction of signal scale)")
+            ax.set_ylabel("macro-F1")
+            ax.set_ylim(min(fv) - 0.05, max(fv) + 0.05)
+            ax.set_title(f"Noise robustness — drop {drop:.3f} at 5% "
+                         "noise", fontsize=10)
+            self.roc_canvas.draw_idle()
+
+        self._run_async("Noise robustness check", fn, done)
 
     def run_local_explain(self):
         """
@@ -4194,21 +4278,20 @@ class MainWindow(QtWidgets.QMainWindow):
         from sklearn.ensemble import RandomForestClassifier
         X, yy, gg = self._lc_data
         wn = np.asarray(self._lc_wn)
-        self.train_status.setText("Explaining prediction…")
-        QtWidgets.QApplication.processEvents()
-        try:
-            busy(True)
+        pred_rows = list(self._pred_rows)
+        pred_spectra = list(self._pred_spectra)
+
+        def fn():
+            import shap as shap_mod
             est = RandomForestClassifier(
                 n_estimators=300, class_weight="balanced", n_jobs=-1,
                 random_state=0).fit(np.asarray(X),
                                     modeling._encode(list(yy),
                                                      sorted(set(yy))))
-            import shap as shap_mod
             expl = shap_mod.TreeExplainer(est)
             # mean spectrum per predicted class
             groups_cls: dict[str, list[np.ndarray]] = {}
-            for (_fname, cls, _p), spec in zip(self._pred_rows,
-                                               self._pred_spectra,
+            for (_fname, cls, _p), spec in zip(pred_rows, pred_spectra,
                                                strict=True):
                 groups_cls.setdefault(cls, []).append(spec)
             classes_enc = sorted(set(yy))
@@ -4233,44 +4316,45 @@ class MainWindow(QtWidgets.QMainWindow):
                                      mol, assign, direction))
                 contribs.sort(key=lambda r: -abs(r[0]))
                 rows.append((cls, contribs[:5]))
-        except Exception as exc:
-            busy(False)
-            self.friendly_error("Local explanation failed", exc)
-            return
-        busy(False)
-        self._local_bands = rows
-        ax = plotting.clear(self.r_local_canvas)
-        colors = {1: "#dc2626", -1: "#2563eb"}
-        ybase = 0.0
-        yticks, yticklabs = [], []
-        for cls, contribs in rows:
-            for i, (v, center, mol, _assign, _dir) in enumerate(contribs):
-                y = ybase + i
-                ax.barh(y, v, height=0.7,
-                        color=colors[1 if v >= 0 else -1],
-                        edgecolor="white", linewidth=0.5)
-                ax.text(v, y, f"  {center:.0f} {mol}",
-                        va="center", ha="left" if v >= 0 else "right",
-                        fontsize=8, color="#334155")
-            yticks.append(ybase + len(contribs) / 2 - 0.5)
-            yticklabs.append(f"predicted: {cls}")
-            ybase += len(contribs) + 1.2
-        ax.set_yticks(yticks, yticklabs, fontsize=9, fontweight="bold")
-        ax.axvline(0, color="#64748b", lw=0.8)
-        ax.invert_yaxis()
-        ax.set_xlabel("signed SHAP contribution (surrogate)")
-        ax.set_title("Why this call — band contributions per predicted "
-                     "class", fontsize=10)
-        self.r_local_canvas.draw_idle()
-        tops = "; ".join(
-            f"{cls}: " + ", ".join(
-                f"{c:.0f}{'+' if v >= 0 else '−'}"
-                for v, c, _m, _a, _d in contribs[:3])
-            for cls, contribs in rows)
-        self.log(f"Local explanation ({len(self._pred_spectra)} "
-                 f"spectra): {tops}")
-        self.train_status.setText("Local explanation done — see Result "
-                                  "page.")
+            return rows
+
+        def done(rows):
+            self._local_bands = rows
+            ax = plotting.clear(self.r_local_canvas)
+            colors = {1: "#dc2626", -1: "#2563eb"}
+            ybase = 0.0
+            yticks, yticklabs = [], []
+            for cls, contribs in rows:
+                for i, (v, center, mol, _assign, _dir) in enumerate(contribs):
+                    y = ybase + i
+                    ax.barh(y, v, height=0.7,
+                            color=colors[1 if v >= 0 else -1],
+                            edgecolor="white", linewidth=0.5)
+                    ax.text(v, y, f"  {center:.0f} {mol}",
+                            va="center", ha="left" if v >= 0 else "right",
+                            fontsize=8, color="#334155")
+                yticks.append(ybase + len(contribs) / 2 - 0.5)
+                yticklabs.append(f"predicted: {cls}")
+                ybase += len(contribs) + 1.2
+            ax.set_yticks(yticks, yticklabs, fontsize=9,
+                          fontweight="bold")
+            ax.axvline(0, color="#64748b", lw=0.8)
+            ax.invert_yaxis()
+            ax.set_xlabel("signed SHAP contribution (surrogate)")
+            ax.set_title("Why this call — band contributions per "
+                         "predicted class", fontsize=10)
+            self.r_local_canvas.draw_idle()
+            tops = "; ".join(
+                f"{cls}: " + ", ".join(
+                    f"{c:.0f}{'+' if v >= 0 else '−'}"
+                    for v, c, _m, _a, _d in contribs[:3])
+                for cls, contribs in rows)
+            self.log(f"Local explanation ({len(pred_spectra)} "
+                     f"spectra): {tops}")
+            self.train_status.setText("Local explanation done — see "
+                                      "Result page.")
+
+        self._run_async("Explaining prediction", fn, done)
 
     # ============================================================== Train
     def start_training(self):
@@ -4835,6 +4919,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_predict.setEnabled(True)
         self.statusBar().showMessage("Prediction failed — see log")
         self.log(f"Prediction failed:\n{tb}")
+        QtWidgets.QMessageBox.warning(
+            self, "Prediction failed",
+            "Prediction failed.\n\nTechnical details are in session.log "
+            "next to the app.")
 
     def _aggregate_patients(self, files: list[str], rows: list[tuple]):
         """
@@ -4982,6 +5070,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
     def closeEvent(self, event):
+        # stop background threads before the widgets they signal die —
+        # a destroyed running QThread crashes the process
+        for w in (self.worker, self._opt_worker, self._pred_worker,
+                  self._honest_worker, self._analysis_worker):
+            if w is not None and w.isRunning():
+                w.wait(3000)
+                if w.isRunning():
+                    w.terminate()
+                    w.wait(500)
         if self._source_folder:
             self.settings["folder"] = self._source_folder
         self.settings.pop("files", None)          # legacy setting

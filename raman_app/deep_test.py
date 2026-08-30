@@ -73,6 +73,16 @@ def make_gui():
     return win
 
 
+def wait_analysis(win, timeout_ms: int = 120000):
+    """The analysis buttons run on a background worker; wait for it and
+    flush the queued done-callbacks before asserting on results."""
+    from qt_compat import QtWidgets
+    if win._analysis_worker is not None:
+        win._analysis_worker.wait(timeout_ms)
+    for _ in range(10):
+        QtWidgets.QApplication.processEvents()
+
+
 def main() -> int:
     # ---------------------------------------------------------------- GUI
     def s_blank_gui():
@@ -506,6 +516,7 @@ def main() -> int:
         win._lc_data = (X, win.labels, win.groups)
         win._lc_wn = np.asarray(win.grid)[pp.crop_mask(win.grid, params)]
         win.run_locked_eval()                     # question -> Yes
+        wait_analysis(win)
         out = win._locked_result
         assert out is not None and out["n_test_patients"] >= 1
         assert 0.0 <= out["f1"] <= 1.0 and "auc" in out
@@ -566,13 +577,16 @@ def main() -> int:
         params = win.read_params().validate()
         win._lc_data = (X, win.labels, win.groups)
         win._lc_wn = np.asarray(win.grid)[pp.crop_mask(win.grid, params)]
-        # deep diagnostics (all synchronous)
+        # deep diagnostics (each runs on the shared analysis worker)
         win.run_lopo()
+        wait_analysis(win)
         assert win._lopo_result is not None
         assert win._lopo_result["n_patients"] == 8
         win.run_seed_stability()
+        wait_analysis(win)
         assert win._seed_result and len(win._seed_result) == 5
         win.run_noise_check()
+        wait_analysis(win)
         assert win._noise_result and len(win._noise_result) == 4
         # predict something, then explain it locally
         path = os.path.join(tmp, "m.joblib")
@@ -588,6 +602,7 @@ def main() -> int:
         try:
             import shap  # noqa: F401
             win.run_local_explain()
+            wait_analysis(win)
             assert win._local_bands, "local explanation produced rows"
         except ImportError:
             pass                        # optional dependency
