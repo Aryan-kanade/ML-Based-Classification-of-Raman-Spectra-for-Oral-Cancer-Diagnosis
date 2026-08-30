@@ -5126,9 +5126,21 @@ class MainWindow(QtWidgets.QMainWindow):
         checked = self._seq_effective_models()
         base = [n for n in checked if n != "Ensemble (top-3)"]
         n = len(base) + (1 if "Ensemble (top-3)" in checked else 0)
-        n = max(n, 2)
         singles, pairs, triples = n, n * (n - 1), n * (n - 1) * (n - 2)
         total_arch = singles + pairs + triples
+        if n < 3:
+            # not enough models for the chain search — say so clearly
+            self.seq_counts.setText(
+                f"Only {n} model{'s' if n > 1 else ''} selected — the "
+                "architecture search needs at least 2 (3+ for two- and "
+                "three-model chains). Tick more models above (the "
+                "'All' button checks everything).")
+            self.seq_counts.setStyleSheet("color:#b91c1c;")
+            self.seq_estimate.setText("")
+            self.b_3sse_run.setEnabled(n >= 2)
+            return
+        self.seq_counts.setStyleSheet("")
+        self.b_3sse_run.setEnabled(True)
         k = 2 if self.chk_3sse_fast.isChecked() else (
             self.spin_folds.value()
             if hasattr(self, "spin_folds") else 5)
@@ -5171,6 +5183,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "3SSE search already running",
                 "An architecture search is in progress — watch the "
                 "counter in this card; results open automatically.")
+            return
+        eff = self._seq_effective_models()
+        if len(eff) < 2:
+            QtWidgets.QMessageBox.information(
+                self, "Not enough models selected",
+                f"Only {len(eff)} model is selected for the "
+                "architecture search.\n\nTick at least 2 models "
+                "(3 or more for two- and three-model chains) — the "
+                "'All' button above the model list checks everything.")
             return
         # paired whenever patient groups exist; the dropdown reflects it
         self.combo_mode.setCurrentIndex(4 if self.groups is not None
