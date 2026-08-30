@@ -868,6 +868,31 @@ def test_bootstrap_ci_patient_level():
     assert hi_s - lo_s > hi_g - lo_g
 
 
+def test_new_models_lgbm_catboost_cnn():
+    """LightGBM / CatBoost / 1D-CNN run through the grouped CV machinery
+    (skipped per-model when the optional dependency is absent)."""
+    from sklearn.base import clone
+    rng = np.random.default_rng(1)
+    y = np.array(["A", "B"] * 30)
+    groups = np.repeat([f"S{i}" for i in range(12)], 5)
+    X = rng.normal(0, 1, (60, 120)) + (y == "B")[:, None] * 1.5
+    names = [n for n, ok in (("LightGBM", modeling.HAS_LGBM),
+                             ("CatBoost", modeling.HAS_CATBOOST),
+                             ("1D-CNN", modeling.HAS_TORCH)) if ok]
+    assert names, "none of the new-model dependencies are installed"
+    for n in names:
+        assert n in modeling.ALL_MODEL_NAMES
+    if modeling.HAS_TORCH:            # clone + proba contract
+        est = clone(modeling.CNN1DClassifier(epochs=5)).fit(X[:20], y[:20])
+        proba = est.predict_proba(X[:10])
+        assert proba.shape == (10, 2) and np.allclose(proba.sum(1), 1)
+    results, _winner = modeling.evaluate_models(
+        X, list(y), model_names=names, k_folds=3, groups=list(groups))
+    for r in results:
+        assert r.error is None, r.error
+        assert 0 <= r.macro_f1() <= 1
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

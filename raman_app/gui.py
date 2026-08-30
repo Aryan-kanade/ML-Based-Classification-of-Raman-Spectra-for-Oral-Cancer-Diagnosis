@@ -50,7 +50,7 @@ DEMO_DIR = os.path.join(APP_DIR, "demo_data")
 
 # bump when the model suite changes so saved checkbox states don't hide
 # newly added models
-SUITE_VERSION = 4
+SUITE_VERSION = 5
 
 # every GUI log line is mirrored to a rotating session log on disk
 import logging                                    # noqa: E402

@@ -43,9 +43,10 @@ venv), PyQt5 binding (auto-detect PyQt5→PyQt6→PySide6 by import success
 order, `qt_compat.py`; ~15 enum constants normalized Qt5/Qt6). Deps
 pinned in `raman_app/requirements.txt`: numpy 2.5.2, scipy 1.18.1,
 scikit-learn 1.9.0, pandas 3.0.5, matplotlib 3.11.1, PyWavelets 1.9.0,
-joblib 1.5.3, xgboost 3.4.1, pybaselines 1.2.1, shap 0.52.0,
-torch 2.13.0, PyQt5 5.15.11. Optional deps (pybaselines/shap/torch/
-xgboost) all have graceful fallbacks via module HAS_* flags.
+joblib 1.5.3, xgboost 3.4.1, lightgbm 4.7.0, catboost 1.2.10,
+pybaselines 1.2.1, shap 0.52.0, torch 2.13.0, PyQt5 5.15.11. Optional
+deps (pybaselines/shap/torch/xgboost/lightgbm/catboost) all have
+graceful fallbacks via module HAS_* flags.
 
 ```bash
 cd raman_app
@@ -67,8 +68,8 @@ exists). `matplotlib.use("Agg")` for all headless figure writing.
 | File | ~Lines | Role |
 |---|---|---|
 | `gui.py` | 5121 | 6-page MainWindow, 5 QThread workers, all slots. See §14. |
-| `modeling.py` | 1189 | Model registry + nested grouped CV + bundles + importance + bootstrap/McNemar. §7-8, 12. |
-| `test_all.py` | 887 | 40 unit tests incl. 4 regressions for the 2026-08-30 fixes. |
+| `modeling.py` | 1346 | Model registry + nested grouped CV + bundles + importance + bootstrap/McNemar. §7-8, 12. |
+| `test_all.py` | 912 | 41 unit tests incl. 4 regressions for the 2026-08-30 fixes + new-models test. |
 | `deep_test.py` | 644 | 17 adversarial GUI/CLI scenarios; `wait_analysis()` helper. |
 | `vit_train.py` / `vit_model.py` / `vit_test.py` | 558/207/143 | Secondary ViT track (torch). §15. |
 | `plotting.py` | 439 | rcParams theme, `MatplotlibCanvas` (lazy Qt-binding pin), plot helpers. |
@@ -241,7 +242,7 @@ pipeline.
   repeats; `bootstrap_ci` patient-level when groups given (both fixed
   2026-08-30); exact McNemar.
 
-## 8. Model registry — full hyperparameter grids
+## 8. Model registry — full hyperparameter grids (17 rows)
 
 All share `random_state=42` where applicable. "PCA" pipelines =
 StandardScaler → PCA(n_components=0.95).
@@ -260,8 +261,19 @@ StandardScaler → PCA(n_components=0.95).
 | PCA + MLP | hidden (64,), max_iter 1500 | alpha∈[1e-3,1e-1] |
 | Isolation Forest (OvR) | IsolationForestOvR | n_estimators∈[100,300] |
 | XGBoost (if installed) | 200 trees, depth 4, hist | max_depth∈[3,5]; lr∈[0.05,0.2] |
+| LightGBM (if installed) | 200 trees, depth 4, balanced, verbosity −1 | max_depth∈[3,5]; lr∈[0.05,0.2] |
+| CatBoost (if installed) | 200 iters, depth 4, auto_class_weights, verbose 0, no file writes | depth∈[3,5]; lr∈[0.05,0.2] |
+| 1D-CNN (if torch) | `CNN1DClassifier` (see below) | **empty** — one seeded fit per fold |
 | Peak bands + RF | `needs_wn`: 16 band means (width 30) → RF 250 | max_depth∈[None,8] |
+| Ensemble (top-3) | resolved post-hoc | — |
 
+- **`CNN1DClassifier`** (modeling.py, sklearn-compatible torch wrapper,
+  BaseEstimator/ClassifierMixin): Conv1d(1→32,k7)+BN+ReLU+MaxPool →
+  Conv1d(32→64,k5)+BN+ReLU+AdaptiveAvgPool → Dropout(0.2) → Linear
+  (~25k params, CPU). Class-weighted CE, Adam 1e-3, 40 epochs, batch
+  32, stratified 15 % val split, early stop patience 6 with best-weight
+  restore; `torch.manual_seed(seed)`; X auto-shaped (n,1,L);
+  predict_proba = batched softmax in eval/no_grad. Pickles into bundles.
 - **PLSDAClassifier**: PLSRegression on one-hot Y; predict_proba =
   softmax of PLS scores (pseudo-probabilities — monotone per class).
 - **Ensemble (top-3)**: VotingClassifier(soft) over the 3 best
@@ -391,8 +403,9 @@ Paired: rule-out p≤0.35 (sens 91%), rule-in p≥0.67 (spec 91%), Brier
 
 **Shell**: `TAB_START..TAB_RESULT = range(6)`; SidebarNav (215px,
 checkable), PageStack with 170 ms fade, footer back/next
-(`NEXT_LABELS`), pages wrapped in QScrollArea. `SUITE_VERSION = 4`
-gates saved model-checkbox restore. Menu: File = Open folder (Ctrl+O),
+(`NEXT_LABELS`), pages wrapped in QScrollArea. `SUITE_VERSION = 5`
+gates saved model-checkbox restore (bumped when the model list changes).
+Menu: File = Open folder (Ctrl+O),
 Reload (F5), Load model (Ctrl+L), Save model (Ctrl+S), Exit (Ctrl+Q);
 Help = How to (F1), Metrics, About. Logging: `log()` → stdout +
 `session.log` (rotating 1 MB ×2).

@@ -45,6 +45,25 @@ try:
 except ImportError:
     HAS_XGB = False
 
+try:
+    from lightgbm import LGBMClassifier
+    HAS_LGBM = True
+except ImportError:
+    HAS_LGBM = False
+
+try:
+    from catboost import CatBoostClassifier
+    HAS_CATBOOST = True
+except ImportError:
+    HAS_CATBOOST = False
+
+try:
+    import torch
+    from torch import nn
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
 RANDOM_STATE = 42
 
 
@@ -79,6 +98,118 @@ class PLSDAClassifier(BaseEstimator, ClassifierMixin):
         s = s - s.max(axis=1, keepdims=True)
         p = np.exp(np.clip(s, -50, 50))
         return p / p.sum(axis=1, keepdims=True)
+
+
+# --------------------------------------------------------------------------
+# 1D-CNN over the raw (cropped) spectrum — torch wrapper, sklearn-compatible
+# --------------------------------------------------------------------------
+if HAS_TORCH:
+
+    class _CNN1DNet(nn.Module):
+        """Conv1d(1→32, k7) → pool → Conv1d(32→64, k5) → global avg pool
+        → dropout → linear head.  ~25k parameters; CPU-fast."""
+
+        def __init__(self, n_classes: int, length: int, dropout: float):
+            super().__init__()
+            self.features = nn.Sequential(
+                nn.Conv1d(1, 32, kernel_size=7, padding=3),
+                nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
+                nn.Conv1d(32, 64, kernel_size=5, padding=2),
+                nn.BatchNorm1d(64), nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+            )
+            self.head = nn.Sequential(nn.Dropout(dropout),
+                                      nn.Linear(64, n_classes))
+
+        def forward(self, x):            # x: (batch, 1, length)
+            h = self.features(x).squeeze(-1)
+            return self.head(h)
+
+    class CNN1DClassifier(BaseEstimator, ClassifierMixin):
+        """
+        Small 1D-CNN classifier: fits inside the CV/bundle machinery
+        like any sklearn estimator (clone, GridSearchCV with an empty
+        grid, joblib pickling of the torch state).
+
+        Training: class-weighted cross-entropy, Adam, fixed epoch budget
+        with early stopping on a stratified 15 % validation split
+        (best-weights restored).  Seeded for reproducibility.
+        """
+
+        def __init__(self, epochs: int = 40, batch_size: int = 32,
+                     lr: float = 1e-3, dropout: float = 0.2,
+                     seed: int = RANDOM_STATE):
+            self.epochs = epochs
+            self.batch_size = batch_size
+            self.lr = lr
+            self.dropout = dropout
+            self.seed = seed
+
+        def _to_tensor(self, X):
+            X = np.asarray(X, dtype=np.float32)
+            if X.ndim != 3:
+                X = X[:, None, :]                    # (n, 1, length)
+            return torch.from_numpy(X)
+
+        def fit(self, X, y):
+            from sklearn.model_selection import train_test_split
+            torch.manual_seed(self.seed)
+            self.classes_ = np.unique(y)
+            ye = np.searchsorted(self.classes_, y)
+            Xt = self._to_tensor(X)
+            self.n_features_in_ = Xt.shape[-1]
+            if len(ye) >= 20:
+                idx_tr, idx_va = train_test_split(
+                    np.arange(len(ye)), test_size=0.15, stratify=ye,
+                    random_state=self.seed)
+            else:                                   # too small to split
+                idx_tr = idx_va = np.arange(len(ye))
+            counts = np.bincount(ye, minlength=len(self.classes_))
+            weights = torch.tensor(
+                len(ye) / (len(self.classes_) * np.maximum(counts, 1)),
+                dtype=torch.float32)
+            loss_fn = nn.CrossEntropyLoss(weight=weights)
+            self.net_ = _CNN1DNet(len(self.classes_), Xt.shape[-1],
+                                  self.dropout)
+            opt = torch.optim.Adam(self.net_.parameters(), lr=self.lr)
+            gen = torch.Generator().manual_seed(self.seed)
+            best_state, best_loss, best_epoch = None, np.inf, -1
+            for epoch in range(self.epochs):
+                self.net_.train()
+                perm = torch.randperm(len(idx_tr), generator=gen).numpy()
+                for s in range(0, len(perm), self.batch_size):
+                    b = perm[s:s + self.batch_size]
+                    opt.zero_grad()
+                    loss = loss_fn(self.net_(Xt[idx_tr[b]]),
+                                   torch.from_numpy(ye[idx_tr[b]]))
+                    loss.backward()
+                    opt.step()
+                self.net_.eval()
+                with torch.no_grad():
+                    va_loss = float(loss_fn(self.net_(Xt[idx_va]),
+                                            torch.from_numpy(ye[idx_va])))
+                if va_loss < best_loss - 1e-4:
+                    best_loss, best_epoch = va_loss, epoch
+                    best_state = {k: v.clone()
+                                  for k, v in self.net_.state_dict().items()}
+                elif epoch - best_epoch >= 6:       # early stop
+                    break
+            if best_state is not None:
+                self.net_.load_state_dict(best_state)
+            self.net_.eval()
+            return self
+
+        def predict_proba(self, X):
+            with torch.no_grad():
+                out = []
+                for s in range(0, len(X), 256):
+                    logits = self.net_(self._to_tensor(
+                        np.asarray(X)[s:s + 256]))
+                    out.append(torch.softmax(logits, dim=1).numpy())
+                return np.vstack(out)
+
+        def predict(self, X):
+            return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
 
 
 # --------------------------------------------------------------------------
@@ -332,6 +463,32 @@ def model_specs() -> list[dict]:
                 tree_method="hist", eval_metric="mlogloss",
                 random_state=RANDOM_STATE, n_jobs=-1),
             "grid": {"max_depth": [3, 5], "learning_rate": [0.05, 0.2]},
+        })
+    if HAS_LGBM:
+        specs.append({
+            "name": "LightGBM",
+            "estimator": LGBMClassifier(
+                n_estimators=200, max_depth=4, learning_rate=0.1,
+                class_weight="balanced", verbosity=-1,
+                random_state=RANDOM_STATE, n_jobs=-1),
+            "grid": {"max_depth": [3, 5], "learning_rate": [0.05, 0.2]},
+        })
+    if HAS_CATBOOST:
+        specs.append({
+            "name": "CatBoost",
+            "estimator": CatBoostClassifier(
+                iterations=200, depth=4, learning_rate=0.1,
+                auto_class_weights="Balanced", verbose=0,
+                allow_writing_files=False, random_seed=RANDOM_STATE),
+            "grid": {"depth": [3, 5], "learning_rate": [0.05, 0.2]},
+        })
+    if HAS_TORCH:
+        specs.append({
+            "name": "1D-CNN",
+            # empty grid: one seeded fit per fold (grid over epochs
+            # would multiply an already-iterative training)
+            "estimator": CNN1DClassifier(),
+            "grid": {},
         })
     # interpretable 16-band model (needs the wavenumber axis at fit time)
     specs.append({
