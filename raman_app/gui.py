@@ -676,40 +676,50 @@ class SeqResultsDialog(QtWidgets.QDialog):
     def _winner_tab(self, payload):
         w = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(w)
-        validated = payload["validated"]
+        validated = payload.get("validated") or {}
         winner = payload.get("winner")
-        lines = ["NESTED VALIDATION — best per level", ""]
-        for level in (1, 2, 3):
-            cands = validated.get(level, [])
-            if cands:
-                b = max(cands, key=lambda e: e["metrics"]["f1"])
-                m = b["metrics"]
-                lines.append(f"{level}-Model:  {' → '.join(b['arch'])}")
-                lines.append(f"          F1 {m['f1']:.3f} · "
-                             f"sens {m['sens']:.3f} · "
-                             f"spec {m['spec']:.3f} · "
-                             f"AUC {m.get('auc', float('nan')):.3f} · "
-                             f"acc {m['acc']:.3f}")
-                lines.append("")
-        if winner:
-            m = winner["metrics"]
-            lines += ["=" * 56,
-                      f"OVERALL WINNER ({len(winner['arch'])}-Model): "
-                      f"{' → '.join(winner['arch'])}",
-                      f"  Macro-F1 {m['f1']:.3f} · sensitivity "
-                      f"{m['sens']:.3f} · specificity {m['spec']:.3f}",
-                      f"  ROC-AUC {m.get('auc', float('nan')):.3f} · "
-                      f"accuracy {m['acc']:.3f}",
-                      "  Baseline (paired Extra Trees): F1 0.702 · "
-                      "AUC 0.788"]
+        if validated or winner:
+            lines = ["NESTED VALIDATION — best per level", ""]
+            for level in (1, 2, 3):
+                cands = validated.get(level, [])
+                if cands:
+                    b = max(cands, key=lambda e: e["metrics"]["f1"])
+                    m = b["metrics"]
+                    lines.append(f"{level}-Model:  "
+                                 f"{' → '.join(b['arch'])}")
+                    lines.append(f"          F1 {m['f1']:.3f} · "
+                                 f"sens {m['sens']:.3f} · "
+                                 f"spec {m['spec']:.3f} · "
+                                 f"AUC {m.get('auc', float('nan')):.3f} ·"
+                                 f" acc {m['acc']:.3f}")
+                    lines.append("")
+            if winner:
+                m = winner["metrics"]
+                lines += ["=" * 56,
+                          f"OVERALL WINNER ({len(winner['arch'])}-Model):"
+                          f" {' → '.join(winner['arch'])}",
+                          f"  Macro-F1 {m['f1']:.3f} · sensitivity "
+                          f"{m['sens']:.3f} · specificity "
+                          f"{m['spec']:.3f}",
+                          f"  ROC-AUC {m.get('auc', float('nan')):.3f} · "
+                          f"accuracy {m['acc']:.3f}",
+                          "  Baseline (paired Extra Trees): F1 0.702 · "
+                          "AUC 0.788"]
+        elif payload.get("report_text"):
+            # loaded from a saved run without persisted validation data
+            text = payload["report_text"]
+            start = text.find("FULL NESTED VALIDATION")
+            lines = ([text[start:].rstrip()] if start >= 0
+                     else [text])
         else:
-            lines.append("No validated winner available.")
+            lines = ["No validated winner available."]
         lbl = QtWidgets.QLabel("\n".join(lines))
         lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         lay.addWidget(lbl)
         lay.addStretch(1)
         btn = QtWidgets.QPushButton("Save winner as model bundle…")
-        btn.setEnabled(winner is not None)
+        # only live search results carry the fitted chain
+        btn.setEnabled(bool(winner and winner.get("chain")))
         btn.clicked.connect(self._on_save)
         lay.addWidget(btn)
         return w
@@ -1253,6 +1263,16 @@ class MainWindow(QtWidgets.QMainWindow):
             "with probabilistic quotient normalization against the "
             "patient's own normal (Dieterle 2006).")
         cv.addWidget(self.combo_mode)
+        cv.addSpacing(4)
+        self.b_3sse_view = QtWidgets.QPushButton(
+            "View saved 3SSE results (last architecture search)…")
+        self.b_3sse_view.setFlat(True)
+        self.b_3sse_view.setToolTip(
+            "Open the ranking tables (single / 2-model / 3-model layers "
+            "and the overall winner) of the last completed 3SSE search "
+            "in study_run_3sse/ — no re-run needed.")
+        self.b_3sse_view.clicked.connect(self.view_saved_3sse)
+        cv.addWidget(self.b_3sse_view)
         cv.addSpacing(4)
         cv.addWidget(QtWidgets.QLabel("Models to compare "
                                       "(best F1 wins — try all!):"))
@@ -4754,6 +4774,67 @@ class MainWindow(QtWidgets.QMainWindow):
             "\n\nFull details are printed to the console.")
 
     # ================================================== 3SSE handlers
+    def view_saved_3sse(self):
+        """Open the last completed 3SSE run's rankings without re-running
+        (reads study_run_3sse: screening.jsonl + validated.json +
+        winner.json + report.txt)."""
+        import json as _json
+        folder = os.path.join(APP_DIR, "study_run_3sse")
+        screening = os.path.join(folder, "screening.jsonl")
+        if not os.path.isfile(screening):
+            QtWidgets.QMessageBox.information(
+                self, "No saved 3SSE run",
+                "No completed architecture search found in "
+                "study_run_3sse/.\n\nPick a '3SSE search' training mode "
+                "and press Start training, or run sequential.py from "
+                "the command line first.")
+            return
+        board = {"singles": [], "pairs": [], "triples": [], "total": 0,
+                 "pruned": 0}
+        key = {1: "singles", 2: "pairs", 3: "triples"}
+        with open(screening, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+                board[key[rec["level"]]].append(
+                    {"arch": tuple(rec["arch"]), "level": rec["level"],
+                     "metrics": {k: v for k, v in rec.items()
+                                 if k not in ("arch", "level")}})
+        board["total"] = (len(board["singles"]) + len(board["pairs"])
+                          + len(board["triples"]))
+        payload = {"board": board, "validated": {}, "winner": None}
+        vpath = os.path.join(folder, "validated.json")
+        if os.path.isfile(vpath):
+            try:
+                with open(vpath, encoding="utf-8") as fh:
+                    payload["validated"] = {
+                        int(k): v
+                        for k, v in _json.load(fh).items()}
+            except Exception:
+                pass
+        wpath = os.path.join(folder, "winner.json")
+        if os.path.isfile(wpath):
+            try:
+                with open(wpath, encoding="utf-8") as fh:
+                    payload["winner"] = _json.load(fh)
+            except Exception:
+                pass
+        rpath = os.path.join(folder, "report.txt")
+        if os.path.isfile(rpath):
+            try:
+                with open(rpath, encoding="utf-8") as fh:
+                    payload["report_text"] = fh.read()
+            except Exception:
+                pass
+        dlg = SeqResultsDialog(payload, parent=self)
+        dlg.setModal(False)
+        dlg.show()
+        self.log("Opened saved 3SSE results "
+                 f"({board['total']} architectures) from "
+                 "study_run_3sse/")
+
     def on_seq_progress(self, pct: int, msg: str):
         if pct >= 0:
             self.progress.setValue(pct)

@@ -844,6 +844,24 @@ def main(argv=None) -> int:
     baseline = ({"Extra Trees (paired baseline)": (0.702, 0.788)}
                 if args.mode.startswith("paired")
                 else {"Peak bands + RF (std baseline)": (0.594, 0.610)})
+
+    def _dumpable(m):
+        return {k: v for k, v in m.items()
+                if k not in ("oof_proba", "y_true", "cm")}
+
+    with open(os.path.join(out_dir, "validated.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump({str(lv): [{"arch": list(e["arch"]),
+                              "metrics": _dumpable(e["metrics"])}
+                             for e in validated.get(lv, [])]
+                   for lv in (1, 2, 3)}, fh, indent=2)
+    winner = pick_overall(validated)
+    if winner is not None:
+        with open(os.path.join(out_dir, "winner.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"arch": list(winner["arch"]),
+                       "metrics": _dumpable(winner["metrics"])},
+                      fh, indent=2)
     report = build_report(board, validated, baseline)
     print(report)
     with open(os.path.join(out_dir, "report.txt"), "w",
