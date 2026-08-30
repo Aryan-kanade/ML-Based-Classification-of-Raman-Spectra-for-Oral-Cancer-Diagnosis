@@ -68,7 +68,15 @@ def make_gui():
     if not DIALOG_LOG and not getattr(make_gui, "_patched", False):
         _install_dialog_recorder()
         make_gui._patched = True
-    win = gui.MainWindow()
+    # isolate from the developer's settings.json: a restored last-session
+    # folder would silently give "no data" scenarios data (and launch
+    # real worker pools) — every scenario loads its own data explicitly
+    _saved = uh.load_settings
+    uh.load_settings = lambda: {}
+    try:
+        win = gui.MainWindow()
+    finally:
+        uh.load_settings = _saved
     win._dialog_log = DIALOG_LOG
     return win
 
@@ -311,17 +319,20 @@ def main() -> int:
 
     def s_workers_programmatic():
         # sender() is None when workers are started programmatically —
-        # the run must still work and the callbacks must not crash
+        # the run must still work and the callbacks must not crash.
+        # Started one after another: concurrent loky pools from several
+        # QThreads are a native-crash race on Windows (access
+        # violation inside joblib retrieval) — see Brain.md gotchas.
         win = make_gui()
         src = dataset.find_default_source_spectrum()
         demo = dataset.generate_demo_data(
             src, os.path.join(tempfile.mkdtemp(), "d4"))
         win.load_folder(demo, quiet=True)
         win.run_optimize()                        # sender() is None here
-        win.run_honest_check()                    # sender() is None here
         win._opt_worker.wait(120000)
-        win._honest_worker.wait(180000)
         assert win._opt_worker.isFinished()
+        win.run_honest_check()                    # sender() is None here
+        win._honest_worker.wait(180000)
         assert win._honest_worker.isFinished()
         win.close()
 

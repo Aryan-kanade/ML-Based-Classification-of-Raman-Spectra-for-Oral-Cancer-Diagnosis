@@ -195,6 +195,7 @@ class SeqSearchWorker(QtCore.QThread):
     and the deployable winner chain — GUI work stays on the main thread.
     """
     progress = Signal(int, str)
+    search_progress = Signal(int, int, str, float, float)  # done,total,best,f1,eta
     done = Signal(object)              # {"board", "validated", "winner"}
     failed = Signal(str)
 
@@ -215,6 +216,7 @@ class SeqSearchWorker(QtCore.QThread):
                     int(100 * done / max(total, 1)),
                     f"{done}/{total} architectures · best {best} "
                     f"(F1 {f1:.3f}) · ETA {eta / 60:.0f} min")
+                self.search_progress.emit(done, total, best, f1, eta)
 
             board = sequential.search(
                 self.X, self.y, groups=self.groups,
@@ -231,7 +233,7 @@ class SeqSearchWorker(QtCore.QThread):
                 self.wavenumbers, board=board, k=self.k, seed=self.seed)
             self.done.emit({"board": board, "validated": validated,
                             "winner": winner, "k": self.k,
-                            "seed": self.seed})
+                            "seed": self.seed, "groups": self.groups})
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -596,6 +598,83 @@ class LikelihoodMeter(QtWidgets.QWidget):
 # ==========================================================================
 # Main window
 # ==========================================================================
+class ChainFlowWidget(QtWidgets.QWidget):
+    """Painted 3SSE architecture flow, e.g.
+    [Spectrum] → [Model A] → P₁ → [Model B] → [Verdict].
+    Scales to 1-3 layers; set_arch() to update."""
+
+    BOX_H = 30
+
+    def __init__(self, arch, parent=None):
+        super().__init__(parent)
+        self._arch = list(arch)
+        self.setMinimumHeight(52)
+
+    def set_arch(self, arch):
+        self._arch = list(arch)
+        self.setVisible(bool(self._arch))
+        self.update()
+
+    def paintEvent(self, _ev):
+        p = qc.QtGui.QPainter(self)
+        p.setRenderHint(PAINTER_AA)
+        f = p.font()
+        f.setPointSizeF(8.5)
+        p.setFont(f)
+        fm = qc.QtGui.QFontMetricsF(p.font())
+        h = self.height()
+        bh = min(self.BOX_H, h - 14)
+        by = (h - bh) // 2
+        # items: (label, color, is_badge)
+        items = [("Spectrum", "#475569", False)]
+        for i, model in enumerate(self._arch):
+            items.append((model, "#4f46e5", False))
+            if i < len(self._arch) - 1:
+                items.append((f"P{i + 1}+", "#b45309", True))
+        items.append(("Verdict", "#15803d", False))
+        # widths: boxes sized to text (elided), badges tiny, arrows 14px
+        avail = self.width() - 8
+        n_arrows = len(items) - 1
+        arrow_w = 14 if n_arrows else 0
+        box_budget = (avail - n_arrows * arrow_w) / len(items)
+        x = 4.0
+        for idx, (label, color, is_badge) in enumerate(items):
+            if is_badge:
+                w = fm.horizontalAdvance(label) + 10
+                rect = QtCore.QRectF(x, by + bh / 2 - 9, w, 18)
+                p.setPen(qc.QtGui.QColor("#b45309"))
+                p.setBrush(qc.QtGui.QColor("#fef3c7"))
+                p.drawRoundedRect(rect, 9, 9)
+                p.drawText(rect, ALIGN_CENTER, label)
+            else:
+                w = min(box_budget, fm.horizontalAdvance(label) + 18)
+                text = label
+                while (text and fm.horizontalAdvance(text)
+                       > w - 14):
+                    text = text[:-2]
+                if text != label:
+                    text = text.rstrip() + "…"
+                rect = QtCore.QRectF(x, by, w, bh)
+                p.setPen(qc.QtGui.QColor(color))
+                p.setBrush(qc.QtGui.QColor(color))
+                p.setOpacity(0.14)
+                p.drawRoundedRect(rect, 6, 6)
+                p.setOpacity(1.0)
+                p.drawText(rect, ALIGN_CENTER | ALIGN_VCENTER, text)
+            x += w
+            if idx < n_arrows:
+                ax0, ax1 = x + 2, x + arrow_w - 2
+                yc = by + bh / 2
+                p.setPen(qc.QtGui.QPen(qc.QtGui.QColor("#94a3b8"), 1.4))
+                p.drawLine(QtCore.QPointF(ax0, yc),
+                           QtCore.QPointF(ax1 - 4, yc))
+                p.drawPolygon(QtCore.QPointF(ax1, yc),
+                              QtCore.QPointF(ax1 - 5, yc - 3),
+                              QtCore.QPointF(ax1 - 5, yc + 3))
+                x += arrow_w
+        p.end()
+
+
 class ArchTableModel(QtCore.QAbstractTableModel):
     """Sortable read-only table of architecture results (handles the
     4,080-row tab without per-row widgets)."""
@@ -676,8 +755,23 @@ class SeqResultsDialog(QtWidgets.QDialog):
     def _winner_tab(self, payload):
         w = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(w)
-        validated = payload.get("validated") or {}
         winner = payload.get("winner")
+        if winner and winner.get("arch"):
+            lay.addWidget(ChainFlowWidget(winner["arch"]))
+            if winner.get("metrics"):
+                m = winner["metrics"]
+                pills = QtWidgets.QHBoxLayout()
+                for label, val, tone in (
+                        ("Macro-F1", m["f1"], "green" if m["f1"] >= .7
+                         else "amber"),
+                        ("Sensitivity", m["sens"], "indigo"),
+                        ("Specificity", m["spec"], "indigo"),
+                        ("ROC-AUC", m.get("auc", float("nan")), "slate")):
+                    pills.addWidget(uh.pill(
+                        f"{label}: {val:.3f}" if val == val
+                        else f"{label}: n/a", tone))
+                lay.addLayout(pills)
+        validated = payload.get("validated") or {}
         if validated or winner:
             lines = ["NESTED VALIDATION — best per level", ""]
             for level in (1, 2, 3):
@@ -1274,6 +1368,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_3sse_view.clicked.connect(self.view_saved_3sse)
         cv.addWidget(self.b_3sse_view)
         cv.addSpacing(4)
+        # ---- 3SSE status card (visible only for 3SSE modes) ----------
+        seq_card, scv = self.card(
+            "3SSE — sequential architecture search",
+            "Start training screens every chain, then nested-validates "
+            "the top 20 per level; the overall winner becomes THE "
+            "trained model (Save → Predict like any training).")
+        self.seq_card = seq_card
+        self.seq_counts = QtWidgets.QLabel("")
+        self.seq_counts.setObjectName("CardHint")
+        self.seq_counts.setWordWrap(True)
+        scv.addWidget(self.seq_counts)
+        self.seq_counter = QtWidgets.QLabel("0 / 0")
+        self.seq_counter.setStyleSheet(
+            "font-size:17pt; font-weight:700; color:#312e81;")
+        self.seq_phase = QtWidgets.QLabel("Ready — press Start training.")
+        self.seq_phase.setObjectName("CardHint")
+        self.seq_best = QtWidgets.QLabel("")
+        self.seq_best.setWordWrap(True)
+        self.seq_best.setStyleSheet("color:#475569;")
+        scv.addWidget(self.seq_counter)
+        scv.addWidget(self.seq_phase)
+        scv.addWidget(self.seq_best)
+        cv.addWidget(seq_card)
+        seq_card.hide()
+        self.combo_mode.currentIndexChanged.connect(
+            self._update_seq_card)
+        cv.addSpacing(4)
         cv.addWidget(QtWidgets.QLabel("Models to compare "
                                       "(best F1 wins — try all!):"))
         self.model_checks: dict[str, QtWidgets.QCheckBox] = {}
@@ -1284,6 +1405,7 @@ class MainWindow(QtWidgets.QMainWindow):
             cb.setChecked(True)
             self.model_checks[name] = cb
             grid.addWidget(cb, i // 2, i % 2)
+            cb.toggled.connect(self._update_seq_card)
         cv.addLayout(grid)
         sel_row = QtWidgets.QHBoxLayout()
         b_all = QtWidgets.QPushButton("All")
@@ -1408,6 +1530,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.banner_plain.setObjectName("CardHint")
         self.banner_plain.setWordWrap(True)
         bv.addWidget(self.banner_plain)
+        # 3SSE winners: painted chain diagram X → model → P → model → …
+        self.chain_flow = ChainFlowWidget([])
+        self.chain_flow.hide()
+        bv.addWidget(self.chain_flow)
         right.addWidget(banner)
 
         cmp_card, cpv = self.card("Model comparison",
@@ -4689,6 +4815,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 X, yy, gg, wn_for_models, model_names=names,
                 k=self.spin_folds.value(), seed=self.spin_seed.value())
             self._seq_worker.progress.connect(self.on_seq_progress)
+            self._seq_worker.search_progress.connect(
+                self.on_seq_search_progress)
             self._seq_worker.done.connect(self.on_seq_done)
             self._seq_worker.failed.connect(self.on_seq_failed)
             self._seq_worker.start()
@@ -4709,6 +4837,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_train_done(self, results, winner):
         self.results, self.winner = results, winner
+        self.chain_flow.hide()          # 3SSE path re-shows with arch
         self.b_train.setEnabled(bool(self.spectra))
         self.progress.setValue(100)
         sens = winner.macro["sens"][0]
@@ -4774,6 +4903,34 @@ class MainWindow(QtWidgets.QMainWindow):
             "\n\nFull details are printed to the console.")
 
     # ================================================== 3SSE handlers
+    def _update_seq_card(self, *_args):
+        """Show/hide the 3SSE card and refresh the architecture counts
+        for the currently checked models."""
+        on = self.combo_mode.currentIndex() >= 3
+        self.seq_card.setVisible(on)
+        if not on:
+            return
+        checked = [n for n, cb in self.model_checks.items()
+                   if cb.isChecked()]
+        base = [n for n in checked if n != "Ensemble (top-3)"]
+        n = len(base) + (1 if "Ensemble (top-3)" in checked else 0)
+        n = max(n, 2)
+        singles, pairs, triples = n, n * (n - 1), n * (n - 1) * (n - 2)
+        self.seq_counts.setText(
+            f"Search space: {singles:,} single models · "
+            f"{pairs:,} two-model chains · {triples:,} three-model "
+            f"chains = {singles + pairs + triples:,} architectures "
+            "(ordered, no repeats; probabilities chained between "
+            "layers, patient-grouped OOF).")
+
+    def on_seq_search_progress(self, done: int, total: int, best: str,
+                               f1: float, eta: float):
+        self.seq_counter.setText(f"{done:,} / {total:,}")
+        self.seq_best.setText(f"Current best: {best}  ·  macro-F1 "
+                              f"{f1:.3f}")
+        self.seq_phase.setText(f"Phase: screening · ETA "
+                               f"{eta / 60:.0f} min")
+
     def view_saved_3sse(self):
         """Open the last completed 3SSE run's rankings without re-running
         (reads study_run_3sse: screening.jsonl + validated.json +
@@ -4838,6 +4995,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_seq_progress(self, pct: int, msg: str):
         if pct >= 0:
             self.progress.setValue(pct)
+        elif "validating" in msg:
+            self.seq_counter.setText("validation")
+            self.seq_phase.setText(
+                "Phase: nested validation of the top architectures")
         self.train_status.setText(msg)
         self.statusBar().showMessage(msg)
 
@@ -4846,28 +5007,65 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setValue(100)
         self._seq_payload = payload
         board = payload["board"]
-        winner = payload.get("winner")
+        fin = payload.get("winner")
         n_pruned = board.get("pruned", 0)
         self.log(f"3SSE search done: {board['total']} architectures "
                  f"({n_pruned} pruned by the sound early-abandon bound)")
-        for level, key in ((1, "singles"), (2, "pairs"),
-                           (3, "triples")):
-            scored = [e for e in board[key] if "metrics" in e]
-            if scored:
-                b = max(scored, key=lambda e: e["metrics"]["f1"])
-                self.log(f"  best {level}-model (screening): "
-                         f"{' → '.join(b['arch'])} "
-                         f"F1 {b['metrics']['f1']:.3f}")
-        if winner:
-            m = winner["metrics"]
-            self.train_status.setText(
-                f"3SSE winner: {' → '.join(winner['arch'])} · "
-                f"F1 {m['f1']:.3f} (nested) — see results window.")
-        else:
-            self.train_status.setText("3SSE search finished.")
         dlg = SeqResultsDialog(payload, parent=self)
         dlg.setModal(False)
         dlg.show()
+        if fin is None:
+            self.train_status.setText(
+                "3SSE search finished (no validated winner available).")
+            return
+        # install the winner like any training run: banner, tables,
+        # plots, Save button, Result page and Predict all work on it
+        m = fin["metrics"]
+        classes = list(fin["classes"])
+        winner = modeling.ModelResult(
+            name="3SSE: " + " → ".join(fin["arch"]), classes=classes)
+        winner.macro = {"sens": (m["sens"], 0.0),
+                        "spec": (m["spec"], 0.0), "f1": (m["f1"], 0.0),
+                        "prec": (m.get("prec", 0.0), 0.0)}
+        cm = m.get("cm")
+        if cm is not None:
+            winner.cm = np.asarray(cm, dtype=int).reshape(
+                len(classes), len(classes))
+            winner.per_class = {
+                classes[int(k)]: {mk: (mv, 0.0) for mk, mv in v.items()}
+                for k, v in
+                modeling.class_metrics_from_cm(winner.cm).items()}
+        winner.oof_proba = m.get("oof_proba")
+        winner.y_true_encoded = np.asarray(m.get("y_true"))
+        winner.groups = payload.get("groups")
+        winner.threshold = fin.get("threshold")
+        winner.pipeline = fin["chain"]
+        # comparison table: validated single models (nested, fair)
+        results = []
+        for entry in payload["validated"].get(1, []):
+            mm = entry["metrics"]
+            r = modeling.ModelResult(name=entry["arch"][0],
+                                     classes=classes)
+            r.macro = {"sens": (mm["sens"], 0.0),
+                       "spec": (mm["spec"], 0.0), "f1": (mm["f1"], 0.0),
+                       "prec": (mm.get("prec", 0.0), 0.0)}
+            results.append(r)
+        if not results:                      # screening-only fallback
+            for s in board["singles"]:
+                mm = s["metrics"]
+                r = modeling.ModelResult(name=s["arch"][0],
+                                         classes=classes)
+                r.macro = {"sens": (mm["sens"], 0.0),
+                           "spec": (mm["spec"], 0.0),
+                           "f1": (mm["f1"], 0.0),
+                           "prec": (mm.get("prec", 0.0), 0.0)}
+                results.append(r)
+        self.on_train_done(results + [winner], winner)
+        self.chain_flow.set_arch(fin["arch"])
+        self.train_status.setText(
+            f"3SSE winner installed: {' → '.join(fin['arch'])} "
+            f"(nested F1 {m['f1']:.3f}) — Save it, then go to Predict. "
+            "Full rankings in the 3SSE results window.")
 
     def on_seq_failed(self, tb: str):
         self.b_train.setEnabled(True)

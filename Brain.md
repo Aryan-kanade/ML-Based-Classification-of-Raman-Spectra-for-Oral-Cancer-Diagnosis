@@ -534,6 +534,20 @@ are possible and documented.
   Overall Winner, `ArchTableModel` + proxy — 4,080 rows sort in ms) +
   "Save winner as model bundle" (goes through `save_bundle` +
   `_set_bundle`, so the whole Predict/clinical stack works on it).
+  **First-class training outcome**: on completion `on_seq_done` wraps
+  the winner as a real `ModelResult` (per_class values must be
+  `(mean, std)` TUPLES keyed by class NAME — consumers index `[0]`)
+  and calls `on_train_done`, so banner/compare-table/per-class/plots/
+  Save/Result-page/Predict all work on the chain; `chain_flow`
+  (ChainFlowWidget, custom-painted Spectrum→Model→P→…→Verdict
+  diagram) shows in the banner. Train page has a 3SSE status card
+  (visible for 3SSE modes): live search-space counts from checked
+  models, big n/total counter, current best + F1 + ETA (structured
+  `search_progress` signal), phase switch to "nested validation".
+  "View saved 3SSE results…" opens the last run from
+  `study_run_3sse/` (screening.jsonl + validated.json + winner.json;
+  report.txt fallback) — save-button disabled for loaded runs (no
+  in-memory chain; winner.joblib already exists).
 - Tests (in test_all.py): space counts/order/no-repeats, search smoke,
   chain + joblib roundtrip for 1/2/3 layers, OOF-leakage probe
   (patient-unique offsets: in-sample ≈1, grouped OOF ≪ 1).
@@ -620,6 +634,18 @@ with default hyperparameters (identical for all 4,369 — fair).
 15. qt_compat binding = import-success order (PyQt5 first), no QT_API
     env pinning; plotting.MatplotlibCanvas pins the binding for
     matplotlib at canvas creation.
+16. **ModelResult consumers expect `per_class[class_name][metric]` as
+    `(mean, std)` tuples** — building a winner by hand must match this
+    (3SSE integration hit exactly this).
+17. **Concurrent loky pools from several QThreads are a native-crash
+    race on Windows** (access violation in joblib retrieval; heavier
+    child imports like torch/Qt make it likelier). Never start Train +
+    Optimize + Honest workers simultaneously — deep_test's workers
+    scenario runs them serially.
+18. deep_test `make_gui()` patches `uh.load_settings` to `{}` —
+    settings.json last-folder restore would silently hand "no data"
+    scenarios real data. Test harnesses must isolate from developer
+    settings.
 
 ## 17. Testing map
 
