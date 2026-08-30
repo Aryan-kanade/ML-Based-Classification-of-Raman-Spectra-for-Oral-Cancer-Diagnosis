@@ -1017,6 +1017,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_settings()
         self.update_footer()
 
+        # in-app activity log (same lines as session.log), toggled from
+        # a permanent status-bar button — errors are never invisible
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(300)
+        self.log_view.setFont(qc.QtGui.QFont("Consolas", 9))
+        self.log_dock = QtWidgets.QDockWidget("Activity log", self)
+        self.log_dock.setWidget(self.log_view)
+        dock_area = (qc.Qt.BottomDockWidgetArea
+                     if hasattr(qc.Qt, "BottomDockWidgetArea")
+                     else qc.Qt.DockWidgetArea.BottomDockWidgetArea)
+        self.addDockWidget(dock_area, self.log_dock)
+        self.log_dock.hide()
+        b_log = QtWidgets.QPushButton("Activity log")
+        b_log.setFlat(True)
+        b_log.setToolTip("Show or hide the in-app log — the same "
+                         "lines that are written to session.log, "
+                         "including error details.")
+        b_log.clicked.connect(
+            lambda: self.log_dock.setVisible(
+                not self.log_dock.isVisible()))
+        self.statusBar().addWidget(b_log)
+
         self.log("Ready. Open your spectra folder, or use One-click "
                  "demo on the Start page.")
 
@@ -1565,7 +1588,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "in study_run_3sse/ — no re-run needed.")
         self.b_3sse_view.clicked.connect(self.view_saved_3sse)
         scv.addWidget(self.b_3sse_view)
-        cv.addWidget(seq_card)
         self.combo_mode.currentIndexChanged.connect(
             self._update_seq_card)
         cv.addSpacing(4)
@@ -1663,6 +1685,9 @@ class MainWindow(QtWidgets.QMainWindow):
         b_metrics.setFlat(True)
         b_metrics.clicked.connect(self.show_metric_help)
         cv.addWidget(b_metrics)
+        cv.addSpacing(6)
+        # 3SSE power feature sits BELOW the everyday train flow
+        cv.addWidget(seq_card)
         cv.addStretch(1)
         h.addWidget(ctrl, 1)
 
@@ -5857,11 +5882,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ================================================================ misc
     def log(self, msg: str):
-        """Log to the console (no visible log panel) and mirror every
-        line to the rotating session.log on disk."""
+        """Log to the console, the in-app Activity-log dock and the
+        rotating session.log on disk."""
         from datetime import datetime
         stamp = datetime.now().strftime("%H:%M:%S")
         print(f"[{stamp}] {msg}", flush=True)
+        dock_text = getattr(self, "log_view", None)
+        if dock_text is not None:
+            dock_text.appendPlainText(f"[{stamp}] {msg}")
+            sb = dock_text.verticalScrollBar()
+            sb.setValue(sb.maximum())
         try:
             FILE_LOG.info(msg)
         except Exception:
@@ -5888,14 +5918,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         # stop background threads before the widgets they signal die —
         # a destroyed running QThread crashes the process
-        for w in (self.worker, self._opt_worker, self._pred_worker,
-                  self._honest_worker, self._analysis_worker,
-                  self._seq_worker):
-            if w is not None and w.isRunning():
-                w.wait(3000)
-                if w.isRunning():
-                    w.terminate()
-                    w.wait(500)
+        running = [w for w in (self.worker, self._opt_worker,
+                               self._pred_worker, self._honest_worker,
+                               self._analysis_worker, self._seq_worker)
+                   if w is not None and w.isRunning()]
+        if running:
+            ans = QtWidgets.QMessageBox.question(
+                self, "Work still running",
+                "A training / search / prediction is still running.\n\n"
+                "Stop it and quit? (A cancelled 3SSE search keeps its "
+                "checkpoint — Run resumes it next time.)",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if ans != QtWidgets.QMessageBox.Yes:
+                event.ignore()
+                return
+        for w in running:
+            w.wait(3000)
+            if w.isRunning():
+                w.terminate()
+                w.wait(500)
         if self._source_folder:
             self.settings["folder"] = self._source_folder
         self.settings.pop("files", None)          # legacy setting

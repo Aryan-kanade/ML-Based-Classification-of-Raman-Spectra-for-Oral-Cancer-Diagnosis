@@ -404,7 +404,13 @@ Paired: rule-out p≤0.35 (sens 91%), rule-in p≥0.67 (spec 91%), Brier
 **Shell**: `TAB_START..TAB_RESULT = range(6)`; SidebarNav (215px,
 checkable), PageStack with 170 ms fade, footer back/next
 (`NEXT_LABELS`), pages wrapped in QScrollArea. `SUITE_VERSION = 5`
-gates saved model-checkbox restore (bumped when the model list changes).
+gates saved model-checkbox restore (bumped when the model list
+changes). Train page = everyday flow first (mode → models → folds →
+Start training → progress → Save) with the 3SSE card BELOW it. A
+bottom **Activity-log dock** (QPlainTextEdit, 300 lines, fed by
+`log()`, status-bar toggle button) shows errors in-app; `closeEvent`
+asks before stopping running workers (No aborts the close; 3SSE keeps
+its checkpoint).
 Menu: File = Open folder (Ctrl+O),
 Reload (F5), Load model (Ctrl+L), Save model (Ctrl+S), Exit (Ctrl+Q);
 Help = How to (F1), Metrics, About. Logging: `log()` → stdout +
