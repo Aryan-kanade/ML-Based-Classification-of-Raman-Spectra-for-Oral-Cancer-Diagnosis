@@ -405,8 +405,17 @@ Paired: rule-out p≤0.35 (sens 91%), rule-in p≥0.67 (spec 91%), Brier
 checkable), PageStack with 170 ms fade, footer back/next
 (`NEXT_LABELS`), pages wrapped in QScrollArea. `SUITE_VERSION = 5`
 gates saved model-checkbox restore (bumped when the model list
-changes). Train page = everyday flow first (mode → models → folds →
-Start training → progress → Save) with the 3SSE card BELOW it. A
+changes). Train page = everyday flow first (mode → models → CV →
+Start training → progress → Save) with the 3SSE card BELOW it
+(**collapsible** via `b_3sse_collapse`, auto-expands when its search
+starts). Mode dropdown uses **UserRole roles** (`mode_kind()` /
+`set_mode_kind()`: standard/paired/paired-pqn/seq-standard/seq-paired)
+— never rely on combo indices. Model chooser = 3-column grid +
+presets (`_apply_model_preset`: all/none/classical/fast) + live
+"N of M models selected" counter (`_models_changed`, red < 3).
+Diagnostic buttons live in `self._diag_buttons` (8), grouped under
+section labels, **disabled until a winner exists** (enabled in
+`on_train_done`, disabled when a training starts). A
 bottom **Activity-log dock** (QPlainTextEdit, 300 lines, fed by
 `log()`, status-bar toggle button) shows errors in-app; `closeEvent`
 asks before stopping running workers (No aborts the close; 3SSE keeps
