@@ -11,6 +11,15 @@ stay binding-agnostic.
 
 BINDING = None  # one of "PyQt5", "PyQt6", "PySide6"
 
+# Load torch's native DLLs BEFORE any Qt binding. On Windows, PyQt5's
+# bundled MinGW runtime DLLs (libstdc++/winpthread) get bound to torch's
+# c10.dll when Qt loads first, and its initialization then fails
+# (WinError 1114). Importing torch first is the fix; harmless elsewhere.
+try:
+    import torch  # noqa: F401
+except Exception:
+    pass
+
 try:
     from PyQt5 import QtCore, QtGui, QtWidgets  # type: ignore
     BINDING = "PyQt5"

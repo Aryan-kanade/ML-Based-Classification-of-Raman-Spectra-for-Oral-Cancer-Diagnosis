@@ -58,10 +58,11 @@ except ImportError:
     HAS_CATBOOST = False
 
 try:
+    # NOTE: import torch BEFORE any Qt binding loads (see qt_compat.py)
     import torch
     from torch import nn
     HAS_TORCH = True
-except ImportError:
+except Exception:                      # ImportError OR DLL/loader errors
     HAS_TORCH = False
 
 RANDOM_STATE = 42
@@ -70,7 +71,7 @@ RANDOM_STATE = 42
 # --------------------------------------------------------------------------
 # PLS-DA classifier wrapper
 # --------------------------------------------------------------------------
-class PLSDAClassifier(BaseEstimator, ClassifierMixin):
+class PLSDAClassifier(ClassifierMixin, BaseEstimator):
     """PLS-DA: PLSRegression on one-hot targets, class = argmax of scores."""
 
     def __init__(self, n_components: int = 5):
@@ -125,7 +126,7 @@ if HAS_TORCH:
             h = self.features(x).squeeze(-1)
             return self.head(h)
 
-    class CNN1DClassifier(BaseEstimator, ClassifierMixin):
+    class CNN1DClassifier(ClassifierMixin, BaseEstimator):
         """
         Small 1D-CNN classifier: fits inside the CV/bundle machinery
         like any sklearn estimator (clone, GridSearchCV with an empty
@@ -215,7 +216,7 @@ if HAS_TORCH:
 # --------------------------------------------------------------------------
 # Calibrated SVM (sklearn >= 1.9 deprecates SVC(probability=True))
 # --------------------------------------------------------------------------
-class CalibratedSVC(BaseEstimator, ClassifierMixin):
+class CalibratedSVC(ClassifierMixin, BaseEstimator):
     """SVC with predict_proba; calibration folds adapt to small classes."""
 
     def __init__(self, C=1.0, gamma="scale", class_weight="balanced",
@@ -260,7 +261,7 @@ class CalibratedSVC(BaseEstimator, ClassifierMixin):
 # --------------------------------------------------------------------------
 # Isolation Forest classifier (one-vs-rest anomaly scoring)
 # --------------------------------------------------------------------------
-class IsolationForestOvR(BaseEstimator, ClassifierMixin):
+class IsolationForestOvR(ClassifierMixin, BaseEstimator):
     """
     Isolation Forest used as a classifier: one anomaly detector is fitted
     per class; a sample is assigned to the class whose detector considers

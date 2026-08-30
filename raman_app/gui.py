@@ -188,6 +188,54 @@ class FuncWorker(QtCore.QThread):
             self.failed.emit(traceback.format_exc())
 
 
+class SeqSearchWorker(QtCore.QThread):
+    """
+    3SSE architecture search in the background: quick screening of all
+    single/pair/triple chains, nested validation of the top-N per level,
+    and the deployable winner chain — GUI work stays on the main thread.
+    """
+    progress = Signal(int, str)
+    done = Signal(object)              # {"board", "validated", "winner"}
+    failed = Signal(str)
+
+    def __init__(self, X, y, groups, wavenumbers, model_names, k=3,
+                 seed=42, top=20, parent=None):
+        super().__init__(parent)
+        self.X, self.y, self.groups = X, y, groups
+        self.wavenumbers = wavenumbers
+        self.model_names = model_names
+        self.k, self.seed, self.top = k, seed, top
+
+    def run(self):
+        try:
+            import sequential
+
+            def prog(done, total, best, f1, eta):
+                self.progress.emit(
+                    int(100 * done / max(total, 1)),
+                    f"{done}/{total} architectures · best {best} "
+                    f"(F1 {f1:.3f}) · ETA {eta / 60:.0f} min")
+
+            board = sequential.search(
+                self.X, self.y, groups=self.groups,
+                wavenumbers=self.wavenumbers, k=self.k, seed=self.seed,
+                top=self.top, model_names=self.model_names,
+                progress_cb=prog)
+            validated = sequential.validate_top(
+                board, self.X, self.y, self.groups, self.wavenumbers,
+                top=self.top, seed=self.seed,
+                model_names=self.model_names,
+                progress=lambda m: self.progress.emit(-1, m))
+            winner = sequential.finalize_winner(
+                validated, self.X, self.y, self.groups,
+                self.wavenumbers, board=board, k=self.k, seed=self.seed)
+            self.done.emit({"board": board, "validated": validated,
+                            "winner": winner, "k": self.k,
+                            "seed": self.seed})
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
 class PredictWorker(QtCore.QThread):
     """
     Prediction in the background: the file loop, per-patient paired
@@ -548,6 +596,130 @@ class LikelihoodMeter(QtWidgets.QWidget):
 # ==========================================================================
 # Main window
 # ==========================================================================
+class ArchTableModel(QtCore.QAbstractTableModel):
+    """Sortable read-only table of architecture results (handles the
+    4,080-row tab without per-row widgets)."""
+
+    HEADERS = ["Rank", "Type", "Architecture", "Macro-F1", "Sens",
+               "Spec", "AUC", "Acc"]
+
+    def __init__(self, rows, parent=None):
+        super().__init__(parent)
+        self._rows = rows              # [rank, type, arch, f1, sens, ...]
+
+    def rowCount(self, _parent=None):
+        return len(self._rows)
+
+    def columnCount(self, _parent=None):
+        return len(self.HEADERS)
+
+    def headerData(self, sec, orient, role=QtCore.Qt.DisplayRole):
+        if (role == QtCore.Qt.DisplayRole
+                and orient == QtCore.Qt.Horizontal):
+            return self.HEADERS[sec]
+        return None
+
+    def data(self, index, role=QtCore.Qt.DisplayRole):
+        if role != QtCore.Qt.DisplayRole or not index.isValid():
+            return None
+        return str(self._rows[index.row()][index.column()])
+
+
+class SeqResultsDialog(QtWidgets.QDialog):
+    """3SSE results: ranking tabs per level + the overall winner."""
+
+    def __init__(self, payload, parent=None):
+        super().__init__(parent)
+        self.payload = payload
+        board = payload["board"]
+        self.setWindowTitle("3SSE — Sequential Architecture Search")
+        self.resize(880, 600)
+        lay = QtWidgets.QVBoxLayout(self)
+        tabs = QtWidgets.QTabWidget()
+        lay.addWidget(tabs)
+        level_meta = ((1, "singles", "Single Models"),
+                      (2, "pairs", "2-Model"),
+                      (3, "triples", "3-Model"))
+        for level, key, title in level_meta:
+            rows = self._rows(board[key], level)
+            tabs.addTab(self._table(rows), f"{title} ({len(rows)})")
+        tabs.addTab(self._winner_tab(payload), "Overall Winner")
+
+    @staticmethod
+    def _rows(entries, level):
+        scored = sorted((e for e in entries if "metrics" in e),
+                        key=lambda e: (-e["metrics"]["f1"],
+                                       -e["metrics"]["sens"],
+                                       -e["metrics"]["spec"]))
+        label = {1: "Single", 2: "2-Model", 3: "3-Model"}[level]
+        return [[i + 1, label, " → ".join(e["arch"]),
+                 f"{e['metrics']['f1']:.3f}",
+                 f"{e['metrics']['sens']:.3f}",
+                 f"{e['metrics']['spec']:.3f}",
+                 f"{e['metrics'].get('auc', float('nan')):.3f}",
+                 f"{e['metrics']['acc']:.3f}"]
+                for i, e in enumerate(scored)]
+
+    @staticmethod
+    def _table(rows):
+        view = QtWidgets.QTableView()
+        model = ArchTableModel(rows)
+        proxy = QtCore.QSortFilterProxyModel()
+        proxy.setSourceModel(model)
+        view.setModel(proxy)
+        view.setSortingEnabled(True)
+        view.horizontalHeader().setStretchLastSection(True)
+        view.verticalHeader().setVisible(False)
+        view.setAlternatingRowColors(True)
+        return view
+
+    def _winner_tab(self, payload):
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(w)
+        validated = payload["validated"]
+        winner = payload.get("winner")
+        lines = ["NESTED VALIDATION — best per level", ""]
+        for level in (1, 2, 3):
+            cands = validated.get(level, [])
+            if cands:
+                b = max(cands, key=lambda e: e["metrics"]["f1"])
+                m = b["metrics"]
+                lines.append(f"{level}-Model:  {' → '.join(b['arch'])}")
+                lines.append(f"          F1 {m['f1']:.3f} · "
+                             f"sens {m['sens']:.3f} · "
+                             f"spec {m['spec']:.3f} · "
+                             f"AUC {m.get('auc', float('nan')):.3f} · "
+                             f"acc {m['acc']:.3f}")
+                lines.append("")
+        if winner:
+            m = winner["metrics"]
+            lines += ["=" * 56,
+                      f"OVERALL WINNER ({len(winner['arch'])}-Model): "
+                      f"{' → '.join(winner['arch'])}",
+                      f"  Macro-F1 {m['f1']:.3f} · sensitivity "
+                      f"{m['sens']:.3f} · specificity {m['spec']:.3f}",
+                      f"  ROC-AUC {m.get('auc', float('nan')):.3f} · "
+                      f"accuracy {m['acc']:.3f}",
+                      "  Baseline (paired Extra Trees): F1 0.702 · "
+                      "AUC 0.788"]
+        else:
+            lines.append("No validated winner available.")
+        lbl = QtWidgets.QLabel("\n".join(lines))
+        lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        lay.addWidget(lbl)
+        lay.addStretch(1)
+        btn = QtWidgets.QPushButton("Save winner as model bundle…")
+        btn.setEnabled(winner is not None)
+        btn.clicked.connect(self._on_save)
+        lay.addWidget(btn)
+        return w
+
+    def _on_save(self):
+        pw = self.parent()
+        if pw is not None and hasattr(pw, "on_seq_save"):
+            pw.on_seq_save(self.payload)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -589,6 +761,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.results: list | None = None
         self.winner = None
         self.worker: TrainWorker | None = None
+        self._seq_worker: SeqSearchWorker | None = None
+        self._seq_payload: dict | None = None
         self._analysis_worker: FuncWorker | None = None
         self.bundle: dict | None = None
         self._loading_table = False
@@ -1064,7 +1238,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_mode.addItems([
             "Standard — each spectrum independently",
             "Margin mode — vs patient's own normal",
-            "Margin + PQN — scale-corrected (Dieterle 2006)"])
+            "Margin + PQN — scale-corrected (Dieterle 2006)",
+            "3SSE search — sequential stacking (standard data)",
+            "3SSE search — sequential stacking (paired data)"])
         self.combo_mode.setToolTip(
             "Standard: every spectrum is classified on its own (works for "
             "any new spectrum).\nMargin mode (paired reference): features "
@@ -4399,7 +4575,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setValue(0)
         self.train_status.setText("Preprocessing spectra…")
         mode_idx = self.combo_mode.currentIndex()
-        paired_mode = mode_idx >= 1
+        seq_mode = mode_idx >= 3                     # 3SSE search
+        paired_mode = mode_idx in (1, 2, 4)
         if paired_mode and self.groups is None:
             self.b_train.setEnabled(True)
             QtWidgets.QMessageBox.warning(
@@ -4475,6 +4652,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self._lc_wn = wn_for_models
         else:
             wn_for_models = self._lc_wn
+        if seq_mode:
+            # ---- 3SSE: screen every single/pair/triple chain ----------
+            import sequential
+            n_arch = sequential._check_space(names)
+            self.train_status.setText(
+                f"3SSE search: {n_arch} architectures — this takes a "
+                "while (see progress).")
+            self.log(f"3SSE search started: {len(names)} models · "
+                     f"{n_arch} architectures "
+                     f"({len(names)} singles + "
+                     f"{len(names) * (len(names) - 1)} pairs + "
+                     f"{len(names) * (len(names) - 1) * (len(names) - 2)}"
+                     " triples), patient-grouped OOF chaining")
+            self._seq_worker = SeqSearchWorker(
+                X, yy, gg, wn_for_models, model_names=names,
+                k=self.spin_folds.value(), seed=self.spin_seed.value())
+            self._seq_worker.progress.connect(self.on_seq_progress)
+            self._seq_worker.done.connect(self.on_seq_done)
+            self._seq_worker.failed.connect(self.on_seq_failed)
+            self._seq_worker.start()
+            return
         self.worker = TrainWorker(X, yy, names, self.spin_folds.value(),
                                   self.spin_seed.value(), groups=gg,
                                   repeats=repeats,
@@ -4554,6 +4752,85 @@ class MainWindow(QtWidgets.QMainWindow):
             self, "Training failed",
             "Training ran into an error:\n\n" + err.splitlines()[-1] +
             "\n\nFull details are printed to the console.")
+
+    # ================================================== 3SSE handlers
+    def on_seq_progress(self, pct: int, msg: str):
+        if pct >= 0:
+            self.progress.setValue(pct)
+        self.train_status.setText(msg)
+        self.statusBar().showMessage(msg)
+
+    def on_seq_done(self, payload: dict):
+        self.b_train.setEnabled(True)
+        self.progress.setValue(100)
+        self._seq_payload = payload
+        board = payload["board"]
+        winner = payload.get("winner")
+        n_pruned = board.get("pruned", 0)
+        self.log(f"3SSE search done: {board['total']} architectures "
+                 f"({n_pruned} pruned by the sound early-abandon bound)")
+        for level, key in ((1, "singles"), (2, "pairs"),
+                           (3, "triples")):
+            scored = [e for e in board[key] if "metrics" in e]
+            if scored:
+                b = max(scored, key=lambda e: e["metrics"]["f1"])
+                self.log(f"  best {level}-model (screening): "
+                         f"{' → '.join(b['arch'])} "
+                         f"F1 {b['metrics']['f1']:.3f}")
+        if winner:
+            m = winner["metrics"]
+            self.train_status.setText(
+                f"3SSE winner: {' → '.join(winner['arch'])} · "
+                f"F1 {m['f1']:.3f} (nested) — see results window.")
+        else:
+            self.train_status.setText("3SSE search finished.")
+        dlg = SeqResultsDialog(payload, parent=self)
+        dlg.setModal(False)
+        dlg.show()
+
+    def on_seq_failed(self, tb: str):
+        self.b_train.setEnabled(True)
+        self.log(f"3SSE search failed:\n{tb}")
+        QtWidgets.QMessageBox.warning(
+            self, "3SSE search failed",
+            "The architecture search failed.\n\nTechnical details are "
+            "in session.log next to the app.")
+
+    def on_seq_save(self, payload: dict):
+        """Save the 3SSE winner chain as a standard model bundle."""
+        winner = payload.get("winner")
+        if not winner:
+            return
+        path, _filt = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save 3SSE winner bundle",
+            os.path.join(os.path.expanduser("~"), "Desktop",
+                         "model_3SSE.joblib"),
+            "Model bundle (*.joblib)")
+        if not path:
+            return
+        try:
+            from types import SimpleNamespace
+            m = winner["metrics"]
+            extras = ({"calibrator": winner["calibrator"]}
+                      if winner["calibrator"] else {})
+            winner_ns = SimpleNamespace(
+                name="3SSE: " + " → ".join(winner["arch"]),
+                pipeline=winner["chain"], classes=winner["classes"],
+                threshold=winner["threshold"],
+                macro={"f1": (m["f1"], 0.0),
+                       "sens": (m["sens"], 0.0),
+                       "spec": (m["spec"], 0.0)})
+            modeling.save_bundle(
+                path, winner_ns, self.grid,
+                self.read_params().validate(),
+                dataset_name=self._source_folder or "",
+                paired=self._paired_mode, **extras)
+            self.settings["last_model"] = path
+            uh.save_settings(self.settings)
+            self._set_bundle(modeling.load_bundle(path), path)
+            self.log(f"3SSE winner bundle saved: {path}")
+        except Exception as exc:
+            self.friendly_error("Saving 3SSE bundle failed", exc)
 
     def _fill_compare_table(self):
         res = self.results
@@ -5073,7 +5350,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # stop background threads before the widgets they signal die —
         # a destroyed running QThread crashes the process
         for w in (self.worker, self._opt_worker, self._pred_worker,
-                  self._honest_worker, self._analysis_worker):
+                  self._honest_worker, self._analysis_worker,
+                  self._seq_worker):
             if w is not None and w.isRunning():
                 w.wait(3000)
                 if w.isRunning():

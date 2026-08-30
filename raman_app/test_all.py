@@ -893,6 +893,93 @@ def test_new_models_lgbm_catboost_cnn():
         assert 0 <= r.macro_f1() <= 1
 
 
+# ---------------------------------------------------------------- 3SSE
+def test_3sse_architecture_space():
+    """17 + 17*16 + 17*16*15 == 4369; ordered, repetition-free."""
+    import sequential as seq
+    names = [f"M{i}" for i in range(17)]
+    assert seq._check_space(names) == 4369
+    archs = set(seq.architectures(names))
+    assert ("M0", "M1") in archs and ("M1", "M0") in archs
+    assert ("M0", "M1", "M2") in archs and ("M0", "M2", "M1") in archs
+    assert len(archs) == 4369               # no duplicates
+    for a in archs:
+        assert len(set(a)) == len(a)         # no model repeats inside
+
+
+def test_3sse_search_smoke():
+    import sequential as seq
+    X, y, groups = _synthetic_ml(60, 12, seed=2)
+    board = seq.search(np.asarray(X, dtype=np.float32), list(y),
+                       groups=list(groups), k=3, jobs=1,
+                       model_names=["PCA + LDA",
+                                    "PCA + Logistic Regression",
+                                    "Random Forest"])
+    # 3 + 3*2 + 3*2*1 = 9 architectures
+    assert len(board["singles"]) == 3
+    assert len(board["pairs"]) == 6
+    assert len(board["triples"]) == 6
+    for entry in board["singles"] + board["pairs"] + board["triples"]:
+        assert "metrics" in entry or "pruned_bound" in entry
+        if "metrics" in entry:
+            m = entry["metrics"]
+            assert 0 <= m["f1"] <= 1 and 0 <= m["sens"] <= 1
+            assert m["pat_f1"] >= 0            # patient-level rollup ran
+
+
+def test_3sse_chain_bundle_roundtrip():
+    """1/2/3-layer SequentialChain: sklearn protocol + joblib roundtrip
+    reproduces predictions exactly (spec §21-22, tests 14-18)."""
+    import joblib
+    import sequential as seq
+    X, y, groups = _synthetic_ml(60, 12, seed=3)
+    facs = seq._factories(None)
+    pool = ["PCA + LDA", "PCA + Logistic Regression", "Random Forest"]
+    for length in (1, 2, 3):
+        chain = seq.SequentialChain([facs[n]() for n in pool[:length]],
+                                    k=3).fit(X, list(y),
+                                             groups=list(groups))
+        proba = chain.predict_proba(X)
+        assert proba.shape == (len(y), 2)
+        assert np.allclose(proba.sum(axis=1), 1.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "chain.joblib")
+            joblib.dump(chain, path)
+            chain2 = joblib.load(path)
+            assert np.allclose(proba, chain2.predict_proba(X))
+        assert chain.predict(X).tolist() == [
+            chain.classes_[i] for i in np.argmax(proba, axis=1)]
+
+
+def test_3sse_oof_is_genuinely_oof():
+    """Leakage probe: NO class signal, only patient-unique offsets —
+    an in-sample fit memorizes patients (F1 ~1) while grouped OOF must
+    stay near chance; a leaking P1 pipeline would transmit the offset."""
+    import sequential as seq
+    rng = np.random.default_rng(5)
+    n_pat, per = 12, 5
+    rows, ys, gs = [], [], []
+    for p in range(n_pat):
+        cls = "A" if p % 2 == 0 else "B"
+        base = rng.normal(p, 1, 40)          # patient-unique offset only
+        for _ in range(per):
+            rows.append(base + rng.normal(0, .1, 40))
+            ys.append(cls)
+            gs.append(f"P{p}")
+    X = np.asarray(rows, dtype=np.float32)
+    facs = seq._factories(None)
+    chain = seq.SequentialChain([facs["Random Forest"](),
+                                 facs["Random Forest"]()], k=3)
+    chain.fit(X, ys, groups=gs)
+    from sklearn.metrics import f1_score
+    in_sample = f1_score(ys, chain.predict(X), average="macro")
+    oof = seq._oof_proba(facs["Random Forest"](), X, ys, gs, 3, 42)
+    oof_pred = np.array(sorted(set(ys)))[np.argmax(oof, axis=1)]
+    oof_f1 = f1_score(ys, oof_pred, average="macro")
+    assert in_sample > 0.9
+    assert oof_f1 < 0.8, "grouped OOF looks leaked (too high)"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

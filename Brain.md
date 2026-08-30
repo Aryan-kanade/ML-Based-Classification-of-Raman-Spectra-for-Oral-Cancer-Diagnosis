@@ -492,7 +492,53 @@ PNGs @150 dpi, predictions ≤300 rows.
 params (mirrors §6 defaults), folds, seed, models (gated by
 SUITE_VERSION), geometry hex, folder, last_model, predict_folder.
 
-## 15. Secondary tracks
+## 15. 3SSE — sequential architecture search (sequential.py)
+
+Evaluates **every** ordered chain over the model registry:
+17 singles + 17·16 pairs + 17·16·15 triples = **4,369 architectures**.
+Chain semantics (probabilities only): `X → A → OOF P1 → [X+P1] → B →
+OOF P2 → [X+P1+P2] → C → final OOF`. Inter-layer predictions are
+grouped `cross_val_predict` OOF (patient-grouped, no leakage).
+"Ensemble (top-3)" is candidate #17, resolved post-singles from the
+singles ranking (voting over the top-3 defaults) — nested ensembles
+are possible and documented.
+
+- **QUICK screening**: single-level OOF stacking, k=3 folds (default),
+  default hyperparameters (identical for all 4,369 → fair level
+  comparison). Efficiency: layer-1 OOF shared; **pair-major** loop
+  (one feature matrix per pair, all 15 third models evaluated while
+  hot, O(1) memory); pairs processed best-first; **sound early-abandon**
+  (max reachable F1 after fold i < current top-N cutoff → prune; top-N
+  ranking stays exact); parallel across pairs (joblib, 1 thread inside);
+  float32; JSONL checkpoint + `--resume`; `--prune-pairs K` beam option.
+- **FULL validation**: top-20 per level through nested grouped CV —
+  OOF features regenerated inside each outer training fold only
+  (`validate_arch`); winner picked by (F1, sens, spec) from validated
+  results only (`pick_overall`) — 1-model can legitimately win.
+- **`SequentialChain`** (sklearn protocol, `ClassifierMixin` first!):
+  fit = per-layer grouped OOF stacking + full-data fits; predict_proba
+  chains, appending each layer's proba columns. Drop-in `pipeline` for
+  the existing bundle/Platt/threshold/predict stack.
+  **Model-specific features (spec §9)**: "Peak bands + RF" needs the
+  wn-aligned axis, so at chained positions (≥1) it is wrapped with
+  `_SpectralSlice` (spectral columns only); ensemble voters likewise.
+- CLI: `python sequential.py --data D:/BARC/Data --mode paired --out
+  study_run_3sse [--k 3 --top 20 --jobs -2 --resume --models ...]`;
+  writes screening.jsonl, report.txt, run_meta.json, winner.joblib.
+  `prepare_dataset()` mirrors reproduce_study (GUI parity; demo data
+  falls back to standard mode — no patient groups).
+- GUI: Train-page combo entries 3/4 = "3SSE search (standard/paired)";
+  `SeqSearchWorker` (existing QThread pattern) runs screening +
+  `validate_top` + `finalize_winner`; live progress `n/4369 · best ·
+  ETA`; `SeqResultsDialog` = 4 sortable tabs (Single/2-Model/3-Model/
+  Overall Winner, `ArchTableModel` + proxy — 4,080 rows sort in ms) +
+  "Save winner as model bundle" (goes through `save_bundle` +
+  `_set_bundle`, so the whole Predict/clinical stack works on it).
+- Tests (in test_all.py): space counts/order/no-repeats, search smoke,
+  chain + joblib roundtrip for 1/2/3 layers, OOF-leakage probe
+  (patient-unique offsets: in-sample ≈1, grouped OOF ≪ 1).
+
+## 16. Secondary tracks
 
 **optimize.py** — GRID (8 base + 3 arPLS): no-crop/vector;
 crop400-1800 × {deriv0 vector, deriv0 snv, deriv1 vector, deriv1 snv,
