@@ -551,7 +551,20 @@ are possible and documented.
   visible and carries the primary **"Run 3SSE architecture search
   now"** button (`run_3sse_now`): guards data + busy state, auto-picks
   paired (groups present) vs standard 3SSE mode in the dropdown, then
-  calls `start_training()`. NOTE: ad-hoc driver scripts that call
+  calls `start_training()`. Card extras: **Fast screening** toggle
+  (k=2 + skips `sequential.SLOW_MODELS` = 1D-CNN/CatBoost/XGBoost, CNN
+  8 epochs), rough **time estimate** (archs·k/240 + 60·0.4 min,
+  calibrated on the measured full run), **Cancel** (cooperative
+  `cancel_check` → `SearchCancelled`; Run hides/Cancel shows while
+  running), **live top-5 leaderboard** (`leaderboard_cb` at batch
+  boundaries), **checkpoint resume** (worker passes
+  `study_run_3sse/archs.jsonl`, deletes on success, keeps on
+  cancel/crash — Run resumes; replay filters to the current model
+  subset). After validation the worker auto-runs **significance**:
+  exact McNemar (winner OOF vs best-single OOF, identical folds) +
+  3-seed stability; shown in the winner tab ("SIGNIFICANCE (auto)").
+  Dialog: **"Export this tab to CSV…"** (active ranking tab →
+  utf-8-sig CSV). NOTE: ad-hoc driver scripts that call
   `sequential.search` must live IN raman_app (loky main-module
   pickling from a $TEMP __main__ segfaults; main.py is unaffected).
 - Tests (in test_all.py): space counts/order/no-repeats, search smoke,

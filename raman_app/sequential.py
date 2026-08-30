@@ -62,6 +62,13 @@ from modeling import fit_maybe_grouped       # noqa: E402
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA = r"D:\BARC\Data"
+# models skipped by the GUI's "fast screening" toggle (slowest first)
+SLOW_MODELS = ("1D-CNN", "CatBoost", "XGBoost")
+
+
+class SearchCancelled(Exception):
+    """Raised inside search() when cancel_check() turns true.  The JSONL
+    checkpoint (if any) keeps everything finished so far."""
 
 
 # --------------------------------------------------------------------------
@@ -299,12 +306,19 @@ def _worker_triples(task):
 def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
            top: int = 20, jobs: int = -2, model_names: list | None = None,
            prune_pairs: int = 0, cnn_epochs: int = 15,
-           resume_path: str | None = None, progress_cb=None) -> dict:
+           resume_path: str | None = None, progress_cb=None,
+           cancel_check=None, leaderboard_cb=None) -> dict:
     """
     QUICK search over all architectures (single-level OOF stacking,
     grouped CV).  Returns {"singles", "pairs", "triples", "total",
     "pruned"} where each entry is {"arch", "level", "metrics"} (or
     {"arch", "level", "pruned_bound"} for early-abandoned triples).
+
+    cancel_check: zero-arg callable; when it returns True the search
+    stops promptly with SearchCancelled (the JSONL checkpoint keeps
+    finished triples for --resume).
+    leaderboard_cb: optional callback receiving the current top-5
+    [(arch_str, f1), ...] at batch boundaries.
     """
     from joblib import Parallel, delayed
 
@@ -322,6 +336,16 @@ def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
     total = _check_space(names)
     t0 = time.time()
     done = [0]
+
+    def check_cancel():
+        if cancel_check is not None and cancel_check():
+            raise SearchCancelled()
+
+    def top5_of(pool):
+        scored = sorted((e for e in pool if "metrics" in e),
+                        key=lambda e: -e["metrics"]["f1"])[:5]
+        return [((" → ".join(e["arch"])), e["metrics"]["f1"])
+                for e in scored]
 
     def tick(best: str, best_f1: float):
         if progress_cb:
@@ -356,6 +380,7 @@ def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
     # ---- level 1: singles (OOF kept as layer-1 features) ---------------
     singles, oof1 = [], {}
     for name in names:
+        check_cancel()
         P1 = _oof_proba(factories[name](), X, y, groups, k, seed)
         oof1[name] = P1.astype(np.float32)
         m = _metrics_from_oof(y, P1, classes, groups)
@@ -390,17 +415,23 @@ def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
               factories, wavenumbers)
              for A, B in itertools.permutations(names, 2)]
     pairs, p2 = [], {}
-    for key, metrics, P2 in Parallel(n_jobs=jobs)(
-            delayed(_worker_pair)(t) for t in tasks):
-        p2[key] = P2
-        pairs.append({"arch": key, "level": 2, "metrics": metrics})
-        done[0] += 1
-        tick(" → ".join(key), metrics["f1"])
+    batch = max(1, abs(jobs)) * 2
+    for i in range(0, len(tasks), batch):
+        check_cancel()
+        for key, metrics, P2 in Parallel(n_jobs=jobs)(
+                delayed(_worker_pair)(t) for t in tasks[i:i + batch]):
+            p2[key] = P2
+            pairs.append({"arch": key, "level": 2, "metrics": metrics})
+            done[0] += 1
+            tick(" → ".join(key), metrics["f1"])
+        if leaderboard_cb:
+            leaderboard_cb(top5_of(singles + pairs))
 
     # ---- level 3: pair-major, best-first, early-abandon -----------------
     triples: list[dict] = []
+    name_set = set(names)
     for rec in resume.values():          # replay checkpointed triples
-        if rec.get("level") == 3:
+        if rec.get("level") == 3 and set(rec["arch"]) <= name_set:
             if rec.get("pruned"):
                 triples.append({"arch": tuple(rec["arch"]), "level": 3,
                                 "pruned_bound": rec.get("bound", 0.0)})
@@ -423,6 +454,7 @@ def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
     cutoff = cutoff_now()
     chunk = max(1, abs(jobs))
     for i in range(0, len(pairs_sorted), chunk):
+        check_cancel()
         batch = pairs_sorted[i:i + chunk]
         tasks = []
         for p in batch:
@@ -450,6 +482,8 @@ def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
         if scored:
             b = max(scored, key=lambda t: t["metrics"]["f1"])
             tick(" → ".join(b["arch"]), b["metrics"]["f1"])
+        if leaderboard_cb:
+            leaderboard_cb(top5_of(singles + pairs + triples))
     if ckpt:
         ckpt.close()
     return {"singles": singles, "pairs": pairs, "triples": triples,

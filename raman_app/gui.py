@@ -18,6 +18,7 @@ shortcuts, wait cursors.
 from __future__ import annotations
 
 import os
+import threading
 import traceback
 from dataclasses import asdict
 from math import log10
@@ -192,20 +193,32 @@ class SeqSearchWorker(QtCore.QThread):
     """
     3SSE architecture search in the background: quick screening of all
     single/pair/triple chains, nested validation of the top-N per level,
-    and the deployable winner chain — GUI work stays on the main thread.
+    the deployable winner chain, and automatic significance testing
+    (McNemar vs the best single model + 3-seed stability).  Supports
+    cooperative cancellation and JSONL-checkpoint resume.
     """
     progress = Signal(int, str)
     search_progress = Signal(int, int, str, float, float)  # done,total,best,f1,eta
-    done = Signal(object)              # {"board", "validated", "winner"}
+    leaderboard = Signal(list)          # [(arch_str, f1), ...] top-5
+    done = Signal(object)              # {"board", "validated", "winner", ...}
+    cancelled = Signal()
     failed = Signal(str)
 
     def __init__(self, X, y, groups, wavenumbers, model_names, k=3,
-                 seed=42, top=20, parent=None):
+                 seed=42, top=20, fast=False, resume_path=None,
+                 parent=None):
         super().__init__(parent)
         self.X, self.y, self.groups = X, y, groups
         self.wavenumbers = wavenumbers
         self.model_names = model_names
         self.k, self.seed, self.top = k, seed, top
+        self.fast = fast
+        self.resume_path = resume_path
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        """Cooperative stop; finished triples stay in the checkpoint."""
+        self._cancel.set()
 
     def run(self):
         try:
@@ -218,24 +231,91 @@ class SeqSearchWorker(QtCore.QThread):
                     f"(F1 {f1:.3f}) · ETA {eta / 60:.0f} min")
                 self.search_progress.emit(done, total, best, f1, eta)
 
+            names = self.model_names
+            k_eff, cnn_eff = self.k, 15
+            if self.fast:               # quick screening preset
+                names = [n for n in names
+                         if n not in sequential.SLOW_MODELS]
+                k_eff, cnn_eff = 2, 8
             board = sequential.search(
                 self.X, self.y, groups=self.groups,
-                wavenumbers=self.wavenumbers, k=self.k, seed=self.seed,
-                top=self.top, model_names=self.model_names,
-                progress_cb=prog)
+                wavenumbers=self.wavenumbers, k=k_eff, seed=self.seed,
+                top=self.top, model_names=names,
+                cnn_epochs=cnn_eff, resume_path=self.resume_path,
+                progress_cb=prog, cancel_check=self._cancel.is_set,
+                leaderboard_cb=lambda t5: self.leaderboard.emit(t5))
+        except sequential.SearchCancelled:
+            self.cancelled.emit()
+            return
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        try:
             validated = sequential.validate_top(
                 board, self.X, self.y, self.groups, self.wavenumbers,
                 top=self.top, seed=self.seed,
-                model_names=self.model_names,
                 progress=lambda m: self.progress.emit(-1, m))
             winner = sequential.finalize_winner(
                 validated, self.X, self.y, self.groups,
-                self.wavenumbers, board=board, k=self.k, seed=self.seed)
+                self.wavenumbers, board=board, k=k_eff, seed=self.seed)
+            sig = self._significance(sequential, validated, winner,
+                                     board)
+            # a completed run clears its checkpoint: the next Run starts
+            # fresh instead of resuming stale triples
+            if self.resume_path and os.path.isfile(self.resume_path):
+                try:
+                    os.remove(self.resume_path)
+                except OSError:
+                    pass
             self.done.emit({"board": board, "validated": validated,
-                            "winner": winner, "k": self.k,
-                            "seed": self.seed, "groups": self.groups})
+                            "winner": winner, "k": k_eff,
+                            "seed": self.seed, "groups": self.groups,
+                            "significance": sig})
         except Exception:
             self.failed.emit(traceback.format_exc())
+
+    def _significance(self, sequential, validated, winner, board):
+        """McNemar winner-vs-best-single on identical folds + 3-seed
+        stability of the winner (binary problems only)."""
+        try:
+            if winner is None or len(winner["arch"]) < 2:
+                return None
+            singles = validated.get(1) or []
+            if not singles:
+                return None
+            best_single = max(singles, key=lambda e: e["metrics"]["f1"])
+            wm, sm = winner["metrics"], best_single["metrics"]
+            if wm["oof_proba"] is None or sm["oof_proba"] is None \
+                    or wm["oof_proba"].shape[1] != 2:
+                return None
+            yt = np.asarray(wm["y_true"])
+            pw = np.argmax(wm["oof_proba"], axis=1)
+            ps = np.argmax(sm["oof_proba"], axis=1)
+            b, c, p = modeling.mcnemar_test(yt, pw, ps)
+            facs = sequential._factories(self.wavenumbers, cnn_epochs=15)
+            if "Ensemble (top-3)" in winner["arch"]:
+                top3 = [e["arch"][0] for e in sorted(
+                    (s for s in board["singles"]
+                     if s["arch"][0] != "Ensemble (top-3)"),
+                    key=lambda s: -s["metrics"]["f1"])][:3]
+                facs["Ensemble (top-3)"] = sequential._ensemble_factory(
+                    top3, facs, wn=self.wavenumbers)
+            seed_f1s = [float(wm["f1"])]
+            for extra_seed in (self.seed + 1, self.seed + 2):
+                m = sequential.validate_arch(winner["arch"], facs,
+                                             self.X, self.y, self.groups,
+                                             seed=extra_seed)
+                seed_f1s.append(float(m["f1"]))
+                self.progress.emit(-1, f"seed stability {extra_seed}: "
+                                       f"F1 {m['f1']:.3f}")
+            return {"baseline": " → ".join(best_single["arch"]),
+                    "baseline_f1": float(sm["f1"]),
+                    "mcnemar_b": int(b), "mcnemar_c": int(c),
+                    "mcnemar_p": float(p),
+                    "seed_f1s": seed_f1s}
+        except Exception as exc:
+            self.progress.emit(-1, f"significance testing skipped: {exc}")
+            return None
 
 
 class PredictWorker(QtCore.QThread):
@@ -719,10 +799,63 @@ class SeqResultsDialog(QtWidgets.QDialog):
         level_meta = ((1, "singles", "Single Models"),
                       (2, "pairs", "2-Model"),
                       (3, "triples", "3-Model"))
+        self._tabs = tabs
+        self._tab_models: list[tuple[str, ArchTableModel]] = []
         for level, key, title in level_meta:
             rows = self._rows(board[key], level)
-            tabs.addTab(self._table(rows), f"{title} ({len(rows)})")
+            model = ArchTableModel(rows)
+            tabs.addTab(self._table(model), f"{title} ({len(rows)})")
+            self._tab_models.append((title, model))
         tabs.addTab(self._winner_tab(payload), "Overall Winner")
+        btn_row = QtWidgets.QHBoxLayout()
+        b_csv = QtWidgets.QPushButton("Export this tab to CSV…")
+        b_csv.setToolTip("Writes the currently selected ranking tab "
+                         "(as displayed, sorted) to a CSV file.")
+        b_csv.clicked.connect(self._export_csv)
+        btn_row.addWidget(b_csv)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+
+    @staticmethod
+    def _table(model: ArchTableModel):
+        view = QtWidgets.QTableView()
+        proxy = QtCore.QSortFilterProxyModel()
+        proxy.setSourceModel(model)
+        view.setModel(proxy)
+        view.setSortingEnabled(True)
+        view.horizontalHeader().setStretchLastSection(True)
+        view.verticalHeader().setVisible(False)
+        view.setAlternatingRowColors(True)
+        return view
+
+    def _export_csv(self):
+        import csv as _csv
+        idx = self._tabs.currentIndex()
+        if idx < 0 or idx >= len(self._tab_models):
+            QtWidgets.QMessageBox.information(
+                self, "Nothing to export",
+                "Select a ranking tab (Single / 2-Model / 3-Model) "
+                "first.")
+            return
+        title, model = self._tab_models[idx]
+        default = f"3sse_{title.lower().replace(' ', '_')}.csv"
+        path, _f = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export ranking to CSV",
+            os.path.join(os.path.expanduser("~"), "Desktop", default),
+            "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                w = _csv.writer(fh)
+                w.writerow(ArchTableModel.HEADERS)
+                w.writerows(model._rows)
+            self.parent().log(f"3SSE ranking exported: {path} "
+                              f"({len(model._rows)} rows)") \
+                if self.parent() else None
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Export failed", f"Could not write CSV:\n{exc}")
 
     @staticmethod
     def _rows(entries, level):
@@ -738,19 +871,6 @@ class SeqResultsDialog(QtWidgets.QDialog):
                  f"{e['metrics'].get('auc', float('nan')):.3f}",
                  f"{e['metrics']['acc']:.3f}"]
                 for i, e in enumerate(scored)]
-
-    @staticmethod
-    def _table(rows):
-        view = QtWidgets.QTableView()
-        model = ArchTableModel(rows)
-        proxy = QtCore.QSortFilterProxyModel()
-        proxy.setSourceModel(model)
-        view.setModel(proxy)
-        view.setSortingEnabled(True)
-        view.horizontalHeader().setStretchLastSection(True)
-        view.verticalHeader().setVisible(False)
-        view.setAlternatingRowColors(True)
-        return view
 
     def _winner_tab(self, payload):
         w = QtWidgets.QWidget()
@@ -799,6 +919,24 @@ class SeqResultsDialog(QtWidgets.QDialog):
                           f"accuracy {m['acc']:.3f}",
                           "  Baseline (paired Extra Trees): F1 0.702 · "
                           "AUC 0.788"]
+            sig = payload.get("significance")
+            if sig:
+                f1s = sig["seed_f1s"]
+                mean = sum(f1s) / len(f1s)
+                sd = (sum((x - mean) ** 2 for x in f1s)
+                      / max(len(f1s) - 1, 1)) ** 0.5
+                verdict = ("SIGNIFICANT" if sig["mcnemar_p"] < 0.05
+                           else "NOT significant")
+                lines += ["",
+                          "SIGNIFICANCE (auto)",
+                          f"  vs best single ({sig['baseline']}, F1 "
+                          f"{sig['baseline_f1']:.3f}): McNemar "
+                          f"b={sig['mcnemar_b']} c={sig['mcnemar_c']} "
+                          f"→ p={sig['mcnemar_p']:.3f} — the chain's "
+                          f"improvement is {verdict}.",
+                          f"  Seed stability ({len(f1s)} seeds): F1 "
+                          f"{mean:.3f} ± {sd:.3f} "
+                          f"({', '.join(f'{x:.3f}' for x in f1s)})"]
         elif payload.get("report_text"):
             # loaded from a saved run without persisted validation data
             text = payload["report_text"]
@@ -1380,6 +1518,27 @@ class MainWindow(QtWidgets.QMainWindow):
             "the app stays responsive.")
         self.b_3sse_run.clicked.connect(self.run_3sse_now)
         scv.addWidget(self.b_3sse_run)
+        run_row = QtWidgets.QHBoxLayout()
+        self.chk_3sse_fast = QtWidgets.QCheckBox(
+            "Fast screening (2-fold, skip 1D-CNN/CatBoost/XGBoost)")
+        self.chk_3sse_fast.setToolTip(
+            "Quick preset: 2-fold screening and the three slowest "
+            "models skipped — several times faster, good for "
+            "exploration; uncheck for the full search.")
+        self.chk_3sse_fast.toggled.connect(self._update_seq_card)
+        run_row.addWidget(self.chk_3sse_fast)
+        self.b_3sse_cancel = QtWidgets.QPushButton("Cancel search")
+        self.b_3sse_cancel.setToolTip(
+            "Stop the search. Finished architectures are kept in the "
+            "checkpoint — pressing Run again resumes where it stopped.")
+        self.b_3sse_cancel.clicked.connect(self.cancel_3sse)
+        self.b_3sse_cancel.hide()
+        run_row.addWidget(self.b_3sse_cancel)
+        run_row.addStretch(1)
+        scv.addLayout(run_row)
+        self.seq_estimate = QtWidgets.QLabel("")
+        self.seq_estimate.setObjectName("CardHint")
+        scv.addWidget(self.seq_estimate)
         self.seq_counter = QtWidgets.QLabel("")
         self.seq_counter.setStyleSheet(
             "font-size:15pt; font-weight:700; color:#312e81;")
@@ -1392,6 +1551,11 @@ class MainWindow(QtWidgets.QMainWindow):
         scv.addWidget(self.seq_counter)
         scv.addWidget(self.seq_phase)
         scv.addWidget(self.seq_best)
+        self.seq_top5 = QtWidgets.QLabel("")
+        self.seq_top5.setTextFormat(QtCore.Qt.RichText)
+        self.seq_top5.setStyleSheet(
+            "color:#334155; font-family:Consolas, monospace;")
+        scv.addWidget(self.seq_top5)
         self.b_3sse_view = QtWidgets.QPushButton(
             "View saved 3SSE results (last architecture search)…")
         self.b_3sse_view.setFlat(True)
@@ -4824,13 +4988,20 @@ class MainWindow(QtWidgets.QMainWindow):
                      " triples), patient-grouped OOF chaining")
             self._seq_worker = SeqSearchWorker(
                 X, yy, gg, wn_for_models, model_names=names,
-                k=self.spin_folds.value(), seed=self.spin_seed.value())
+                k=self.spin_folds.value(), seed=self.spin_seed.value(),
+                fast=self.chk_3sse_fast.isChecked(),
+                resume_path=os.path.join(APP_DIR, "study_run_3sse",
+                                         "archs.jsonl"))
             self._seq_worker.progress.connect(self.on_seq_progress)
             self._seq_worker.search_progress.connect(
                 self.on_seq_search_progress)
+            self._seq_worker.leaderboard.connect(self.on_seq_leaderboard)
             self._seq_worker.done.connect(self.on_seq_done)
+            self._seq_worker.cancelled.connect(self.on_seq_cancelled)
             self._seq_worker.failed.connect(self.on_seq_failed)
             self._seq_worker.start()
+            self.b_3sse_run.hide()
+            self.b_3sse_cancel.show()
             return
         self.worker = TrainWorker(X, yy, names, self.spin_folds.value(),
                                   self.spin_seed.value(), groups=gg,
@@ -4914,23 +5085,50 @@ class MainWindow(QtWidgets.QMainWindow):
             "\n\nFull details are printed to the console.")
 
     # ================================================== 3SSE handlers
-    def _update_seq_card(self, *_args):
-        """Refresh the 3SSE card's architecture counts for the
-        currently checked models (card is always visible)."""
+    def _seq_effective_models(self) -> list[str]:
+        """Checked models, minus the fast-screening skips."""
+        import sequential
         checked = [n for n, cb in self.model_checks.items()
                    if cb.isChecked()]
+        if self.chk_3sse_fast.isChecked():
+            checked = [n for n in checked
+                       if n not in sequential.SLOW_MODELS]
+        return checked
+
+    def _update_seq_card(self, *_args):
+        """Refresh the 3SSE card: architecture counts + rough time
+        estimate for the currently checked (and fast-filtered) models."""
+        checked = self._seq_effective_models()
         base = [n for n in checked if n != "Ensemble (top-3)"]
         n = len(base) + (1 if "Ensemble (top-3)" in checked else 0)
         n = max(n, 2)
         singles, pairs, triples = n, n * (n - 1), n * (n - 1) * (n - 2)
+        total_arch = singles + pairs + triples
+        k = 2 if self.chk_3sse_fast.isChecked() else (
+            self.spin_folds.value()
+            if hasattr(self, "spin_folds") else 5)
+        # calibrated on the measured full run (4,369 @ k=3 ≈ 55 min
+        # screening + ~25 min validation) — rough by design
+        est_min = total_arch * k / 240 + 60 * 0.4
         data_note = ("paired data" if self.groups is not None
                      else "standard data (no patient groups loaded)")
+        fast_note = (" · FAST: 2-fold, slow models skipped"
+                     if self.chk_3sse_fast.isChecked() else "")
         self.seq_counts.setText(
             f"Search space: {singles:,} single models · "
             f"{pairs:,} two-model chains · {triples:,} three-model "
-            f"chains = {singles + pairs + triples:,} architectures "
+            f"chains = {total_arch:,} architectures "
             f"(ordered, no repeats; probabilities chained between "
-            f"layers, patient-grouped OOF). Will run on {data_note}.")
+            f"layers, patient-grouped OOF). Will run on {data_note}"
+            f"{fast_note}.")
+        self.seq_estimate.setText(
+            f"Rough time estimate: ≈ {est_min:.0f} min "
+            "(screening + nested validation + significance tests)")
+        ckpt = os.path.join(APP_DIR, "study_run_3sse", "archs.jsonl")
+        if os.path.isfile(ckpt):
+            self.seq_phase.setText(
+                "Checkpoint from an interrupted search found — Run "
+                "resumes it instead of starting over.")
 
     def run_3sse_now(self):
         """Run button: pick the right 3SSE mode for the loaded data and
@@ -4955,7 +5153,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seq_counter.setText("0")
         self.seq_phase.setText("Phase: screening — starting…")
         self.seq_best.setText("")
+        self.seq_top5.setText("")
         self.start_training()
+
+    def cancel_3sse(self):
+        if self._seq_worker is not None and self._seq_worker.isRunning():
+            self._seq_worker.cancel()
+            self.seq_phase.setText("Cancelling — finishing current "
+                                   "batch…")
+
+    def on_seq_leaderboard(self, top5: list):
+        rows = "".join(
+            f"{i + 1}. {arch}  <b>{f1:.3f}</b><br>"
+            for i, (arch, f1) in enumerate(top5))
+        self.seq_top5.setText(f"<b>Top so far</b><br>{rows}")
 
     def on_seq_search_progress(self, done: int, total: int, best: str,
                                f1: float, eta: float):
@@ -5038,7 +5249,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_seq_done(self, payload: dict):
         self.b_train.setEnabled(True)
+        self.b_3sse_run.show()
+        self.b_3sse_cancel.hide()
         self.progress.setValue(100)
+        self.seq_phase.setText("Done — winner installed.")
         self._seq_payload = payload
         board = payload["board"]
         fin = payload.get("winner")
@@ -5101,8 +5315,20 @@ class MainWindow(QtWidgets.QMainWindow):
             f"(nested F1 {m['f1']:.3f}) — Save it, then go to Predict. "
             "Full rankings in the 3SSE results window.")
 
+    def on_seq_cancelled(self):
+        self.b_train.setEnabled(True)
+        self.b_3sse_run.show()
+        self.b_3sse_cancel.hide()
+        self.progress.setValue(0)
+        self.seq_phase.setText(
+            "Cancelled — checkpoint kept. Press Run to resume where "
+            "it stopped.")
+        self.log("3SSE search cancelled (checkpoint kept for resume)")
+
     def on_seq_failed(self, tb: str):
         self.b_train.setEnabled(True)
+        self.b_3sse_run.show()
+        self.b_3sse_cancel.hide()
         self.log(f"3SSE search failed:\n{tb}")
         QtWidgets.QMessageBox.warning(
             self, "3SSE search failed",
