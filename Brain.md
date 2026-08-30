@@ -563,6 +563,30 @@ model}`) — vit_train `--preset best` consumes it.
 - `vit_test.py`: re-evaluates the exact checkpoint test files; prints
   accuracy + report; writes vit_test_report.txt + confusion PNG.
 
+### 3SSE real-data results (2026-08-30, paired mode, seed 42)
+
+All 4,369 architectures screened (k=3, 3,462 pruned by the sound
+early-abandon bound — 79 % of triples never finished their folds);
+top-20 per level nested-validated (5-fold grouped). Artifacts in
+`raman_app/study_run_3sse/` (screening.jsonl, report.txt,
+winner.joblib).
+
+| Level | Best architecture | F1 (nested) | AUC |
+|---|---|---|---|
+| Single | Extra Trees | 0.702 | 0.789 |
+| 2-Model | Ensemble (top-3) → Extra Trees | 0.697 | 0.787 |
+| **3-Model** | **PCA+GNB → PCA+SVM(RBF) → Extra Trees** | **0.725** | **0.796** |
+
+**OVERALL WINNER: the 3-model chain** (F1 0.725 / sens 0.726 / spec
+0.726 / AUC 0.796) — beats the paired baseline (Extra Trees 0.702 /
+0.788) by +0.023 F1, +0.008 AUC. **BUT McNemar on the identical outer
+folds: b=16, c=10, exact p=0.327 — the improvement is NOT
+statistically significant.** Honest verdict: sequential chaining gives
+a modest point-estimate gain, unproven at this sample size (n=287
+spectra / 64 patients). Known limitation: winner chosen from the top-20
+per level on the same seed; no seed-stability rerun yet. Screened
+with default hyperparameters (identical for all 4,369 — fair).
+
 ## 16. Gotchas & invariants (read before editing)
 
 1. `load_clinical_dataset()` returns a **`ClinicalData` dataclass**
@@ -622,3 +646,6 @@ Repo `D:\BARC`, branch `main`, init 2026-08-30; per-commit history:
    paths.
 5. Winner selected on the reporting CV (nested eval is opt-in, GUI-only);
    no external cohort; confounders unrecorded.
+6. 3SSE winner: run seed-stability (5 seeds) on the winning chain +
+   baseline before claiming the +0.023 F1 gain (McNemar p=0.327 so
+   far); screening used default hyperparameters only.
