@@ -413,6 +413,7 @@ class ModelResult:
     thresholds: list = field(default_factory=list)    # binary only
     threshold: float | None = None                    # binary only (median)
     fold_f1: list = field(default_factory=list)       # macro-F1 per fold/repeat
+    groups: list | None = None                        # eval group (patient) per row
     pipeline: object = None                           # refit on all data
     error: str | None = None
 
@@ -649,7 +650,11 @@ def evaluate_models(X: np.ndarray, y: list[str],
         res = ModelResult(name=name, classes=classes)
         fold_metrics: list[dict[str, dict[str, float]]] = []
         cm_total = np.zeros((len(classes), len(classes)), dtype=int)
-        oof = np.full((len(ye), len(classes)), np.nan)
+        # OOF probabilities pooled (averaged) across repeats, matching the
+        # pooled confusion matrices — a plain `oof[te] = proba` would keep
+        # only the last repeat's probabilities
+        oof_sum = np.zeros((len(ye), len(classes)))
+        oof_cnt = np.zeros(len(ye))
         param_list: list[dict] = []
         param_counter: Counter = Counter()
         best_tpl: tuple | None = None
@@ -723,7 +728,8 @@ def evaluate_models(X: np.ndarray, y: list[str],
                     clone(estimator).set_params(**params), Xtr, ytr,
                     groups_tr)
                 proba = final.predict_proba(Xte)
-                oof[te] = proba
+                oof_sum[te] += proba
+                oof_cnt[te] += 1
                 if binary and thr is not None:
                     pred = np.where(proba[:, pos_idx] >= thr, pos_idx, 1 - pos_idx)
                 else:
@@ -737,8 +743,12 @@ def evaluate_models(X: np.ndarray, y: list[str],
                                                   average="macro")))
                 done += 1
             _aggregate(res, fold_metrics, cm_total)
+            oof = np.full((len(ye), len(classes)), np.nan)
+            seen = oof_cnt > 0
+            oof[seen] = oof_sum[seen] / oof_cnt[seen, None]
             res.oof_proba = oof
             res.y_true_encoded = ye
+            res.groups = list(groups) if groups is not None else None
             if binary and res.thresholds:
                 valid = [t for t in res.thresholds if t is not None]
                 res.threshold = float(np.median(valid)) if valid else None
@@ -906,16 +916,30 @@ def region_importance(X, y, groups, wn, seed: int = RANDOM_STATE,
 
 
 def bootstrap_ci(y_true, y_pred, n: int = 1000, alpha: float = 0.05,
-                 seed: int = RANDOM_STATE):
-    """95% bootstrap confidence interval for macro-F1 -> (lo, hi)."""
+                 seed: int = RANDOM_STATE, groups=None):
+    """95% bootstrap confidence interval for macro-F1 -> (lo, hi).
+
+    When `groups` (one id per sample, e.g. patient) is given, the resample
+    is drawn over GROUPS so all spectra of a patient move together —
+    spectrum-level resampling on grouped data would understate the CI
+    width (pseudo-replication).
+    """
     from sklearn.metrics import f1_score
 
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     rng = np.random.default_rng(seed)
+    if groups is not None:
+        groups = np.asarray(groups)
+        rows_by = [np.flatnonzero(groups == g) for g in np.unique(groups)]
+        n_blocks = len(rows_by)
     scores = []
     for _ in range(n):
-        idx = rng.integers(0, len(y_true), len(y_true))
+        if groups is None:
+            idx = rng.integers(0, len(y_true), len(y_true))
+        else:
+            idx = np.concatenate(
+                [rows_by[b] for b in rng.integers(0, n_blocks, n_blocks)])
         if len(set(y_true[idx])) < 2:
             continue                      # degenerate resample
         scores.append(f1_score(y_true[idx], y_pred[idx], average="macro"))

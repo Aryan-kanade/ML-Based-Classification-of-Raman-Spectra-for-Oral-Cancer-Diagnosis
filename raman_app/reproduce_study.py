@@ -28,30 +28,15 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import clinical as clin                      # noqa: E402
+import dataset as ds                         # noqa: E402
 import modeling                              # noqa: E402
 import plotting                              # noqa: E402
 import preprocessing as pp                   # noqa: E402
-from clinical_data import load_clinical_dataset  # noqa: E402
+import study_stats as sstats                 # noqa: E402
+from clinical_data import load_clinical_dataset, write_report  # noqa: E402
 
 DEFAULT_DATA = r"D:\BARC\Data"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def _matrix_from_spectra(spectra):
-    """Common-grid matrix exactly like the GUI: the first spectrum's
-    axis is the grid; every other spectrum is interpolated onto it."""
-    grid = None
-    rows = []
-    for s in spectra:
-        wn = np.asarray(s.wavenumbers, dtype=float)
-        it = np.asarray(s.intensities, dtype=float)
-        if grid is None:
-            grid = wn
-            rows.append(it)
-        else:
-            order = np.argsort(wn)
-            rows.append(np.interp(grid, wn[order], it[order]))
-    return np.vstack(rows), grid
 
 
 def main(argv=None) -> int:
@@ -77,13 +62,13 @@ def main(argv=None) -> int:
 
     # ---- data ------------------------------------------------------------
     groups: list[str] | None
+    flagged: list[bool] | None = None
     if args.demo:
-        import dataset
         import tempfile
-        src = dataset.find_default_source_spectrum()
-        root = dataset.generate_demo_data(
+        src = ds.find_default_source_spectrum()
+        root = ds.generate_demo_data(
             src, os.path.join(tempfile.mkdtemp(), "demo"))
-        spectra = dataset.load_folder(root)
+        spectra = ds.load_folder(root)
         labels = [s.label for s in spectra]
         groups = None
         print(f"[reproduce] demo data: {len(spectra)} spectra")
@@ -92,8 +77,12 @@ def main(argv=None) -> int:
             print(f"[reproduce] data folder not found: {args.data}"
                   " (use --demo for synthetic data)")
             return 2
-        _report, spectra, labels, groups, _flags = load_clinical_dataset(
-            args.data)
+        cd = load_clinical_dataset(args.data)
+        spectra = cd.spectra
+        labels = [s.label for s in spectra]
+        groups = cd.groups or None
+        flagged = cd.flagged or None
+        write_report(os.path.join(out_dir, "data_report.txt"), cd.report)
         print(f"[reproduce] {len(spectra)} spectra, "
               f"{len(set(labels))} classes, "
               f"{len(set(groups)) if groups else 0} patients")
@@ -102,23 +91,36 @@ def main(argv=None) -> int:
         return 2
 
     # ---- preprocessing (validated defaults, fixed seed) -------------------
+    # Mirrors the GUI path exactly: common_grid/to_matrix, then either
+    # paired_features (which preprocesses internally) or preprocess_matrix.
     params = pp.PreprocessParams().validate()
-    X_raw, grid = _matrix_from_spectra(spectra)
-    X = pp.preprocess_matrix(X_raw, params, wn=grid)
-    wn_cropped = np.asarray(grid)[pp.crop_mask(grid, params)]
+    grid = ds.common_grid(spectra)
+    X_raw, _ = ds.to_matrix(spectra, grid)
     keep = [i for i, lab in enumerate(labels) if lab.strip()]
-    X, y = X[keep], [labels[i] for i in keep]
+    if flagged is not None and not params.despike:
+        # GUI parity: spiked spectra are excluded unless despiking (which
+        # recovers them) is on
+        n_flagged = sum(1 for i in keep if flagged[i])
+        if n_flagged:
+            print(f"[reproduce] excluding {n_flagged} quality-flagged "
+                  "spiked spectra (despiking off)")
+            keep = [i for i in keep if not flagged[i]]
+    y = [labels[i].strip() for i in keep]
     g = [groups[i] for i in keep] if groups else None
 
-    # paired (margin) mode
+    # paired (margin) mode: paired_features takes RAW intensities and the
+    # full grid; it preprocesses + crops internally (single preprocessing)
     if args.mode in ("paired", "paired-pqn"):
         import paired as pmod
-        pd_ = pmod.paired_features(X, y, g, wn_cropped, params,
+        pd_ = pmod.paired_features(X_raw[keep], y, g, grid, params,
                                    use_pqn=(args.mode == "paired-pqn"))
         X, y, g = pd_.X, pd_.y, pd_.groups
         wn_cropped = pd_.wn
         print(f"[reproduce] {args.mode}: {pd_.X.shape[0]} deviation "
               f"spectra from {pd_.n_patients} patients")
+    else:
+        X = pp.preprocess_matrix(X_raw[keep], params, wn=grid)
+        wn_cropped = np.asarray(grid)[pp.crop_mask(grid, params)]
 
     # ---- model comparison -------------------------------------------------
     model_names = (["PCA + LDA", "PCA + Logistic Regression",
@@ -158,6 +160,13 @@ def main(argv=None) -> int:
         brier_cal = float(np.mean((p_cal - yv) ** 2))
         auc, _se, lo, hi = clin.delong_auc_ci(yv, pv)
         lines.append(f"  AUC {auc:.3f} (DeLong 95% CI {lo:.2f}-{hi:.2f})")
+        pred_oof = np.argmax(winner.oof_proba[valid], axis=1)
+        ci_lo, ci_hi = modeling.bootstrap_ci(
+            yv, pred_oof,
+            groups=(np.asarray(winner.groups)[valid]
+                    if getattr(winner, "groups", None) else None))
+        lines.append(f"  macro-F1 95% CI [{ci_lo:.2f}-{ci_hi:.2f}]"
+                     " (patient-level bootstrap)")
         lines.append(f"  Brier {brier_raw:.3f}"
                      + (f" -> {brier_cal:.3f} after Platt calibration"
                         if ab else ""))
@@ -174,10 +183,18 @@ def main(argv=None) -> int:
               "  Purohit 2026 review        0.90 / 0.89",
               "  (spectrum-level splits — this study's patient-grouped "
               "numbers are the stricter standard)"]
-    # Friedman + Nemenyi across models
+    # Friedman + Nemenyi across models. Blocks must be independent: with
+    # repeats>1 the per-fold scores are averaged across repeats first
+    # (pooling repeats as blocks would violate independence).
+    def _per_fold_blocks(f1s: list[float]) -> list[float]:
+        if args.repeats > 1 and len(f1s) % args.repeats == 0:
+            k = len(f1s) // args.repeats
+            return np.asarray(f1s, dtype=float).reshape(
+                args.repeats, k).mean(axis=0).tolist()
+        return list(f1s)
+
     try:
-        import study_stats as sstats
-        scores = {r.name: r.fold_f1 for r in results
+        scores = {r.name: _per_fold_blocks(r.fold_f1) for r in results
                   if r.error is None and len(r.fold_f1) > 2}
         if len(scores) >= 2:
             fr = sstats.friedman_nemenyi(scores)
@@ -187,8 +204,8 @@ def main(argv=None) -> int:
                              else "NOT significant (models tie)")
                           + f"; best by rank: {fr['best']} "
                             f"(CD {fr['cd']:.2f})"]
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[reproduce] Friedman skipped: {exc}")
     # leave-one-patient-out of the winner (grouped data only)
     if g:
         try:
@@ -202,8 +219,8 @@ def main(argv=None) -> int:
                             if np.isfinite(lo["auc"]) else "")
                          + f", mean per-patient accuracy "
                            f"{np.mean(lo['accs']):.3f}")
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[reproduce] LOPO skipped: {exc}")
     summary = "\n".join(lines)
     print(summary)
     with open(os.path.join(out_dir, "summary.txt"), "w",

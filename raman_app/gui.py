@@ -2095,8 +2095,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         and getattr(w, "y_true_encoded", None) is not None):
                     valid = ~np.isnan(w.oof_proba).any(axis=1)
                     pred_oof = np.argmax(w.oof_proba[valid], axis=1)
+                    w_groups = (np.asarray(w.groups)[valid]
+                                if getattr(w, "groups", None) else None)
                     ci_lo, ci_hi = modeling.bootstrap_ci(
-                        w.y_true_encoded[valid], pred_oof)
+                        w.y_true_encoded[valid], pred_oof,
+                        groups=w_groups)
                     bits.append(f"macro-F1 95% CI "
                                 f"[{ci_lo:.2f}–{ci_hi:.2f}]")
             except Exception:
@@ -2567,8 +2570,12 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 parts.append(f"On the {n} spectra you just classified, "
                              "<b>none were called positive</b>.")
+        n_eval_pat = (len(set(w.groups)) if getattr(w, "groups", None)
+                      else None)
         parts.append("These numbers come from patient-grouped "
-                     "cross-validation on ~70 patients; expect larger "
+                     "cross-validation"
+                     + (f" on {n_eval_pat} patients" if n_eval_pat else "")
+                     + "; expect larger "
                      "variation on new patients. This is research "
                      "triage support for trained clinicians — not a "
                      "medical diagnosis; histopathology remains the "
