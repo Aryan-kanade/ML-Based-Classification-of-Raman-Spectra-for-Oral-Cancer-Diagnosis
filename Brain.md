@@ -5,8 +5,8 @@
 > gotchas, and a changelog. Do NOT re-explore the whole tree.
 >
 > **Maintenance rule (mandatory):** after any non-trivial change, update
-> the matching section below and add a line to §13 Changelog. Keep the
-> "Last updated" stamp current. Keep it dense — no prose padding.
+> the matching section below. Keep the "Last updated" stamp current.
+> Keep it dense — no prose padding.
 
 Last updated: 2026-08-30 (after the "real clinical study" overhaul, git `876b624`)
 
@@ -248,10 +248,8 @@ custom collectors (`main()` at bottom).
 
 ## 11. Git / repo state
 
-Repo at `D:\BARC` (init 2026-08-30). Branch `main`, 3 commits:
-`a12c8d3` initial → `93afae4` bug fixes (reproduce clinical path, OOF
-pooling, patient bootstrap) → `876b624` real study + async GUI +
-regression tests. Patient data & run artifacts gitignored — see §3.
+Repo at `D:\BARC` (init 2026-08-30), branch `main`. Per-commit history:
+`git log --oneline`. Patient data & run artifacts gitignored — see §3.
 
 ## 12. Open items (prioritized)
 
@@ -267,16 +265,3 @@ regression tests. Patient data & run artifacts gitignored — see §3.
 5. Sci-rigor ceilings: winner selected on the same CV that reports
    (nested `evaluate_pipeline` exists but is opt-in, GUI-only); no
    external cohort; confounders unrecorded.
-
-## 13. Changelog (append one line per change; newest last)
-
-- 2026-08-30 `a12c8d3` — repo init, .gitignore (privacy), pinned
-  requirements, stale raman_app.zip deleted.
-- 2026-08-30 `93afae4` — fixed reproduce_study clinical crash +
-  paired double-preprocess + sstats NameError; OOF pooled across
-  repeats; patient-level bootstrap; Friedman blocks per-repeat; dynamic
-  patient count in reports.
-- 2026-08-30 `876b624` — real clinical study run both modes (§7);
-  FuncWorker/_run_async de-freezes 8 GUI analyses; closeEvent thread
-  stop; failure dialogs; 4 regression tests; deep_test wait_analysis.
-- 2026-08-30 — Brain.md created (this file).
