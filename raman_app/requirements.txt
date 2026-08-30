@@ -1,0 +1,21 @@
+# Core scientific stack — pinned to the validated environment (2026-08-30)
+numpy==2.5.2
+scipy==1.18.1
+scikit-learn==1.9.0
+pandas==3.0.5
+matplotlib==3.11.1
+PyWavelets==1.9.0
+joblib==1.5.3
+xgboost==3.4.1
+
+# Research-grade extras (the app falls back gracefully when missing)
+pybaselines==1.2.1   # arPLS baseline correction (Baek 2015)
+shap==0.52.0         # signed SHAP region importance
+
+# Vision Transformer scripts (vit_train.py / vit_test.py) — CPU build is
+# sufficient for these small spectrum models:
+torch==2.13.0
+
+# Qt binding for the GUI — this environment uses PyQt5; on newer Pythons
+# without PyQt5 wheels, PyQt6 or PySide6 work too (the app auto-detects):
+PyQt5==5.15.11

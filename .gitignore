@@ -1,0 +1,26 @@
+# Patient data — never commit (privacy)
+Data/
+
+# Copyrighted literature / external clones / generated renders
+Documatation/
+_external/
+renders/
+
+# Run artifacts (regenerated per study; manifest contains patient IDs)
+raman_app/__pycache__/
+raman_app/.ruff_cache/
+raman_app/session.log
+raman_app/settings.json
+raman_app/study_manifest.json
+raman_app/data_report.txt
+raman_app/result_report.txt
+raman_app/result_report.html
+raman_app/*.joblib
+raman_app/demo_data/
+raman_app/vit_outputs/
+*.zip
+
+# Python / tooling
+__pycache__/
+*.pyc
+.zcode/
