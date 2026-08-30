@@ -415,7 +415,19 @@ presets (`_apply_model_preset`: all/none/classical/fast) + live
 "N of M models selected" counter (`_models_changed`, red < 3).
 Diagnostic buttons live in `self._diag_buttons` (8), grouped under
 section labels, **disabled until a winner exists** (enabled in
-`on_train_done`, disabled when a training starts). A
+`on_train_done`, disabled when a training starts).
+**`restore_last_3sse()`** runs at the end of `__init__`: if
+`study_run_3sse/winner.json` exists it rebuilds the winner ModelResult
+(cm/oof/y_true are PERSISTED via `sequential.persist_run` — `_dumpable`
+keeps ndarrays as JSON lists, plus threshold/calibrator) + the
+validated singles, loads the fitted chain from winner.joblib, and
+calls `on_train_done` — banner/tables/plots/Save/diagnostics/chain
+flow are never blank after a restart; a fresh training overwrites.
+`modeling.load_bundle` registers `__main__`-pickled CLI classes
+(SequentialChain, _SpectralSlice) so CLI-saved bundles unpickle
+anywhere. deep_test harness: file dialogs patched to ("", "") and
+`JOBLIB_MULTIPROCESSING=0` (threading backend — loky pools + QThreads
+are the Windows access-violation race). A
 bottom **Activity-log dock** (QPlainTextEdit, 300 lines, fed by
 `log()`, status-bar toggle button) shows errors in-app; `closeEvent`
 asks before stopping running workers (No aborts the close; 3SSE keeps
