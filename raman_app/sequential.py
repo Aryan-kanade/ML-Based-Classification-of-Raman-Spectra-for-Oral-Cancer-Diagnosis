@@ -676,7 +676,8 @@ def pick_overall(validated: dict[int, list]) -> dict | None:
     return best[1] if best else None
 
 
-def build_report(board: dict, validated: dict, baseline: dict) -> str:
+def build_report(board: dict, validated: dict, baseline: dict,
+                 significance: dict | None = None) -> str:
     lines = ["3SSE — Sequential Architecture Search",
              "=" * 60]
     for level, key, title in ((1, "singles", "BEST SINGLE MODEL"),
@@ -718,6 +719,23 @@ def build_report(board: dict, validated: dict, baseline: dict) -> str:
             lines.append(f"  3SSE winner {'':<20} F1 "
                          f"{winner['metrics']['f1']:.3f} · AUC "
                          f"{winner['metrics'].get('auc', float('nan')):.3f}")
+    if significance:
+        f1s = significance["seed_f1s"]
+        mean = sum(f1s) / len(f1s)
+        sd = (sum((x - mean) ** 2 for x in f1s)
+              / max(len(f1s) - 1, 1)) ** 0.5
+        verdict = ("SIGNIFICANT" if significance["mcnemar_p"] < 0.05
+                   else "NOT significant")
+        lines += ["", "SIGNIFICANCE",
+                  f"  vs best single ({significance['baseline']}, F1 "
+                  f"{significance['baseline_f1']:.3f}): McNemar "
+                  f"b={significance['mcnemar_b']} "
+                  f"c={significance['mcnemar_c']} -> "
+                  f"p={significance['mcnemar_p']:.3f} — the winner's "
+                  f"improvement is {verdict}.",
+                  f"  Seed stability ({len(f1s)} seeds): F1 "
+                  f"{mean:.3f} ± {sd:.3f} "
+                  f"({', '.join(f'{x:.3f}' for x in f1s)})"]
     lines += ["",
               f"Architectures evaluated: {board['total']} · pruned early "
               f"(sound bound): {board.get('pruned', 0)}",
@@ -809,6 +827,62 @@ def finalize_winner(validated: dict, X, y, groups, wavenumbers,
 
 
 # --------------------------------------------------------------------------
+# significance of the winner (shared by GUI worker, CLI and back-fills)
+# --------------------------------------------------------------------------
+def significance_of(validated, winner, board, X, y, groups, wavenumbers,
+                    seed: int = 42, extra_seeds: int = 2,
+                    cnn_epochs: int = 15, progress=None) -> dict | None:
+    """
+    Is the chain winner really better than the best single model?
+    Exact McNemar on the two architectures' nested-OOF predictions
+    (identical outer folds + seed -> a valid paired comparison) plus a
+    small seed-stability rerun of the winner.  Returns a dict (see the
+    GUI winner tab) or None when not applicable (1-model winner,
+    multi-class, missing OOF).
+    """
+    try:
+        if winner is None or len(winner["arch"]) < 2:
+            return None
+        singles = validated.get(1) or []
+        if not singles:
+            return None
+        best_single = max(singles, key=lambda e: e["metrics"]["f1"])
+        wm, sm = winner["metrics"], best_single["metrics"]
+        if (wm.get("oof_proba") is None
+                or sm.get("oof_proba") is None
+                or wm["oof_proba"].shape[1] != 2):
+            return None
+        yt = np.asarray(wm["y_true"])
+        pw = np.argmax(wm["oof_proba"], axis=1)
+        ps = np.argmax(sm["oof_proba"], axis=1)
+        b, c, p = modeling.mcnemar_test(yt, pw, ps)
+        facs = _factories(wavenumbers, cnn_epochs=cnn_epochs)
+        if "Ensemble (top-3)" in winner["arch"]:
+            top3 = [e["arch"][0] for e in sorted(
+                (s for s in board.get("singles", [])
+                 if s["arch"][0] != "Ensemble (top-3)"),
+                key=lambda s: -s["metrics"]["f1"])][:3]
+            facs["Ensemble (top-3)"] = _ensemble_factory(
+                top3, facs, wn=wavenumbers)
+        seed_f1s = [float(wm["f1"])]
+        for extra in range(1, extra_seeds + 1):
+            m = validate_arch(winner["arch"], facs, X, y, groups,
+                              seed=seed + extra)
+            seed_f1s.append(float(m["f1"]))
+            if progress:
+                progress(f"seed stability {seed + extra}: "
+                         f"F1 {m['f1']:.3f}")
+        return {"baseline": _fmt_arch(best_single["arch"]),
+                "baseline_f1": float(sm["f1"]),
+                "mcnemar_b": int(b), "mcnemar_c": int(c),
+                "mcnemar_p": float(p), "seed_f1s": seed_f1s}
+    except Exception as exc:
+        if progress:
+            progress(f"significance testing skipped: {exc}")
+        return None
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 def main(argv=None) -> int:
@@ -890,13 +964,22 @@ def main(argv=None) -> int:
                              for e in validated.get(lv, [])]
                    for lv in (1, 2, 3)}, fh, indent=2)
     winner = pick_overall(validated)
+    sig = None
     if winner is not None:
         with open(os.path.join(out_dir, "winner.json"), "w",
                   encoding="utf-8") as fh:
             json.dump({"arch": list(winner["arch"]),
                        "metrics": _dumpable(winner["metrics"])},
                       fh, indent=2)
-    report = build_report(board, validated, baseline)
+        sig = significance_of(validated, winner, board, X, y, g, wn,
+                              seed=args.seed,
+                              progress=lambda m: print(f"[3sse] {m}",
+                                                       flush=True))
+        if sig is not None:
+            with open(os.path.join(out_dir, "significance.json"),
+                      "w", encoding="utf-8") as fh:
+                json.dump(sig, fh, indent=2)
+    report = build_report(board, validated, baseline, significance=sig)
     print(report)
     with open(os.path.join(out_dir, "report.txt"), "w",
               encoding="utf-8") as fh:

@@ -258,8 +258,20 @@ class SeqSearchWorker(QtCore.QThread):
             winner = sequential.finalize_winner(
                 validated, self.X, self.y, self.groups,
                 self.wavenumbers, board=board, k=k_eff, seed=self.seed)
-            sig = self._significance(sequential, validated, winner,
-                                     board)
+            sig = sequential.significance_of(
+                validated, winner, board, self.X, self.y, self.groups,
+                self.wavenumbers, seed=self.seed,
+                progress=lambda m: self.progress.emit(-1, m))
+            if sig is not None and self.resume_path:
+                try:
+                    import json as _json
+                    with open(os.path.join(
+                            os.path.dirname(self.resume_path),
+                            "significance.json"), "w",
+                            encoding="utf-8") as fh:
+                        _json.dump(sig, fh, indent=2)
+                except OSError:
+                    pass
             # a completed run clears its checkpoint: the next Run starts
             # fresh instead of resuming stale triples
             if self.resume_path and os.path.isfile(self.resume_path):
@@ -273,49 +285,6 @@ class SeqSearchWorker(QtCore.QThread):
                             "significance": sig})
         except Exception:
             self.failed.emit(traceback.format_exc())
-
-    def _significance(self, sequential, validated, winner, board):
-        """McNemar winner-vs-best-single on identical folds + 3-seed
-        stability of the winner (binary problems only)."""
-        try:
-            if winner is None or len(winner["arch"]) < 2:
-                return None
-            singles = validated.get(1) or []
-            if not singles:
-                return None
-            best_single = max(singles, key=lambda e: e["metrics"]["f1"])
-            wm, sm = winner["metrics"], best_single["metrics"]
-            if wm["oof_proba"] is None or sm["oof_proba"] is None \
-                    or wm["oof_proba"].shape[1] != 2:
-                return None
-            yt = np.asarray(wm["y_true"])
-            pw = np.argmax(wm["oof_proba"], axis=1)
-            ps = np.argmax(sm["oof_proba"], axis=1)
-            b, c, p = modeling.mcnemar_test(yt, pw, ps)
-            facs = sequential._factories(self.wavenumbers, cnn_epochs=15)
-            if "Ensemble (top-3)" in winner["arch"]:
-                top3 = [e["arch"][0] for e in sorted(
-                    (s for s in board["singles"]
-                     if s["arch"][0] != "Ensemble (top-3)"),
-                    key=lambda s: -s["metrics"]["f1"])][:3]
-                facs["Ensemble (top-3)"] = sequential._ensemble_factory(
-                    top3, facs, wn=self.wavenumbers)
-            seed_f1s = [float(wm["f1"])]
-            for extra_seed in (self.seed + 1, self.seed + 2):
-                m = sequential.validate_arch(winner["arch"], facs,
-                                             self.X, self.y, self.groups,
-                                             seed=extra_seed)
-                seed_f1s.append(float(m["f1"]))
-                self.progress.emit(-1, f"seed stability {extra_seed}: "
-                                       f"F1 {m['f1']:.3f}")
-            return {"baseline": " → ".join(best_single["arch"]),
-                    "baseline_f1": float(sm["f1"]),
-                    "mcnemar_b": int(b), "mcnemar_c": int(c),
-                    "mcnemar_p": float(p),
-                    "seed_f1s": seed_f1s}
-        except Exception as exc:
-            self.progress.emit(-1, f"significance testing skipped: {exc}")
-            return None
 
 
 class PredictWorker(QtCore.QThread):
@@ -5267,6 +5236,13 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 with open(wpath, encoding="utf-8") as fh:
                     payload["winner"] = _json.load(fh)
+            except Exception:
+                pass
+        gpath = os.path.join(folder, "significance.json")
+        if os.path.isfile(gpath):
+            try:
+                with open(gpath, encoding="utf-8") as fh:
+                    payload["significance"] = _json.load(fh)
             except Exception:
                 pass
         rpath = os.path.join(folder, "report.txt")
