@@ -364,7 +364,7 @@ if HAS_TORCH:
             self.seed = seed
             self.augment = augment
             # B2: fraction of the TRAINING rows to additionally
-            # synthesize as within-class Lorentzian blends (0 = off)
+            # synthesize as within-class spectral blends (0 = off)
             self.synth = synth
 
         def _to_tensor(self, X):
@@ -406,9 +406,10 @@ if HAS_TORCH:
                         random_state=self.seed)
             else:                                   # too small to split
                 idx_tr = idx_va = np.arange(len(ye))
-            # B2: physics-safe within-class Lorentzian blends of the
-            # TRAINING rows only — the early-stop validation split
-            # stays 100% real, so the stopping signal stays honest
+            # B2: physics-safe within-class spectral blends (see
+            # lorentzian_synthesize — convex pairs + smooth gain/tilt)
+            # of the TRAINING rows only — the early-stop validation
+            # split stays 100% real, so the stopping signal stays honest
             tr_X, tr_y = Xt[idx_tr], ye[idx_tr]
             if self.synth > 0 and len(idx_tr) >= 4:
                 X_tr_np = np.asarray(X, dtype=np.float32)[idx_tr]
@@ -860,13 +861,13 @@ def phantom_cohort(n_patients: int = 40, spectra_per: int = 4,
 def lorentzian_synthesize(X: np.ndarray, n_new: int, wn=None,
                           seed: int = RANDOM_STATE) -> np.ndarray:
     """
-    RamanSPy-style physics-safe augmentation (no GAN): bootstrap `n_new`
-    synthetic spectra by fitting Lorentzian peaks to real class examples
-    and perturbing amplitudes/widths/positions by small factors — the
-    internship report's "generative augmentation" future-work line
-    without any generative-model risk.  Pairs of same-class spectra are
-    also intensity-blended (convex combos), which stays on the data
-    manifold by construction.
+    Physics-safe augmentation (no GAN): bootstrap `n_new` synthetic
+    spectra as CONVEX BLENDS of random same-class pairs plus smooth
+    random gain curves and a linear tilt — a perturbation that stays
+    on the data manifold by construction.  (Naming note, 2026-09-05:
+    despite the name there is NO Lorentzian peak fitting here; the
+    original docstring claimed amplitude/width/position perturbation of
+    fitted peaks, which the code never did.)
 
     Use INSIDE training folds only (augmenting before a split leaks).
     """
@@ -1086,8 +1087,9 @@ def model_specs() -> list[dict]:
         })
         # B1+B2 (2026-09-05): deep (seed) ensemble — the small-n gold
         # standard (Lakshminarayanan 2017) — plus 30% physics-safe
-        # Lorentzian blends INSIDE the training split. The plain 1D-CNN
-        # above stays single-seed/unaugmented as the controlled variant.
+        # synthetic within-class blends INSIDE the training split. The
+        # plain 1D-CNN above stays single-seed/unaugmented as the
+        # controlled variant.
         specs.append({
             "name": "1D-CNN ensemble (5 seeds)",
             "estimator": CNNEnsemble(n_seeds=5, epochs=25, synth=0.3),
@@ -2358,7 +2360,7 @@ def band_stability(profiles: list[np.ndarray], top_k: int = 20
 # --------------------------------------------------------------------------
 def export_model_card(path: str, winner, params=None,
                       dataset_name: str = "", k_folds: int = 5,
-                      repeats: int = 3) -> str:
+                      repeats: int = 1, grouped: bool = True) -> str:
     """
     Publication/report-ready model card: development data, full
     preprocessing, CV protocol, discrimination + calibration, AUC power
@@ -2369,7 +2371,10 @@ def export_model_card(path: str, winner, params=None,
     lines = ["# Model card — Raman Spectra Classifier", ""]
     lines += [f"**Model**: {w.name}",
               f"**Development data**: {dataset_name or '(unnamed cohort)'}",
-              f"**Validation**: {k_folds}-fold patient-grouped CV"
+              "**Validation**: "
+              + (f"{k_folds}-fold patient-grouped CV" if grouped
+                 else f"{k_folds}-fold SPECTRUM-LEVEL CV (no patient "
+                      "information — patient leaks possible)")
               + (f" × {repeats}" if repeats > 1 else "")
               + " (nested hyperparameter tuning inside folds)", ""]
     if params is not None:
@@ -2399,8 +2404,8 @@ def export_model_card(path: str, winner, params=None,
             f"- AUC power: detectable AUC at 80% power = "
             f"{pw['detectable_auc_80pct']:.3f} "
             f"(n+ {n_pos} / n− {n_neg}; "
-            f"~{pw['n_per_group_for_target']} per group needed for "
-            f"AUC 0.85)")
+            f"~{pw['n_per_group_for_target']} per group needed to "
+            f"reach the OBSERVED AUC {auc:.2f} at 80% power)")
     except Exception:
         pass
     lines += ["", "## Limitations",

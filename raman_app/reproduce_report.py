@@ -181,24 +181,42 @@ def run(X: np.ndarray, y, groups, folds: int = 5, repeats: int = 3,
         row["A"] = _binary_metrics(np.asarray(y), proba, cls)
         # B: patient-grouped x repeats
         per = []
+        pat_acc0 = None
         for r in range(repeats):
             proba, cls = pooled_oof(pipe, X, y, groups, folds,
                                     seed + 100 * r, grouped=True)
             per.append(_binary_metrics(np.asarray(y), proba, cls))
+            if r == 0 and groups is not None:
+                # per-PATIENT accuracy of repeat 0 — INDEPENDENT blocks
+                # for the Friedman test.  (The old test used the repeat
+                # numbers as blocks: same patients, same models,
+                # different seeds — strongly correlated, so the
+                # chi-square was invalid; fixed 2026-09-05.)
+                pred = cls[np.argmax(proba, axis=1)]
+                correct = (pred == np.asarray(y)).astype(float)
+                g = np.asarray(groups)
+                pat_acc0 = {str(p): float(correct[g == p].mean())
+                            for p in np.unique(g)}
         row["B"] = {k: (float(np.mean([m[k] for m in per])),
                         float(np.std([m[k] for m in per])))
                     for k in per[0]}
         row["B_repeats"] = per
+        row["B_patient_acc"] = pat_acc0
         res["models"][name] = row
         print(f"[report] {name:11s} A: F1 {row['A']['f1']:.3f}  "
               f"B: F1 {row['B']['f1'][0]:.3f}±{row['B']['f1'][1]:.3f}")
-    if len(models) >= 3 and repeats >= 2:
-        stat, p = friedmanchisquare(*[
-            [m["f1"] for m in res["models"][n]["B_repeats"]]
-            for n in models])
-        res["friedman_p"] = float(p)
-        print(f"[report] Friedman across models (grouped CV): "
-              f"chi2={stat:.2f} p={p:.4f}")
+    if len(models) >= 3:
+        acc_maps = [res["models"][n].get("B_patient_acc")
+                    for n in models]
+        if all(acc_maps):
+            pats = sorted(acc_maps[0])
+            cols = [[m[p] for p in pats] for m in acc_maps]
+            stat, p = friedmanchisquare(*cols)
+            res["friedman_p"] = float(p)
+            res["friedman_blocks"] = (f"{len(pats)} patients, repeat 0, "
+                                      "grouped CV")
+            print(f"[report] Friedman across models (blocks = "
+                  f"{len(pats)} patients): chi2={stat:.2f} p={p:.4f}")
     return res
 
 
@@ -224,7 +242,8 @@ def write_markdown(res: dict, path: str) -> None:
             f"| {b['f1'][0]:.3f}±{b['f1'][1]:.3f} · "
             f"{b['auc'][0]:.3f}±{b['auc'][1]:.3f} |")
     if "friedman_p" in res:
-        lines += ["", f"Friedman across models (grouped CV): "
+        lines += ["", f"Friedman across models (blocks = "
+                      f"{res.get('friedman_blocks', 'patients')}): "
                       f"**p = {res['friedman_p']:.4f}**"]
     lines += [
         "",

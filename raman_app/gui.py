@@ -3008,25 +3008,46 @@ class MainWindow(QtWidgets.QMainWindow):
                     h.update(chunk)
             return h.hexdigest()
 
+        def sha1_quiet(path):
+            # one locked/deleted file must not kill the whole manifest
+            # (2026-09-05: the loops ran unguarded — a mid-walk failure
+            # aborted with NO manifest at all)
+            try:
+                return sha1_file(path)
+            except OSError:
+                return None
+
         manifest: dict = {
-            "created": datetime.now().isoformat(timespec="seconds"),
+            "created": datetime.now().astimezone().isoformat(
+                timespec="seconds"),
             "app": "Raman Spectra Classifier",
             "data_folder": self._source_folder,
             "n_spectra": len(self.spectra),
             "n_patients": len(set(self.groups)) if self.groups else 0,
             "paired_mode": self._paired_mode,
-            "preprocessing": asdict(self.read_params().validate()),
-            "code_hashes": {fn: sha1_file(os.path.join(APP_DIR, fn))
+            "seed": self.spin_seed.value(),
+            "folds": self.spin_folds.value(),
+            # TRAINING-time params (a post-training GUI tweak used to be
+            # recorded as if the winner had used it)
+            "preprocessing": asdict(
+                getattr(self, "_params_at_train", None)
+                or self.read_params().validate()),
+            "code_hashes": {fn: d
                             for fn in sorted(os.listdir(APP_DIR))
-                            if fn.endswith(".py")},
+                            if fn.endswith(".py")
+                            for d in [sha1_quiet(
+                                os.path.join(APP_DIR, fn))]
+                            if d is not None},
         }
         if self._source_folder and os.path.isdir(self._source_folder):
             manifest["data_hashes"] = {
-                rel: sha1_file(os.path.join(root, fn))
+                rel: d
                 for root, _dirs, fns in os.walk(self._source_folder)
                 for fn in sorted(fns)
                 if fn.lower().endswith((".txt", ".csv", ".dat"))
-                for rel in [os.path.relpath(os.path.join(root, fn),
+                for full in [os.path.join(root, fn)]
+                for d in [sha1_quiet(full)] if d is not None
+                for rel in [os.path.relpath(full,
                                             self._source_folder)]}
         if self.winner is not None:
             manifest["winner"] = {
@@ -4130,14 +4151,19 @@ class MainWindow(QtWidgets.QMainWindow):
                              "<b>none were called positive</b>.")
         n_eval_pat = (len(set(w.groups)) if getattr(w, "groups", None)
                       else None)
-        parts.append("These numbers come from patient-grouped "
-                     "cross-validation"
-                     + (f" on {n_eval_pat} patients" if n_eval_pat else "")
-                     + "; expect larger "
-                     "variation on new patients. This is research "
-                     "triage support for trained clinicians — not a "
-                     "medical diagnosis; histopathology remains the "
-                     "reference standard.")
+        parts.append(
+            "These numbers come from "
+            + ("patient-grouped cross-validation"
+               + (f" on {n_eval_pat} patients" if n_eval_pat else "")
+               if n_eval_pat
+               else "SPECTRUM-LEVEL cross-validation (no patient "
+                    "information was available — load the clinical "
+                    "layout for patient-grouped splits)")
+            + "; expect larger "
+            "variation on new patients. This is research "
+            "triage support for trained clinicians — not a "
+            "medical diagnosis; histopathology remains the "
+            "reference standard.")
         # is the winner significantly better than the runner-up?
         try:
             ok = [r for r in (self.results or [])
@@ -4205,7 +4231,9 @@ class MainWindow(QtWidgets.QMainWindow):
                          f"{len(set(l for l in self.labels if l))} classes"
                          + (f", {n_sub} patients" if n_sub else ""))
         try:
-            lines.append(f"Preprocessing: {self.read_params().validate()}")
+            _p_train = (getattr(self, "_params_at_train", None)
+                        or self.read_params().validate())
+            lines.append(f"Preprocessing (as trained): {_p_train}")
         except Exception:
             pass
         if w is not None:
@@ -4280,7 +4308,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "", "Compared with the published literature",
                 "-" * 60,
                 f"{'Test (validation method)':<38} {'sens':>6} {'spec':>6}",
-                f"{'This study (patient-grouped CV)':<38} "
+                f"{('This study (patient-grouped CV)' if self.groups else 'This study (SPECTRUM-level CV!)'):<38} "
                 f"{w.macro.get('sens', (0,))[0]:>6.2f} "
                 f"{w.macro.get('spec', (0,))[0]:>6.2f}",
                 f"{'Han 2022 meta (13 studies)':<38} {'0.89':>6} "
@@ -4327,11 +4355,17 @@ class MainWindow(QtWidgets.QMainWindow):
                       if n_pat else " (flat layout)"),
                    "Outcomes: class labels from the top-level folders "
                    "(histopathology-confirmed tissue sites)",
-                   "Analysis: patient-grouped CV "
-                   "(StratifiedGroupKFold); repeated x3 when enabled; "
-                   "preprocessing re-chosen inside every fold for the "
-                   "nested honest estimate — no patient leaks between "
-                   "train and test (PROBAST+AI analysis domain)",
+                   "Analysis: "
+                   + ("patient-grouped CV (StratifiedGroupKFold); "
+                      "repeated x3 when enabled; "
+                      if self.groups else
+                      "SPECTRUM-LEVEL CV (no patient information in "
+                      "this dataset — patient leaks are possible); ")
+                   + "preprocessing re-chosen inside every fold for the "
+                   "nested honest estimate"
+                   + (" — no patient leaks between "
+                      "train and test (PROBAST+AI analysis domain)"
+                      if self.groups else ""),
                    "Intended use: research triage support for trained "
                    "clinicians; not a diagnosis — histopathology is "
                    "the reference standard",
@@ -4578,8 +4612,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "research triage support for trained clinicians — not a "
             "medical diagnosis; histopathology remains the reference "
             "standard.</div>"
-            "<p class='muted'>Evaluated with patient-grouped "
-            "cross-validation (no patient leaks); published oral-cancer "
+            "<p class='muted'>Evaluated with "
+            + ("patient-grouped "
+               "cross-validation (no patient leaks)" if self.groups
+               else "SPECTRUM-LEVEL cross-validation (patient leaks "
+                    "possible — no patient information in this data)")
+            + "; published oral-cancer "
             "Raman meta-analyses (Han 2022; 2025 meta; Purohit 2026) "
             "pool ~0.89–0.90 sensitivity / 0.84–0.91 specificity but "
             "mostly under spectrum-level splits, which inflate them. "
@@ -6554,11 +6592,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 "or switch back to Standard mode.")
             return
         try:
+            # snapshot the params the winner is ACTUALLY trained with —
+            # freeze_study / reports must not record later GUI tweaks
+            self._params_at_train = self.read_params().validate()
             if paired_mode:
                 import paired as paired_mod
                 pd_ = paired_mod.paired_features(
                     self.X_raw, self.labels, self.groups, self.grid,
-                    self.read_params().validate(),
+                    self._params_at_train,
                     exclude=(self.spike_flags
                              if (self.spike_flags is not None
                                  and self.chk_exclude_flagged.isChecked()
@@ -7285,10 +7326,18 @@ class MainWindow(QtWidgets.QMainWindow):
                                  calibrator=calibrator)
             card = os.path.splitext(path)[0] + "_card.md"
             try:
-                modeling.export_model_card(card, self.winner,
-                                           self.read_params().validate(),
-                                           dataset_name=self.folder_edit
-                                           .text())
+                # report the protocol that ACTUALLY ran (2026-09-05):
+                # the card used to hardcode "5-fold x3 patient-grouped"
+                # regardless of the real fold/repeat/group settings
+                _reps = (3 if self.chk_repeat.isChecked() else 1)
+                _grp = (self._lc_data is not None
+                        and self._lc_data[2] is not None)
+                modeling.export_model_card(
+                    card, self.winner,
+                    self.read_params().validate(),
+                    dataset_name=self.folder_edit.text(),
+                    k_folds=self.spin_folds.value(),
+                    repeats=_reps, grouped=_grp)
                 self.log(f"Model card: {card}")
             except Exception:
                 self.log("Model card export failed:\n"
