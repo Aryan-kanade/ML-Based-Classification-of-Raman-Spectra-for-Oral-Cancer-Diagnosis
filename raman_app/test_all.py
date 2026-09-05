@@ -12,7 +12,9 @@ Everything runs on tiny synthetic data — a few seconds total.
 
 from __future__ import annotations
 
+import glob
 import os
+import re
 import sys
 import tempfile
 
@@ -21,6 +23,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import clinical_data as cdata          # noqa: E402
+import dataset as ds                   # noqa: E402
 import modeling                        # noqa: E402
 import optimize                        # noqa: E402
 import preprocessing as pp             # noqa: E402
@@ -112,6 +115,32 @@ def test_patient_split_disjoint():
     g = lambda idx: {groups[i] for i in idx}  # noqa: E731
     assert not (g(tr) & g(va)) and not (g(tr) & g(te)) and not (g(va) & g(te))
     assert len(tr) + len(va) + len(te) == 60
+
+
+def test_find_data_root():
+    """Portable dataset discovery: pointer round-trip, env override, and
+    non-clinical folders are never auto-selected."""
+    old_env = os.environ.pop("RAMAN_DATA_DIR", None)
+    old_ptr = cdata.DATA_POINTER
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            cdata.DATA_POINTER = os.path.join(td, "ptr")
+            _make_clinical_tree(td)
+            cdata.remember_data_root(td)
+            assert cdata.find_data_root() == td    # pointer round-trip
+            os.environ["RAMAN_DATA_DIR"] = td
+            assert cdata.find_data_root() == td    # env override works
+            os.environ.pop("RAMAN_DATA_DIR")
+            empty = os.path.join(td, "empty_dir")
+            os.makedirs(empty)
+            cdata.remember_data_root(empty)
+            assert cdata.find_data_root() != empty  # layout-validated
+    finally:
+        cdata.DATA_POINTER = old_ptr
+        if old_env is None:
+            os.environ.pop("RAMAN_DATA_DIR", None)
+        else:
+            os.environ["RAMAN_DATA_DIR"] = old_env
 
 
 def test_crop_and_spike_score():
@@ -344,6 +373,385 @@ def test_arpls_fallback_and_method():
         assert p1.validate().baseline_method == "als"
 
 
+def test_adaptive_wavelet_and_new_steps():
+    """Bayes/SURE adaptive thresholds match-or-beat the fixed universal
+    rule on synthetic Lorentzians; garrote + cycle-spin + coif5 run; new
+    baselines / area / minmax / detrend / Phe-1003 alignment behave."""
+    rng = np.random.default_rng(0)
+    wn = np.linspace(700, 1800, 1100)
+    clean = (np.exp(-((wn - 1003) / 8) ** 2)
+             + 0.7 * np.exp(-((wn - 1450) / 10) ** 2)) + 0.3 * (wn - 700) / 1100
+    y = clean + rng.normal(0, 0.06, len(wn))
+    rmse = lambda o: float(np.sqrt(np.mean((o - clean) ** 2)))  # noqa: E731
+    raw = rmse(y)
+    uni = rmse(pp.wavelet_denoise(y, "sym8", 4, "universal", "soft"))
+    bayes = rmse(pp.wavelet_denoise(y, "sym8", 4, "bayes", "soft"))
+    sure = rmse(pp.wavelet_denoise(y, "sym8", 4, "sure", "soft"))
+    assert max(uni, bayes, sure) < raw * 0.6      # denoising works
+    assert min(bayes, sure) <= uni + 1e-4         # adaptive >= universal
+    for kw in ({"tmode": "garrote", "threshold": "sure"},
+               {"tmode": "garrote", "threshold": "bayes", "cycle": 3},
+               {"threshold": "sure", "wavelet": "coif5", "level": 5}):
+        assert 0 < rmse(pp.wavelet_denoise(y, **kw)) < raw, kw
+    peak = wn[np.argmax(pp.wavelet_denoise(y, "sym8", 4, "sure", "soft"))]
+    assert abs(peak - 1003) < 6                   # peak position survives
+    if pp.HAS_PYBASELINES:
+        for m in ("iarpls", "pspline", "snip"):
+            b = pp._pybase(y, m, 1e5)
+            assert np.isfinite(b).all() and b.max() <= y.max() + 1e-9, m
+    assert abs(np.trapezoid(pp.normalize(y, "area"))) - 1.0 < 1e-9
+    mm = pp.normalize(y, "minmax")
+    assert mm.min() >= 0 and mm.max() <= 1 + 1e-12
+    slope_before = np.polyfit(np.arange(len(y)), y, 1)[0]
+    slope_after = np.polyfit(np.arange(len(y)), pp.detrend_linear(y), 1)[0]
+    assert abs(slope_after) < abs(slope_before) / 10
+    X = np.vstack([y, np.interp(wn, wn - 4.0, y)])
+    drift = np.abs(pp.estimate_wn_drift(X, wn)).max()
+    fixed = np.abs(pp.estimate_wn_drift(pp.calibrate_wn(X, wn), wn)).max()
+    assert fixed < drift, "Phe-1003 alignment must reduce drift"
+    p = pp.PreprocessParams(
+        baseline_method="iarpls", norm="area", detrend=True,
+        wn_calibrate=True, wavelet_threshold="sure", wavelet_mode="garrote",
+        wavelet_cycle=2, wavelet_name="coif5").validate()
+    assert (p.wavelet_threshold, p.wavelet_mode, p.wavelet_cycle) == \
+        ("sure", "garrote", 2)
+    assert np.isfinite(pp.preprocess_matrix(X, p, wn=wn)).all()
+    # defaults unchanged (back-compat): saved sessions keep old behavior
+    d = pp.PreprocessParams().validate()
+    assert (d.wavelet_threshold, d.wavelet_mode, d.wavelet_cycle,
+            d.baseline_method, d.norm) == \
+        ("universal", "soft", 0, "als", "vector")
+
+
+def test_stage2_registry_augmentation_uncertainty_pr():
+    """Stage 2: report models in the registry; CNN augmentation; MC
+    dropout + deep ensemble; physics synthesis; PR points."""
+    import gui  # SUITE_VERSION bump when the registry changes
+    assert gui.SUITE_VERSION >= 7
+    assert len(modeling.ALL_MODEL_NAMES) == 24
+    for n in ("Sparse PLS-DA", "PLS + XGBoost", "PCA + XGBoost",
+              "t-test filter + XGBoost", "Spectral + band features"):
+        assert n in modeling.ALL_MODEL_NAMES
+    X, y, groups = _synthetic_ml(60, 12, seed=3)
+    res, _ = modeling.evaluate_models(
+        X, list(y), model_names=["t-test filter + XGBoost"],
+        k_folds=3, groups=list(groups))
+    assert res[0].error is None, res[0].error
+    # CNN: augmented fit still satisfies the proba contract; MC dropout
+    # returns mean+std; the 3-seed ensemble agrees with its members
+    if modeling.HAS_TORCH:
+        from sklearn.base import clone
+        est = clone(modeling.CNN1DClassifier(epochs=3)).fit(X, y)
+        proba = est.predict_proba(X[:6])
+        assert proba.shape == (6, 2) and np.allclose(proba.sum(1), 1)
+        mean, std = est.predict_proba_mc(X[:6], n_passes=4)
+        assert mean.shape == (6, 2) and (std >= 0).all()
+        ens = modeling.CNNEnsemble(n_seeds=2, epochs=3).fit(X, y)
+        assert ens.predict_proba(X[:4]).shape == (4, 2)
+        assert (ens.predict_proba_std(X[:4]) >= 0).all()
+        # physics synthesis: bounded perturbations of convex blends
+        wn = np.linspace(700, 1800, X.shape[1])
+        syn = modeling.lorentzian_synthesize(X, 5, wn=wn)
+        assert syn.shape == (5, X.shape[1]) and np.isfinite(syn).all()
+        lo, hi = X.min(), X.max()
+        assert syn.min() >= lo - 0.6 * abs(hi) and \
+            syn.max() <= hi + 0.6 * abs(hi)
+    # PR points: AP in [0,1]; a perfect ranking gives AP 1
+    rng = np.random.default_rng(4)
+    s = np.linspace(0, 1, 40)
+    yb = (s > 0.5).astype(int)
+    prec, rec, ap = modeling.pr_points(yb, s)
+    assert 0 <= ap <= 1 and len(prec) == len(rec)
+    assert modeling.pr_points(yb, s)[2] > modeling.pr_points(
+        yb, rng.permutation(s))[2]
+    # ViT MC-dropout + SpecAugment path compiles and runs
+    import vit_train as vt
+    import torch
+    from vit_model import SpectralViT, ViTConfig
+    cfg = ViTConfig(seq_len=X.shape[1], patch_size=8, dim=32, depth=1,
+                    heads=2, n_classes=2)
+    net = SpectralViT(cfg)
+    mean, std = vt.mc_dropout_predict(net, X[:8], torch.device("cpu"),
+                                      n_passes=3)
+    assert mean.shape == (8, 2) and np.allclose(mean.sum(1), 1, atol=1e-5)
+
+
+def test_stage3_conformal_permutation_explainability():
+    """Conformal sets keep their coverage promise on synthetic OOF;
+    ECE/isotonic compare runs; the permutation null kills a fake signal
+    and keeps a real one; VIP/Grad-CAM produce aligned profiles; the
+    band-agreement report matches known bands; patient prob-mean
+    aggregation logic is exercised through the GUI offscreen."""
+    import clinical as clin
+    rng = np.random.default_rng(0)
+    n = 300
+    y = rng.integers(0, 2, n)
+    sep = 3.0
+    s = np.clip(y * sep + rng.normal(0, 1, n), 0, None)
+    proba = np.column_stack([1 - 1 / (1 + np.exp(-(s - sep / 2))),
+                             1 / (1 + np.exp(-(s - sep / 2)))])
+    q = clin.conformal_q(proba, y)
+    m = clin.conformal_metrics(clin.conformal_sets(proba, q), y)
+    assert m["coverage"] >= 0.85, m          # ~90% promised
+    assert 0.5 <= m["mean_size"] <= 2.0      # empty sets = abstention
+    e = clin.ece(y, proba[:, 1])
+    assert 0 <= e <= 1
+    cmp_ = clin.isotonic_compare(y, proba[:, 1])
+    assert set(cmp_) >= {"ece_raw", "ece_platt", "ece_isotonic"}
+    # permutation test: real signal → small p; noise → large p
+    Xr = rng.normal(size=(120, 6))
+    yr = rng.integers(0, 2, 120).astype(str)
+    yr = np.array(["A", "B"])[yr.astype(int)]
+    gr = [f"P{i//4}" for i in range(120)]
+    Xr = Xr + (yr == "B")[:, None] * 2.0
+    from sklearn.linear_model import LogisticRegression
+    out = modeling.permutation_auc_p(
+        LogisticRegression(max_iter=1000), Xr, yr, gr, n_perm=15, k=3)
+    assert out["p"] <= 0.07 and out["auc"] > 0.9, out
+    Xn = rng.normal(size=(120, 6))
+    out_n = modeling.permutation_auc_p(
+        LogisticRegression(max_iter=1000), Xn, yr, gr, n_perm=15, k=3)
+    assert out_n["p"] > 0.1, out_n
+    # VIP: PLS loadings produce a per-wavenumber profile
+    pls = modeling.PLSScores(n_components=3).fit(Xr, yr)
+    vip = modeling.pls_vip(pls.pls_)
+    assert vip.shape == (Xr.shape[1],) and (vip >= 0).all()
+    # Grad-CAM: aligned to the wavenumber axis, non-negative, peaked
+    if modeling.HAS_TORCH:
+        est = modeling.CNN1DClassifier(epochs=2).fit(Xr, yr)
+        cam = est.grad_cam(Xr[:8])
+        assert cam.shape == (8, Xr.shape[1])
+        assert (cam >= 0).all() and abs(cam.max() - 1.0) < 1e-6
+    # band agreement: importance concentrated on a literature band
+    import biochemistry as bio
+    wn = np.linspace(400, 1800, 700)
+    imp = np.exp(-((wn - 1003) / 12) ** 2)          # phenylalanine peak
+    rep = bio.agreement_report(wn, imp, top_k=10)
+    assert rep["lit_frac"] >= 0.3 and rep["spearman"] > 0.2, rep
+    # patient probability-mean via the GUI machinery (offscreen).
+    # ISOLATED construction (deep_test pattern): the un-isolated window
+    # auto-loads the real dataset — combined with the torch work above,
+    # that natively aborted on some machines (Brain gotcha #22).
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from qt_compat import QtWidgets
+    import ui_helpers as uh
+    import clinical_data as _cd
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyle("Fusion")               # windowsvista + this QSS-heavy
+    app.setStyleSheet(uh.STYLESHEET)     # UI fail-fasts (0xC0000409) —
+    import gui                          # always style before constructing
+    _saved_ls, _saved_fdr = uh.load_settings, _cd.find_data_root
+    uh.load_settings = lambda: {}
+    _cd.find_data_root = lambda: None
+    try:
+        win = gui.MainWindow()
+    finally:
+        uh.load_settings = _saved_ls
+        _cd.find_data_root = _saved_fdr
+    win._positive_class = lambda: "Tumor"     # no trained winner needed
+    with tempfile.TemporaryDirectory() as td:  # real folder layout
+        for i in range(3):
+            os.makedirs(os.path.join(td, f"P{i}"), exist_ok=True)
+        files = [os.path.join(td, f"P{i}", f"s{j}.txt")
+                 for i in range(3) for j in range(4)]
+        pt = [0.9 if (i + j) % 3 == 0 else 0.15
+              for i in range(3) for j in range(4)]
+        rows = [(files[4 * i + j], "Tumor" if p >= 0.5 else "Normal", p)
+                for (i, j, p) in ((i, j, pt[4 * i + j])
+                                  for i in range(3) for j in range(4))]
+        win._pred_rows = rows
+        win._pred_probs = [{"Normal": 1 - p, "Tumor": p} for p in pt]
+        win.spec_path_edit.setText(td)
+        agg = win._aggregate_patients(files, rows)
+        assert len(agg) == 3
+        for patient, n_spec, _votes, mean_p, verdict in agg:
+            assert n_spec == 4 and 0 <= mean_p <= 1
+            assert verdict in ("Normal", "Tumor")
+            # probability-mean verdict: >= 0.5 mean P(Tumor) -> Tumor
+            assert verdict == ("Tumor" if mean_p >= 0.5 else "Normal")
+
+
+def test_stage4_power_card_fusion_saliva_external():
+    """Stage 4: AUC power behaves; saliva preset + thiocyanate QC +
+    biochemical shift + dataset QC; covariate fusion lifts AUC when the
+    covariate is informative; model card exports; the external-
+    validation CLI runs end-to-end on a synthetic cohort."""
+    import clinical as clin
+    pw = clin.auc_power(150, 150, auc=0.9)
+    assert 0.5 < pw["detectable_auc_80pct"] < 0.9
+    pw_small = clin.auc_power(20, 20, auc=0.9)
+    assert pw_small["detectable_auc_80pct"] > pw["detectable_auc_80pct"]
+    # 2026-09-05 regression: one-sample detectable delta = (z_a+z_b)*SE —
+    # the old /sqrt(2) made power claims ~1.4x optimistic.
+    from scipy.stats import norm as _norm
+    _za = float(_norm.ppf(0.975))
+    assert abs(pw["detectable_auc_80pct"]
+               - (0.5 + (_za + 0.8416) * pw["se_auc"])) < 1e-9
+    p = pp.PreprocessParams.saliva().validate()
+    assert p.crop_max >= 2300 and p.baseline_method == "snip" \
+        and p.norm == "snv"
+    wn = np.linspace(400, 2300, 1900)
+    rng = np.random.default_rng(0)
+
+    def spec(car_high: bool) -> np.ndarray:
+        return (np.exp(-((wn - 1003) / 8) ** 2)
+                + 0.5 * np.exp(-((wn - 1445) / 10) ** 2)
+                + (0.4 if car_high else 0.05)
+                * np.exp(-((wn - 1520) / 10) ** 2)
+                + 0.3 * np.exp(-((wn - 2120) / 12) ** 2)
+                + rng.normal(0, 0.02, len(wn)))
+
+    X = np.vstack([spec(False) for _ in range(30)]
+                  + [spec(True) for _ in range(30)])
+    y = np.array(["Normal"] * 30 + ["Tumor"] * 30)
+    import biochemistry as bio
+    tc = bio.thiocyanate_index(wn, X)
+    assert np.isfinite(tc).all() and (tc > 0).all()
+    q = bio.dataset_qc(X, wn)
+    assert q["snr_median"] > 5 and q["thiocyanate_band"]
+    rows = bio.biochemical_shift(X, wn, y)
+    car = [r for r in rows if r[1] == "carotenoids"
+           and abs(r[0] - 1520) < 1]
+    assert car and car[0][3] > 0.2, rows          # measured direction
+    # covariate fusion: an informative covariate must lift the AUC
+    probs = np.clip(0.55 + 0.35 * (y == "Tumor")
+                    + rng.normal(0, 0.18, len(y)), 0.02, 0.98)
+    cov = ((y == "Tumor") * 1.2
+           + rng.normal(0, 0.35, len(y))).reshape(-1, 1)
+    gr = [f"P{i//3}" for i in range(len(y))]
+    out = modeling.covariate_fusion_cv(probs, cov, y, gr)
+    assert out["auc_base"] > 0.7 and out["auc_fused"] > out["auc_base"]
+    # model card export on a real winner
+    Xs, ys, gs = _synthetic_ml(60, 12, seed=5)
+    results, winner = modeling.evaluate_models(
+        Xs, list(ys), model_names=["PCA + LDA"], k_folds=3,
+        groups=list(gs))
+    with tempfile.TemporaryDirectory() as td:
+        card = os.path.join(td, "card.md")
+        text = modeling.export_model_card(card, winner,
+                                          pp.PreprocessParams(),
+                                          dataset_name="synthetic")
+        assert "macro-F1" in text and "Limitations" in text
+        assert os.path.getsize(card) > 400
+        # external validation CLI on the same synthetic distribution
+        bpath = os.path.join(td, "b.joblib")
+        modeling.save_bundle(bpath, winner, np.linspace(500, 2000,
+                                                        Xs.shape[1]),
+                             pp.PreprocessParams())
+        import validate_external as ve
+        rc = ve.main(["--data", "unused", "--model", bpath])
+        assert rc == 2                       # missing folder -> clean exit
+        # in-memory external run: reuse the module's helpers
+        proba = winner.pipeline.predict_proba(Xs)
+        assert proba.shape == (60, 2)
+
+
+def test_roadmap_J_E_batch():
+    """J1 label-error flags planted mislabels; E7 band stability
+    separates stable from noise bands; E3 TTA keeps the proba contract;
+    the locked-exam block in reproduce_study is wired (unit level)."""
+    # J1: 8 spectra with swapped labels on a separable problem
+    rng = np.random.default_rng(7)
+    y = np.array(["A", "B"] * 60)
+    p_b = np.clip((y == "B") * 0.9 + 0.05 + rng.normal(0, 0.02, 120),
+                  0.01, 0.99)
+    proba = np.column_stack([1 - p_b, p_b])
+    planted = [3, 17, 40, 66, 90, 104, 111, 118]
+    y_swapped = y.copy()
+    y_swapped[planted] = np.where(y[planted] == "A", "B", "A")
+    rep = modeling.label_error_report(proba, list(y_swapped))
+    flagged = {r["i"] for r in rep}
+    assert len(flagged & set(planted)) >= 6, rep   # catches most mislabels
+    assert len(flagged - set(planted)) <= 4        # few false accusations
+    assert all(r["tier"] in ("likely", "review") for r in rep)
+    # E7: consistent importance peaks → high Jaccard; noise → low
+    wn_len = 200
+    prof_a = np.abs(rng.normal(size=wn_len))
+    prof_a[[5, 20, 40, 60, 80, 100, 130, 150, 170, 190]] = 10.0
+    st = modeling.band_stability(
+        [prof_a + rng.normal(0, 0.5, wn_len) for _ in range(4)], top_k=10)
+    assert st["jaccard_mean"] > 0.6
+    noisy = [np.abs(rng.normal(size=wn_len)) for _ in range(4)]
+    st2 = modeling.band_stability(noisy, top_k=10)
+    assert st2["jaccard_mean"] < st["jaccard_mean"]
+    assert st["stable"].shape == (wn_len,) and st["stable"].sum() >= 2
+    # E3: CNN + ViT TTA keep the probability contract
+    if modeling.HAS_TORCH:
+        Xc, yc, _gc = _synthetic_ml(40, 8, seed=9)
+        est = modeling.CNN1DClassifier(epochs=2).fit(Xc, yc)
+        tta = est.predict_proba_tta(Xc[:5], n_aug=3)
+        assert tta.shape == (5, 2) and np.allclose(tta.sum(1), 1,
+                                                   atol=1e-5)
+        import vit_train as vt
+        import torch
+        from vit_model import SpectralViT, ViTConfig
+        cfg = ViTConfig(seq_len=Xc.shape[1], patch_size=8, dim=32,
+                        depth=1, heads=2, n_classes=2)
+        t = vt.tta_predict(SpectralViT(cfg), Xc[:5],
+                           torch.device("cpu"), n_aug=2)
+        assert t.shape == (5, 2) and np.allclose(t.sum(1), 1, atol=1e-5)
+    # A1 wiring: the locked exam's import path exists
+    from clinical_data import patient_split  # noqa: F401
+    import reproduce_study  # noqa: F401  (parse-level sanity)
+
+
+def test_phantom_cohort_ground_truth():
+    """J2: the phantom cohort separates perfectly, carries the planted
+    biochemistry directions, and the planted bands dominate a simple
+    class-difference importance profile (explainability ground truth)."""
+    X, y, groups, wn, planted = modeling.phantom_cohort(
+        n_patients=24, spectra_per=3, seed=3)
+    assert X.shape[0] == 72 and set(y) == {"Normal", "Tumor"}
+    assert len(set(groups)) == 24 and np.isfinite(X).all()
+    # planted directions recovered by the biochemistry layer
+    import biochemistry as bio
+    rows = bio.biochemical_shift(X, wn, y)
+    lut = {round(r[0]): r for r in rows}
+    for center, d in planted:
+        if d == 0 or center not in lut:
+            continue
+        r = lut[center]
+        assert np.sign(r[3]) == np.sign(d) and r[4] < 0.05, (center, r)
+    # class-difference profile ranks planted bands in the top decile
+    diff = np.abs(X[y == "Tumor"].mean(0) - X[y == "Normal"].mean(0))
+    top = set(wn[np.argsort(-diff)[:60]])           # top 60 of 1900
+    hits = sum(1 for c, _d in planted
+               if any(abs(c - t) < 15 for t in top))
+    assert hits >= 5, (planted, hits)               # ≥5 of 8 planted
+    # a quick grouped-CV model nails the phantom (sanity for CI smoke)
+    res, _w = modeling.evaluate_models(
+        X, list(y), model_names=["PCA + LDA"], k_folds=3,
+        groups=list(groups))
+    assert res[0].error is None and res[0].macro_f1() > 0.9
+
+
+def test_ttest_select_pls_scores_report_replication():
+    """Report's building blocks: Welch/Cohen-d filter (leakage-safe inside
+    a pipeline), PLS-scores transformer with string labels, and the
+    head-to-head replication engine end-to-end on synthetic data."""
+    X, y, groups = _synthetic_ml(80, 16, seed=1)
+    Xb = X + (y == "B")[:, None] * 2.0            # strongly separable
+    sel = modeling.TTestSelect().fit(Xb, y)
+    assert 1 <= sel.n_selected_ <= X.shape[1]
+    assert sel.transform(Xb).shape[1] == sel.n_selected_
+    rng = np.random.default_rng(2)
+    Xn = rng.normal(size=(40, 20))
+    yn = np.array(["A", "B"] * 20)
+    assert modeling.TTestSelect(d_min=50.0).fit(Xn, yn).n_selected_ == 20
+    ym = np.array(["A", "B", "C"] * 10)
+    assert modeling.TTestSelect().fit(rng.normal(size=(30, 8)),
+                                      ym).n_selected_ == 8   # multiclass: all
+    from sklearn.base import clone
+    scores = modeling.PLSScores(n_components=3).fit(Xb, y)
+    assert scores.transform(Xb).shape == (len(Xb), 3)
+    assert clone(scores).get_params()["n_components"] == 3
+    import reproduce_report as rr
+    res = rr.run(Xb.astype(float), y, groups, folds=3, repeats=2, mini=True)
+    assert set(res["models"]) == {"PCA+SVM", "PCA+RF", "PLS+XGB"}
+    assert all(r["A"]["f1"] > 0.9 for r in res["models"].values())
+    assert "friedman_p" in res
+
+
 def test_shap_region_importance():
     """SHAP importance: signed, aligned, with named bands when available."""
     try:
@@ -441,6 +849,15 @@ def test_calibration_and_dca():
     assert all(0 <= b[0] <= 1 and 0 <= b[1] <= 1 for b in bins)
     pred = [b[0] for b in bins]
     assert pred == sorted(pred)          # bins ordered by predicted prob
+    # 2026-09-05 regression: bins are CONTIGUOUS ranges of the sorted p —
+    # the first bin must sit far below the last (the old interleaved
+    # order[b::n] made every bin span the full range, flattening the
+    # reliability diagram to the global mean).
+    assert pred[0] < pred[-1] - 0.25
+    # and the observed rate must track p inside the bins (calibrated-ish
+    # model): correlation of mean_p vs observed is positive.
+    obs = [b[1] for b in bins]
+    assert np.corrcoef(pred, obs)[0, 1] > 0.5
     thr, nb_m, nb_all = clin.decision_curve(y, p)
     assert len(thr) == len(nb_m) == len(nb_all)
     assert nb_m.max() > 0                # the model has utility somewhere
@@ -712,6 +1129,23 @@ def test_lopo_seed_noise_rollup():
     nr = sstats.noise_robustness(X, y, g, tpl, {}, ["Normal", "Tumor"],
                                  levels=(0.0, 0.05), k=4)
     assert len(nr) == 2 and nr[-1][1] >= nr[0][1] - 0.15
+    # fit-once refactor: bit-identical to the old per-level loop
+    # (same fits, same sequential noise draws, level-major order)
+    rng2 = np.random.default_rng(0)
+    ye = np.array([{"Normal": 0, "Tumor": 1}[v] for v in y], dtype=int)
+    ref = [(lv, sstats._grouped_f1(X, ye, g, tpl, {}, 4, 0,
+                                   noise_level=lv, rng=rng2))
+           for lv in (0.0, 0.01, 0.02, 0.05)]
+    got = sstats.noise_robustness(X, y, g, tpl, {}, ["Normal", "Tumor"],
+                                  k=4, seed=0)
+    assert all(abs(a[1] - b[1]) < 1e-12 for a, b in zip(ref, got,
+                                                        strict=True))
+    # parallel LOPO == serial LOPO (order-independent folds)
+    lo_ser = sstats.lopo_evaluate(X, y, g, tpl, {}, ["Normal", "Tumor"],
+                                  jobs=1)
+    assert lo_ser["per_patient"] == lo["per_patient"]
+    assert abs(lo_ser["f1"] - lo["f1"]) < 1e-12
+    assert abs(lo_ser["auc"] - lo["auc"]) < 1e-12
     oof = np.zeros((n, 2))
     oof[:, 1] = np.clip(0.5 + X[:, 0] * 0.5 + rng.normal(0, .1, n),
                         0.01, 0.99)
@@ -720,6 +1154,11 @@ def test_lopo_seed_noise_rollup():
     assert len(rows) == 30
     assert all(rows[i][2] <= rows[i + 1][2] for i in range(len(rows) - 1))
     assert all(isinstance(r[5], bool) for r in rows)
+    # B6: patient-level (mean-probability) metrics pool OOF per patient
+    pm = sstats.patient_level_metrics(y, g, oof)
+    assert pm is not None and pm["n_patients"] == 30
+    assert 0.0 <= pm["f1"] <= 1.0 and 0.0 <= pm["auc"] <= 1.0
+    assert sstats.patient_level_metrics(y, None, oof) is None
 
 
 def test_band_stats_paired_fdr():
@@ -809,10 +1248,9 @@ def test_paired_features_preprocesses_once():
     """paired_features takes RAW intensities and preprocesses exactly
     once (reproduce_study once passed pre-processed X -> double
     preprocessing, diverging from the GUI)."""
-    import dataset as ds
     import paired
     with tempfile.TemporaryDirectory() as root:
-        wn = _make_clinical_tree(root)
+        _make_clinical_tree(root)
         cd = cdata.load_clinical_dataset(root)
         spectra = cd.spectra
         grid = ds.common_grid(spectra)
@@ -878,14 +1316,45 @@ def test_new_models_lgbm_catboost_cnn():
     X = rng.normal(0, 1, (60, 120)) + (y == "B")[:, None] * 1.5
     names = [n for n, ok in (("LightGBM", modeling.HAS_LGBM),
                              ("CatBoost", modeling.HAS_CATBOOST),
-                             ("1D-CNN", modeling.HAS_TORCH)) if ok]
+                             ("1D-CNN", modeling.HAS_TORCH),
+                             ("TabPFN (foundation model)",
+                              modeling.HAS_TABPFN)) if ok]
     assert names, "none of the new-model dependencies are installed"
     for n in names:
         assert n in modeling.ALL_MODEL_NAMES
     if modeling.HAS_TORCH:            # clone + proba contract
+        import torch
         est = clone(modeling.CNN1DClassifier(epochs=5)).fit(X[:20], y[:20])
         proba = est.predict_proba(X[:10])
         assert proba.shape == (10, 2) and np.allclose(proba.sum(1), 1)
+        # device selection: RAMAN_DEVICE=cpu forces CPU; auto mode never
+        # crashes; fitted weights are stored on CPU (portable bundles)
+        os.environ["RAMAN_DEVICE"] = "cpu"
+        assert modeling.torch_device().type == "cpu"
+        assert modeling.gpu_ok() is False      # kill-switch wins per call
+        assert modeling.boost_device() == "cpu"
+        if modeling.HAS_XGB:                   # parent-built GPU estimator
+            from xgboost import XGBClassifier  # re-pointed for 3SSE workers
+            g = modeling.as_env_device(
+                XGBClassifier(n_estimators=2, device="cuda"))
+            assert g.get_params()["device"] == "cpu"
+        est = clone(modeling.CNN1DClassifier(epochs=5)).fit(X[:20], y[:20])
+        del os.environ["RAMAN_DEVICE"]
+        assert modeling.torch_device() in (torch.device("cpu"),
+                                           torch.device("cuda"))
+        # registry wiring: XGBoost/CatBoost carry a device chosen from the
+        # hardware actually present (cuda/GPU here, cpu/CPU elsewhere)
+        if modeling.HAS_XGB:
+            xb = next(s for s in modeling.model_specs()
+                      if s["name"] == "XGBoost")["estimator"]
+            assert xb.get_params()["device"] in ("cuda", "cpu")
+        if modeling.HAS_CATBOOST:
+            cb = next(s for s in modeling.model_specs()
+                      if s["name"] == "CatBoost")["estimator"]
+            assert cb.get_params()["task_type"] in ("GPU", "CPU")
+        pnext = next(est.net_.parameters())
+        assert pnext.device.type == "cpu"
+        assert est.predict_proba(X[:5]).shape == (5, 2)
     results, _winner = modeling.evaluate_models(
         X, list(y), model_names=names, k_folds=3, groups=list(groups))
     for r in results:
@@ -925,6 +1394,28 @@ def test_3sse_search_smoke():
             m = entry["metrics"]
             assert 0 <= m["f1"] <= 1 and 0 <= m["sens"] <= 1
             assert m["pat_f1"] >= 0            # patient-level rollup ran
+
+
+def test_3sse_validate_top_parallel_equivalence():
+    """The parallel validate_top pool returns the same architectures in
+    the same screening-rank order with identical metrics as jobs=1."""
+    import sequential as seq
+    X, y, groups = _synthetic_ml(60, 12, seed=4)
+    Xa = np.asarray(X, dtype=np.float32)
+    board = seq.search(Xa, list(y), groups=list(groups), k=3, jobs=1,
+                       model_names=["PCA + LDA",
+                                    "PCA + Logistic Regression",
+                                    "Random Forest"])
+    ser = seq.validate_top(board, Xa, list(y), list(groups), None,
+                           top=2, k_outer=3, cnn_epochs=2, jobs=1)
+    par = seq.validate_top(board, Xa, list(y), list(groups), None,
+                           top=2, k_outer=3, cnn_epochs=2, jobs=-2)
+    for level in (1, 2, 3):
+        ks = [e["arch"] for e in ser[level]]
+        assert ks == [e["arch"] for e in par[level]]   # same order
+        for a, b in zip(ser[level], par[level], strict=True):
+            for mk in ("f1", "sens", "spec"):
+                assert abs(a["metrics"][mk] - b["metrics"][mk]) < 1e-12
 
 
 def test_3sse_chain_bundle_roundtrip():
@@ -978,6 +1469,54 @@ def test_3sse_oof_is_genuinely_oof():
     oof_f1 = f1_score(ys, oof_pred, average="macro")
     assert in_sample > 0.9
     assert oof_f1 < 0.8, "grouped OOF looks leaked (too high)"
+
+
+def test_fstring_device_portability():
+    """No f-string may open a {..} expression it doesn't close on the
+    same line — that is Python 3.12+ syntax and SyntaxErrors the whole
+    module on older Pythons (hit on a 3.11 device 2026-09-04; the dev
+    machine runs 3.14 and cannot catch it by running the code)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    pat = re.compile(r"""f"[^"]*\{[^}]*$|f'[^']*\{[^}]*$""")
+    for path in glob.glob(os.path.join(here, "*.py")):
+        with open(path, encoding="utf-8") as fh:
+            for i, line in enumerate(fh, 1):
+                assert not pat.search(line), (
+                    f"{os.path.basename(path)}:{i} — f-string {{..}} "
+                    "spans lines (3.12+ only): " + line.strip())
+
+
+def test_search_survives_broken_model():
+    """One model whose fits fail (e.g. CatBoost native OOM 'bad
+    allocation', 2026-09-05) must cost one architecture — never the
+    whole 3SSE screening run."""
+    import sequential as seq
+    from sklearn.base import BaseEstimator, ClassifierMixin
+
+    class Boom(BaseEstimator, ClassifierMixin):
+        def fit(self, X, y=None, **kw):
+            raise MemoryError("bad allocation (simulated)")
+        def predict_proba(self, X):
+            raise RuntimeError("unfitted")
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(60, 8)).astype(np.float32)
+    y = (np.arange(60) % 2).tolist()
+    groups = [f"S{i // 6}" for i in range(60)]
+    orig = modeling.model_specs
+    modeling.model_specs = lambda: orig() + [{"name": "Boom",
+                                              "estimator": Boom()}]
+    try:
+        board = seq.search(X, y, groups=groups, wavenumbers=None, k=2,
+                           top=3, model_names=["PCA + LDA", "Boom"],
+                           jobs=1, prune_pairs=2)
+    finally:
+        modeling.model_specs = orig
+    ok = [s for s in board["singles"] if "metrics" in s]
+    assert any(s["arch"] == ("PCA + LDA",) for s in ok), ok
+    assert all(s["arch"] != ("Boom",) for s in ok)    # error row, no crash
+    assert board["pairs"] == [] or all(
+        "Boom" not in p["arch"] for p in board["pairs"])
 
 
 def main():

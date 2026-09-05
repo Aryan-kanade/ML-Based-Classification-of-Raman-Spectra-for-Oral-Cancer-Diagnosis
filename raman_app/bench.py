@@ -88,8 +88,13 @@ def main(argv=None) -> int:
                                   winner.oof_proba[valid, 1]))
     out["accuracy"]["winner_single_f1"] = round(rows[0][1], 4)
     out["accuracy"]["winner_single_auc"] = round(auc, 4) if auc else None
-    # B4b: PATIENT-LEVEL headline — per-patient mean P(positive) verdict
-    # (the clinically meaningful unit; literature: Farnesi 2025 13/13)
+    # B4b: PATIENT-LEVEL headline — per-class-conditioned patient verdicts
+    # (the clinically meaningful unit; literature: Farnesi 2025 13/13).
+    # Paired data: every patient has Normal AND Tumor rows, so "the
+    # patient's truth" is NOT one label — each site class gets its own
+    # verdict from the mean P over that site's spectra.  (The previous
+    # version averaged both sites' probabilities together against the
+    # first row's label — a reorder-dependent number; fixed 2026-09-05.)
     if winner.oof_proba is not None and g is not None:
         from sklearn.metrics import f1_score as _f1
         wclasses = list(winner.classes)
@@ -97,11 +102,18 @@ def main(argv=None) -> int:
         preds, trues = [], []
         for pat in sorted(set(g)):
             idx = [i for i, gg in enumerate(g) if gg == pat]
-            p_pos = float(np.nanmean(oof[idx, 1]))
-            preds.append(wclasses[1] if p_pos >= 0.5 else wclasses[0])
-            trues.append(y[idx[0]])
-        out["accuracy"]["patient_level_f1"] = round(
-            float(_f1(trues, preds, average="macro")), 4)
+            for c in wclasses:
+                cidx = [i for i in idx if y[i] == c]
+                if not cidx:
+                    continue
+                mean_p = np.nanmean(oof[cidx], axis=0)
+                if np.isnan(mean_p).any():
+                    continue
+                preds.append(wclasses[int(np.argmax(mean_p))])
+                trues.append(c)
+        if preds:
+            out["accuracy"]["patient_level_f1"] = round(
+                float(_f1(trues, preds, average="macro")), 4)
 
     # ---- 3SSE screening with the speed engine (beam, 2-fold ladder) ---
     def _screen():

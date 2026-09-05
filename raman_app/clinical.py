@@ -131,9 +131,12 @@ def calibration_bins(y_true, p_pos: np.ndarray, n_bins: int = 8):
     ok = ~np.isnan(p_pos)
     y, p = y_true[ok], p_pos[ok]
     order = np.argsort(p, kind="stable")
+    # CONTIGUOUS equal-count bins: block b of the sorted probabilities.
+    # (Interleaving — order[b::n_bins] — puts every bin across the whole
+    # [0, 1] range, flattening each bin to the global mean and destroying
+    # the reliability diagram; fixed 2026-09-05.)
     out = []
-    for b in range(n_bins):
-        sel = order[b::n_bins]        # interleaved -> equal-count bins
+    for sel in np.array_split(order, n_bins):
         if len(sel) == 0:
             continue
         out.append((float(np.mean(p[sel])), float(np.mean(y[sel])),
@@ -206,6 +209,117 @@ def apply_platt(p, ab: tuple[float, float]) -> np.ndarray | float:
     z = a * np.log(p / (1.0 - p)) + b
     out = 1.0 / (1.0 + np.exp(-z))
     return float(out) if out.ndim == 0 else out
+
+
+# --------------------------------------------------------------------------
+# Conformal prediction sets (split-conformal LAC; hand-rolled, no MAPIE)
+# --------------------------------------------------------------------------
+def conformal_q(oof_proba: np.ndarray, y_codes: np.ndarray,
+                alpha: float = 0.10) -> float:
+    """
+    Split-conformal threshold for Least-Ambiguous set-valued Classifier
+    scores s_i = 1 - p_i(y_i):  q̂ = the ceil((n+1)(1-alpha))/n empirical
+    quantile.  Fitted on pooled OUT-OF-FOLD probabilities of the winner
+    (the only honest calibration source), it guarantees ~1-alpha marginal
+    coverage of the true class in the prediction sets.
+    """
+    p = np.asarray(oof_proba, dtype=float)
+    s = 1.0 - p[np.arange(len(y_codes)), np.asarray(y_codes)]
+    n = len(s)
+    if n < 10:
+        return 1.0                      # too small to promise anything
+    rank = min(n, int(np.ceil((n + 1) * (1.0 - alpha))))
+    return float(np.sort(s)[rank - 1])
+
+
+def conformal_sets(proba: np.ndarray, q: float) -> list[list[int]]:
+    """Per-sample prediction sets: classes with p >= 1 - q̂."""
+    p = np.asarray(proba, dtype=float)
+    return [list(np.where(row >= 1.0 - q)[0]) for row in p]
+
+
+def conformal_metrics(sets: list[list[int]], y_codes: np.ndarray) -> dict:
+    """Coverage (true class inside the set), mean set size, abstain rate."""
+    sets = [list(s) for s in sets]
+    cover = sum(1 for s, y in zip(sets, y_codes, strict=True) if y in s)
+    return {
+        "coverage": cover / max(len(sets), 1),
+        "mean_size": float(np.mean([len(s) for s in sets])) if sets else 0.0,
+        "abstain_rate": float(np.mean([len(s) == 0 for s in sets]))
+        if sets else 0.0,
+    }
+
+
+# --------------------------------------------------------------------------
+# Calibration quality (ECE) + isotonic comparison
+# --------------------------------------------------------------------------
+def ece(y_true, p_pos: np.ndarray, n_bins: int = 10) -> float:
+    """Expected calibration error: |predicted - observed| mass-weighted
+    over equal-count bins (0 = perfectly calibrated)."""
+    bins = calibration_bins(y_true, p_pos, n_bins)
+    n = sum(b[2] for b in bins)
+    if n == 0:
+        return float("nan")
+    return float(sum(b[2] * abs(b[0] - b[1]) for b in bins) / n)
+
+
+def isotonic_compare(y_true, p_pos: np.ndarray) -> dict:
+    """
+    Fit isotonic mapping alongside Platt and report both ECEs — the
+    honest comparison at n<500 (isotonic usually overfits small samples;
+    Platt stays applied, isotonic is reported for transparency).
+    """
+    from sklearn.isotonic import IsotonicRegression
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(p_pos, dtype=float)
+    ok = ~np.isnan(p)
+    y, p = y[ok], p[ok]
+    if len(y) < 10 or len(np.unique(y)) < 2:
+        return {}
+    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    p_iso = iso.fit_transform(p, y)
+    ab = fit_platt(y, p)
+    p_platt = apply_platt(p, ab) if ab else p
+    return {"ece_raw": ece(y, p),
+            "ece_platt": ece(y, p_platt),
+            "ece_isotonic": ece(y, p_iso)}
+
+
+# --------------------------------------------------------------------------
+# AUC power / sample size (Hanley & McNeil 1982 variance)
+# --------------------------------------------------------------------------
+def auc_power(n_pos: int, n_neg: int, auc: float = 0.85,
+              alpha: float = 0.05) -> dict:
+    """
+    Detectable AUC at 80% power for this case/control split (and the
+    sample needed for a target AUC) using the Hanley-McNeil variance —
+    answers 'is this study big enough to see the effect it claims?'.
+    """
+    import math
+    from scipy.stats import norm
+    q1 = auc / (2.0 - auc)
+    q2 = 2.0 * auc ** 2 / (1.0 + auc)
+    v = (auc * (1 - auc)
+         + (n_pos - 1) * (q1 - auc ** 2)
+         + (n_neg - 1) * (q2 - auc ** 2)) / (n_pos * n_neg)
+    se = math.sqrt(max(v, 1e-12))
+    z_a = norm.ppf(1.0 - alpha / 2.0)
+    z_b = 0.8416                              # 80% power
+    # Detectable AUC vs the 0.5 null: delta = (z_a + z_b) * SE(AUC).
+    # (A previous version divided by sqrt(2) — that factor belongs to a
+    # DIFFERENCE of two independent AUCs, not a one-sample test vs 0.5;
+    # dividing shrank the detectable effect ~29% and halved n_needed,
+    # making every power claim optimistic. Fixed 2026-09-05.)
+    detectable = 0.5 + (z_a + z_b) * se
+    n_needed = None
+    for n in range(10, 100000, 5):            # equal groups search
+        se_n = se * math.sqrt(n_pos * n_neg / (n * n))
+        if 0.5 + (z_a + z_b) * se_n <= auc:
+            n_needed = n
+            break
+    return {"detectable_auc_80pct": float(min(detectable, 1.0)),
+            "se_auc": float(se),
+            "n_per_group_for_target": n_needed}
 
 
 # --------------------------------------------------------------------------

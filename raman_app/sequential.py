@@ -27,9 +27,15 @@ Efficiency (why 4,369 architectures are feasible):
   * pair-major loop: each [X + P1 + P2] feature matrix is built once and
     all eligible third models are evaluated while it is hot;
   * pairs processed best-first with sound early-abandon: after fold i a
-    triple's best reachable macro-F1 is (sum_i + (k-i))/k; below the
-    current top-N cutoff it cannot enter the validated set, so the
-    remaining folds are skipped (top-N ranking stays exact);
+    triple's best reachable MEAN per-fold macro-F1 is (sum_i + (k-i))/k;
+    below the current top-N cutoff (also expressed as mean per-fold F1,
+    `metrics["f1_mean"]`) it cannot enter the validated set, so the
+    remaining folds are skipped (the abandon bound exactly upper-bounds
+    the mean-fold metric the ranking uses; pooled-OOF F1 is reported for
+    display but is NOT prunable).  Exactness caveat: with the default
+    beam (--prune-pairs 50) triples whose base pair ranks below the
+    top-50 pairs are never evaluated, so the triple top-N is exact only
+    within the beam, not globally;
   * parallel across pairs (joblib), single-threaded inside estimators;
   * append-only JSONL checkpoint; --resume skips finished triples.
 
@@ -38,8 +44,11 @@ identical treatment across all 4,369 architectures keeps the level
 comparison fair (per-layer nested grids x 4,369 would be prohibitive).
 
 Usage:
-    python sequential.py --data D:/BARC/Data --mode paired --out study_run_3sse
-    python sequential.py --demo --models "PCA + LDA,Random Forest" --k 3
+    python sequential.py --mode paired --out study_run_3sse
+        (--data defaults to the auto-detected dataset root — see
+         clinical_data.find_data_root; override with --data or the
+         RAMAN_DATA_DIR environment variable)
+    python sequential.py --models "PCA + LDA,Random Forest" --k 3
 """
 
 from __future__ import annotations
@@ -50,6 +59,7 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -57,11 +67,14 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import clinical as clin                      # noqa: E402
+import clinical_data as cdata                # noqa: E402
 import modeling                              # noqa: E402
 from modeling import fit_maybe_grouped       # noqa: E402
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DATA = r"D:\BARC\Data"
+# auto-detected per device — no hardcoded machine path to edit when the
+# project moves to another computer (see clinical_data.find_data_root)
+DEFAULT_DATA = cdata.find_data_root() or os.path.join(APP_DIR, "..", "Data")
 # models skipped by the GUI's "fast screening" toggle (slowest first)
 SLOW_MODELS = ("1D-CNN", "CatBoost", "XGBoost")
 
@@ -103,7 +116,10 @@ def _factories(wavenumbers=None, cnn_epochs: int = 15
     out: dict[str, object] = {}
 
     def wrap(est):
-        return lambda: modeling.clone(est)  # noqa: E731
+        # clone + RAMAN_DEVICE guard: the parent builds estimators with GPU
+        # params baked in; 3SSE loky workers force them back to CPU (one
+        # CUDA context per child process would blow VRAM)
+        return lambda: modeling.as_env_device(modeling.clone(est))
 
     for spec in modeling.model_specs():
         name = spec["name"]
@@ -132,7 +148,7 @@ def _ensemble_factory(top3: list[str], factories: dict, wn=None):
     voters = []
     for i, n in enumerate(top3):
         est = factories[n]()
-        if n == "Peak bands + RF" and wn is not None:
+        if n in WN_ALIGNED_MODELS and wn is not None:
             est = _sliced(est, len(wn))
         voters.append((f"m{i}", est))
     ens = VotingClassifier(estimators=voters, voting="soft", n_jobs=1)
@@ -158,16 +174,22 @@ def _sliced(est, n: int):
     return Pipeline([("spec", _SpectralSlice(n)), ("clf", est)])
 
 
+# wn-aligned models (their band/peak features index the spectral axis,
+# so at chained positions — where probability columns are appended — they
+# must be wrapped to use the spectral columns only)
+WN_ALIGNED_MODELS = ("Peak bands + RF", "Spectral + band features")
+
+
 def _layer_est(name: str, factories: dict, position: int, wn):
     """
-    Estimator for a chain position.  "Peak bands + RF" consumes the
+    Estimator for a chain position.  WN-aligned models consume the
     wavenumber-aligned axis, so at chained positions (>= 1, where the
-    input carries appended probability columns) it is wrapped to use
+    input carries appended probability columns) they are wrapped to use
     the spectral columns only (spec §9: model-specific features stay
     intact; probability chaining remains available to the others).
     """
     est = factories[name]()
-    if position >= 1 and wn is not None and name == "Peak bands + RF":
+    if position >= 1 and wn is not None and name in WN_ALIGNED_MODELS:
         return _sliced(est, len(wn))
     return est
 
@@ -199,8 +221,7 @@ def _metrics_from_oof(y, proba, classes, groups) -> dict:
     """Spectrum + patient-level metrics from pooled OOF probabilities.
     `y` must already be class-encoded (see search/validate_arch) — the
     registry's boosting models reject string labels."""
-    from sklearn.metrics import (confusion_matrix, f1_score,
-                                 roc_auc_score)
+    from sklearn.metrics import (confusion_matrix, roc_auc_score)
     ye = np.asarray(y, dtype=int)
     pred = np.argmax(proba, axis=1)
     cm = confusion_matrix(ye, pred, labels=range(len(classes)))
@@ -217,9 +238,16 @@ def _metrics_from_oof(y, proba, classes, groups) -> dict:
         out["auc"] = float("nan")
     if groups is not None:                       # patient-level rollup
         g = np.asarray(groups)
-        p_true = [int(ye[g == pat][0]) for pat in np.unique(g)]
-        p_pred = [int(np.argmax(proba[g == pat].mean(axis=0)))
-                  for pat in np.unique(g)]
+        # patient truth = DOMINANT class of their spectra (not the first
+        # row — paired patients legitimately carry both classes and row
+        # order is arbitrary; fixed 2026-09-05)
+        uniq_p = np.unique(g)
+        p_true, p_pred = [], []
+        for pat in uniq_p:
+            lab = ye[g == pat]
+            vals, cnts = np.unique(lab, return_counts=True)
+            p_true.append(int(vals[np.argmax(cnts)]))
+            p_pred.append(int(np.argmax(proba[g == pat].mean(axis=0))))
         pcm = confusion_matrix(p_true, p_pred,
                                labels=range(len(classes)))
         pper = modeling.class_metrics_from_cm(pcm)
@@ -228,6 +256,13 @@ def _metrics_from_oof(y, proba, classes, groups) -> dict:
         out["pat_sens"] = float(np.mean([pper[c]["sens"] for c in pper]))
         out["pat_spec"] = float(np.mean([pper[c]["spec"] for c in pper]))
     return out
+
+
+def _screen_f1(metrics: dict) -> float:
+    """Ranking key for PRUNED screening levels (triples): the mean
+    per-fold F1 the abandon bound actually upper-bounds.  Falls back to
+    pooled F1 for records that predate the field (old checkpoints)."""
+    return float(metrics.get("f1_mean", metrics.get("f1", 0.0)))
 
 
 def _eval_last_layer(factory, feats, y, classes, groups, k, seed, cutoff):
@@ -259,28 +294,57 @@ def _eval_last_layer(factory, feats, y, classes, groups, k, seed, cutoff):
     valid = ~np.isnan(oof).any(axis=1)
     sub_g = g_arr[valid] if g_arr is not None else None
     metrics = _metrics_from_oof(y_arr[valid], oof[valid], classes, sub_g)
+    # Screen/prune metric: MEAN of the completed per-fold macro-F1s.
+    # The early-abandon bound below upper-bounds exactly this quantity;
+    # pooled-OOF F1 (metrics["f1"], F1 of the summed confusion matrix) is
+    # NOT bounded by any fold-mean, so ranking pruned candidates on it
+    # made "top-N stays exact" false (fixed 2026-09-05).
+    metrics["f1_mean"] = float(np.mean(fold_f1))
     return metrics, None
 
 
 def _pin_threads():
-    """One thread per worker process (avoid oversubscription)."""
+    """One thread per worker process (avoid oversubscription + memory
+    pressure); CPU-only torch — one CUDA context per loky child would
+    blow VRAM."""
     if modeling.HAS_TORCH:
         modeling.torch.set_num_threads(1)
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(var, "1")
+    os.environ.setdefault("RAMAN_DEVICE", "cpu")
 
 
 # --------------------------------------------------------------------------
 # parallel workers (self-contained args: no module globals needed)
 # --------------------------------------------------------------------------
+def _worker_single(task):
+    """Evaluate one single model: OOF probabilities + metrics.
+    Errors are RETURNED (name, None, None, msg) — one broken model must
+    never kill the whole screening run (CatBoost 'bad allocation',
+    2026-09-05)."""
+    _pin_threads()
+    name, X, y, groups, classes, k, seed, factories = task
+    try:
+        P1 = _oof_proba(factories[name](), X, y, groups, k, seed)
+        m = _metrics_from_oof(y, P1, classes, groups)
+        return name, P1.astype(np.float32), m, None
+    except Exception as exc:
+        return name, None, None, f"{type(exc).__name__}: {exc}"
+
+
 def _worker_pair(task):
     """Evaluate one ordered pair: B on [X + OOF P1_A]."""
     _pin_threads()
     (A, B), X, y, groups, classes, k, seed, p1, factories, wn = task
-    feats = np.hstack([X, p1])
-    est = _layer_est(B, factories, 1, wn)
-    P2 = _oof_proba(est, feats, y, groups, k, seed)
-    metrics = _metrics_from_oof(y, P2, classes, groups)
-    return (A, B), metrics, P2.astype(np.float32)
+    try:
+        feats = np.hstack([X, p1])
+        est = _layer_est(B, factories, 1, wn)
+        P2 = _oof_proba(est, feats, y, groups, k, seed)
+        metrics = _metrics_from_oof(y, P2, classes, groups)
+        return (A, B), metrics, P2.astype(np.float32), None
+    except Exception as exc:
+        return (A, B), None, None, f"{type(exc).__name__}: {exc}"
 
 
 def _worker_triples(task):
@@ -293,34 +357,141 @@ def _worker_triples(task):
     for C in cand:
         # fresh estimator per fold (XGBoost & co. must not be refit on
         # the same instance with re-encoded labels)
-        factory = (lambda nm=C: _layer_est(nm, factories, 2, wn))
-        metrics, pruned = _eval_last_layer(
-            factory, feats, y, classes, groups, k, seed, cutoff)
-        results.append(((A, B, C), metrics, pruned))
+        try:
+            factory = (lambda nm=C: _layer_est(nm, factories, 2, wn))
+            metrics, pruned = _eval_last_layer(
+                factory, feats, y, classes, groups, k, seed, cutoff)
+            results.append(((A, B, C), metrics, pruned, None))
+        except Exception as exc:
+            results.append(((A, B, C), None, None,
+                            f"{type(exc).__name__}: {exc}"))
     return results
 
 
 # --------------------------------------------------------------------------
 # the search
 # --------------------------------------------------------------------------
+def _available_gb() -> float:
+    """Available physical RAM in GB (Windows via ctypes GlobalMemoryStatusEx;
+    other platforms / any failure -> conservative 8.0)."""
+    try:
+        import ctypes
+
+        class _MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        ms = _MS(dwLength=ctypes.sizeof(_MS))
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+            return float(ms.ullAvailPhys) / (1024 ** 3)
+    except Exception:
+        pass
+    return 8.0
+
+
+def _safe_jobs(requested: int) -> int:
+    """
+    Resolve a joblib-style job count (negative = CPUs+N) and size it to
+    the AVAILABLE RAM: every loky child imports the full modeling stack
+    (torch + CatBoost/XGBoost/LightGBM, ~1.5-2 GB each) — a fixed CPU
+    count OOM'd a 16 GB laptop with ~7.7 GB free (CatBoostError 'bad
+    allocation' / TerminatedWorkerError at the pairs loop, 2026-09-05).
+    Budget 2 GB per worker, hard ceiling 4, floor 1.
+    """
+    cpus = os.cpu_count() or 2
+    n = (cpus + 1 + requested) if requested < 0 else requested
+    by_ram = int(_available_gb() / 2.0)
+    return max(1, min(int(n), 4, max(1, by_ram)))
+
+
+@contextmanager
+def _child_cpu_only():
+    """Hide the GPU from loky children for the duration: torch (cu
+    build) and CatBoost each probe/init CUDA at import inside every
+    child, and on a busy 6 GB card those probes OOM'd whole runs
+    (CUDA error 2 aborts, 2026-09-05 evening). The parent's own CUDA
+    context is already initialized and unaffected by the env change;
+    restore the previous value afterwards."""
+    _cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    try:
+        yield
+    finally:
+        if _cvd is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = _cvd
+
+
 def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
            top: int = 20, jobs: int = -2, model_names: list | None = None,
-           prune_pairs: int = 0, cnn_epochs: int = 15,
+           prune_pairs: int = 50, cnn_epochs: int = 15,
            resume_path: str | None = None, progress_cb=None,
            cancel_check=None, leaderboard_cb=None) -> dict:
+    """(see _search_impl) — thin wrapper: loky children spawn with the
+    GPU HIDDEN (_child_cpu_only), so torch/CatBoost never probe CUDA
+    inside a worker even when the parent's VRAM is busy."""
+    with _child_cpu_only():
+        return _search_impl(X, y, groups=groups, wavenumbers=wavenumbers,
+                            k=k, seed=seed, top=top, jobs=jobs,
+                            model_names=model_names,
+                            prune_pairs=prune_pairs,
+                            cnn_epochs=cnn_epochs, resume_path=resume_path,
+                            progress_cb=progress_cb,
+                            cancel_check=cancel_check,
+                            leaderboard_cb=leaderboard_cb)
+
+
+def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
+                 seed: int = 42, top: int = 20, jobs: int = -2,
+                 model_names: list | None = None, prune_pairs: int = 50,
+                 cnn_epochs: int = 15, resume_path: str | None = None,
+                 progress_cb=None, cancel_check=None,
+                 leaderboard_cb=None) -> dict:
     """
     QUICK search over all architectures (single-level OOF stacking,
     grouped CV).  Returns {"singles", "pairs", "triples", "total",
     "pruned"} where each entry is {"arch", "level", "metrics"} (or
     {"arch", "level", "pruned_bound"} for early-abandoned triples).
 
+    Speed engine (2026-09-05 program):
+      * SUCCESSIVE-HALVING FIDELITY — big spaces screen at 2-fold
+        (k_s = min(k, 2)); the nested validate_top() re-ranks the top-N
+        at full fidelity, so screening noise never reaches the winner.
+      * BEAM (prune_pairs, default 50) — triples only for the top-K
+        pairs (~8x fewer third-model evaluations).
+      * WARM early-abandon cutoff seeded from the pairs ranking, so
+        pruning bites from the first triple (not after 20 scores).
+      * CHECKPOINTED at every level (singles/pairs carry their OOF
+        arrays; resume replays them instead of refitting).
+      * joblib memmapping (max_nbytes) shares X across workers once.
+
+    jobs is clamped by _safe_jobs (≤4 workers — more OOMs the machine).
+
     cancel_check: zero-arg callable; when it returns True the search
     stops promptly with SearchCancelled (the JSONL checkpoint keeps
-    finished triples for --resume).
+    everything finished so far for --resume).
     leaderboard_cb: optional callback receiving the current top-5
     [(arch_str, f1), ...] at batch boundaries.
     """
     from joblib import Parallel, delayed
+
+    # parent-process pin: factories wrap estimators with as_env_device(),
+    # which caps CatBoost thread_count/GPU and XGB/LGBM/RF n_jobs — but
+    # only under RAMAN_DEVICE=cpu.  Without this the GUI/CLI process
+    # itself fit CatBoost with ALL cores -> native OOM "bad allocation"
+    # that killed whole runs (2026-09-05).  Power users: set the env var
+    # to "gpu" BEFORE starting to keep GPU CatBoost.
+    os.environ.setdefault("RAMAN_DEVICE", "cpu")
+
+    jobs = _safe_jobs(jobs)
 
     X = np.asarray(X, dtype=np.float32)
     y = list(y)
@@ -343,7 +514,7 @@ def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
 
     def top5_of(pool):
         scored = sorted((e for e in pool if "metrics" in e),
-                        key=lambda e: -e["metrics"]["f1"])[:5]
+                        key=lambda e: -_screen_f1(e["metrics"]))[:5]
         return [((" → ".join(e["arch"])), e["metrics"]["f1"])
                 for e in scored]
 
@@ -361,32 +532,80 @@ def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
                 except json.JSONDecodeError:
                     continue
                 resume[" → ".join(rec["arch"])] = rec
+    if resume_path:        # parent may not exist yet (GUI resume path)
+        os.makedirs(os.path.dirname(resume_path) or ".", exist_ok=True)
     ckpt = open(resume_path, "a", encoding="utf-8") \
         if resume_path else None
 
-    def record(arch, metrics, pruned):
+    def record(arch, metrics, pruned, level: int = 3, oof=None):
         if not ckpt:
             return
-        rec = {"arch": list(arch), "level": 3,
+        rec = {"arch": list(arch), "level": level,
                "pruned": pruned is not None,
                **({"bound": round(float(pruned), 4)}
                   if pruned is not None
                   else {m: (round(float(v), 4)
                             if isinstance(v, float) and v == v else v)
                         for m, v in metrics.items() if m != "cm"})}
+        if oof is not None and pruned is None:
+            rec["oof"] = np.asarray(oof, dtype=np.float32).tolist()
         ckpt.write(json.dumps(rec) + "\n")
         ckpt.flush()
 
+    def record_error(arch, level: int, msg: str):
+        """A failed architecture is still 'done' (resume must not retry
+        it) — recorded with an `error` field, skipped by every
+        ranking/cutoff/winner filter."""
+        if ckpt:
+            ckpt.write(json.dumps({"arch": list(arch), "level": level,
+                                   "error": msg[:300]}) + "\n")
+            ckpt.flush()
+        print(f"3SSE: {_fmt_arch(tuple(arch))} failed — {msg}")
+
+    # successive-halving: big spaces screen at 2-fold — validate_top()
+    # re-ranks the survivors at full fidelity, so cheap screening noise
+    # never reaches the winner
+    k_s = min(k, 2) if total > 600 else k
+
+    def _metrics_from_rec(rec):
+        return {m: v for m, v in rec.items()
+                if m not in ("arch", "level", "pruned", "oof")}
+
     # ---- level 1: singles (OOF kept as layer-1 features) ---------------
     singles, oof1 = [], {}
-    for name in names:
+    done_names: set[str] = set()
+    for rec in resume.values():            # replay checkpointed singles
+        if rec.get("level") == 1 and len(rec["arch"]) == 1 \
+                and rec["arch"][0] in names:
+            name = rec["arch"][0]
+            done_names.add(name)
+            done[0] += 1
+            if rec.get("error"):
+                continue               # failed before: don't retry
+            singles.append({"arch": (name,), "level": 1,
+                            "metrics": _metrics_from_rec(rec)})
+            if "oof" in rec:
+                oof1[name] = np.asarray(rec["oof"], dtype=np.float32)
+    pending = [n for n in names if n not in done_names]
+    batch1 = max(1, jobs) * 2
+    for i in range(0, len(pending), batch1):
         check_cancel()
-        P1 = _oof_proba(factories[name](), X, y, groups, k, seed)
-        oof1[name] = P1.astype(np.float32)
-        m = _metrics_from_oof(y, P1, classes, groups)
-        singles.append({"arch": (name,), "level": 1, "metrics": m})
-        done[0] += 1
-        tick(name, m["f1"])
+        chunk = pending[i:i + batch1]
+        for name, P1, m, err in Parallel(n_jobs=jobs, max_nbytes=100)(
+                delayed(_worker_single)(
+                    (name, X, y, groups, classes, k_s, seed, factories))
+                for name in chunk):
+            if m is None:
+                record_error((name,), 1, err)
+                done[0] += 1
+                continue
+            oof1[name] = P1
+            singles.append({"arch": (name,), "level": 1, "metrics": m})
+            record((name,), m, None, level=1, oof=P1)
+            done[0] += 1
+            tick(name, m["f1"])
+    if leaderboard_cb:
+        leaderboard_cb(top5_of(singles))
 
     # model 17 resolved from the singles ranking (spec §10) whenever it
     # was requested (full run or an explicit checkbox subset)
@@ -396,32 +615,62 @@ def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
         factories["Ensemble (top-3)"] = _ensemble_factory(top3,
                                                           factories,
                                                           wn=wavenumbers)
-        names = names + ["Ensemble (top-3)"]
-        total = _check_space(names)          # now includes model 17
-        # the full 17-model registry (peak-bands needs the wn axis)
-        if model_names is None and wavenumbers is not None:
-            assert total == 4369, total      # spec §4
-        P1 = _oof_proba(factories["Ensemble (top-3)"](), X, y, groups,
-                        k, seed)
-        oof1["Ensemble (top-3)"] = P1.astype(np.float32)
-        m = _metrics_from_oof(y, P1, classes, groups)
-        singles.append({"arch": ("Ensemble (top-3)",), "level": 1,
-                        "metrics": m})
-        done[0] += 1
-        tick("Ensemble (top-3)", m["f1"])
+        try:                    # parent-process fit — guarded like workers
+            P1 = _oof_proba(factories["Ensemble (top-3)"](), X, y, groups,
+                            k_s, seed)
+        except Exception as exc:
+            record_error(("Ensemble (top-3)",), 1,
+                         f"{type(exc).__name__}: {exc}")
+        else:
+            names = names + ["Ensemble (top-3)"]
+            total = _check_space(names)          # now includes model 17
+            oof1["Ensemble (top-3)"] = P1.astype(np.float32)
+            m = _metrics_from_oof(y, P1, classes, groups)
+            singles.append({"arch": ("Ensemble (top-3)",), "level": 1,
+                            "metrics": m})
+            record(("Ensemble (top-3)",), m, None, level=1, oof=P1)
+            done[0] += 1
+            tick("Ensemble (top-3)", m["f1"])
 
-    # ---- level 2: ordered pairs ----------------------------------------
-    tasks = [((A, B), X, y, groups, classes, k, seed, oof1[A],
-              factories, wavenumbers)
-             for A, B in itertools.permutations(names, 2)]
+    # ---- level 2: ordered pairs (checkpointed, memmapped) --------------
     pairs, p2 = [], {}
+    done_pairs: set[str] = set()
+    for rec in resume.values():            # replay checkpointed pairs
+        if rec.get("level") == 2 and len(rec["arch"]) == 2 \
+                and set(rec["arch"]) <= set(names):
+            key = tuple(rec["arch"])
+            done_pairs.add(" → ".join(rec["arch"]))
+            done[0] += 1
+            if rec.get("error"):
+                continue               # failed before: don't retry
+            pairs.append({"arch": key, "level": 2,
+                          "metrics": _metrics_from_rec(rec)})
+            if "oof" in rec:
+                p2[key] = np.asarray(rec["oof"], dtype=np.float32)
+    pair_permutations = [ab for ab in itertools.permutations(names, 2)
+                         if " → ".join(ab) not in done_pairs]
+    for A, B in pair_permutations:
+        if A not in oof1:      # its level-1 OOF failed — pair impossible
+            record_error((A, B), 2, f"level-1 features unavailable "
+                                    f"({A} failed)")
+            done_pairs.add(" → ".join((A, B)))
+            done[0] += 1
+    tasks = [((A, B), X, y, groups, classes, k_s, seed, oof1[A],
+              factories, wavenumbers)
+             for A, B in pair_permutations
+             if " → ".join((A, B)) not in done_pairs]
     batch = max(1, abs(jobs)) * 2
     for i in range(0, len(tasks), batch):
         check_cancel()
-        for key, metrics, P2 in Parallel(n_jobs=jobs)(
+        for key, metrics, P2, err in Parallel(n_jobs=jobs, max_nbytes=100)(
                 delayed(_worker_pair)(t) for t in tasks[i:i + batch]):
+            if metrics is None:
+                record_error(key, 2, err)
+                done[0] += 1
+                continue
             p2[key] = P2
             pairs.append({"arch": key, "level": 2, "metrics": metrics})
+            record(key, metrics, None, level=2, oof=P2)
             done[0] += 1
             tick(" → ".join(key), metrics["f1"])
         if leaderboard_cb:
@@ -432,6 +681,9 @@ def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
     name_set = set(names)
     for rec in resume.values():          # replay checkpointed triples
         if rec.get("level") == 3 and set(rec["arch"]) <= name_set:
+            done[0] += 1
+            if rec.get("error"):
+                continue               # failed before: don't retry
             if rec.get("pruned"):
                 triples.append({"arch": tuple(rec["arch"]), "level": 3,
                                 "pruned_bound": rec.get("bound", 0.0)})
@@ -440,18 +692,34 @@ def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
                                 "metrics": {m: v for m, v in rec.items()
                                             if m not in ("arch", "level",
                                                          "pruned")}})
-            done[0] += 1
 
     def cutoff_now() -> float:
-        scored = [t["metrics"]["f1"] for t in triples if "metrics" in t]
+        scored = [_screen_f1(t["metrics"]) for t in triples
+                  if "metrics" in t]
         if len(scored) < top:
             return -1.0
         return min(sorted(scored, reverse=True)[:top])
 
+    # single-model F1 ranking: third candidates are tried best-first so
+    # the early-abandon cutoff tightens as fast as possible
+    single_f1 = {s["arch"][0]: s["metrics"]["f1"] for s in singles}
     pairs_sorted = sorted(pairs, key=lambda p: -p["metrics"]["f1"])
-    if prune_pairs:
+    beam_applied = 0
+    if prune_pairs and prune_pairs < len(pairs_sorted):
+        beam_applied = len(pairs_sorted) - int(prune_pairs)
         pairs_sorted = pairs_sorted[:int(prune_pairs)]
-    cutoff = cutoff_now()
+    # WARM cutoff: seed from the pairs ranking (a triple rarely beats its
+    # own base pair by much) with 0.10 slack — pruning bites from the
+    # very first triple instead of after `top` full evaluations
+    pair_f1s = sorted((p["metrics"]["f1"] for p in pairs
+                       if "metrics" in p), reverse=True)
+    cutoff = (min(pair_f1s[:top]) - 0.10) if len(pair_f1s) >= top else -1.0
+    # beam-skipped triples count as done so progress reaches 100%
+    kept_pairs = len(pairs_sorted)
+    n_names = len(names)
+    expected_triples = sum(
+        max(0, n_names - 2) for _ in range(kept_pairs))
+    done[0] += beam_applied * max(0, n_names - 2)
     chunk = max(1, abs(jobs))
     for i in range(0, len(pairs_sorted), chunk):
         check_cancel()
@@ -459,36 +727,45 @@ def search(X, y, groups=None, wavenumbers=None, k: int = 3, seed: int = 42,
         tasks = []
         for p in batch:
             A, B = p["arch"]
-            cand = [C for C in names
-                    if C not in (A, B)
-                    and " → ".join((A, B, C)) not in resume]
+            cand = sorted((C for C in names
+                           if C not in (A, B)
+                           and " → ".join((A, B, C)) not in resume),
+                          key=lambda c: -single_f1.get(c, 0.0))
             if cand:
-                tasks.append(((A, B), X, y, groups, classes, k, seed,
+                tasks.append(((A, B), X, y, groups, classes, k_s, seed,
                               oof1[A], p2[(A, B)], cand, factories,
                               wavenumbers, cutoff))
-        for results in Parallel(n_jobs=jobs)(
+        for results in Parallel(n_jobs=jobs, max_nbytes=100)(
                 delayed(_worker_triples)(t) for t in tasks):
-            for arch, metrics, pruned in results:
-                if metrics is None:
+            for arch, metrics, pruned, err in results:
+                if err is not None:
+                    record_error(arch, 3, err)
+                    done[0] += 1
+                elif metrics is None:
                     triples.append({"arch": arch, "level": 3,
                                     "pruned_bound": pruned})
+                    record(arch, metrics, pruned, level=3)
+                    done[0] += 1
                 else:
                     triples.append({"arch": arch, "level": 3,
                                     "metrics": metrics})
-                record(arch, metrics, pruned)
-                done[0] += 1
+                    record(arch, metrics, pruned, level=3)
+                    done[0] += 1
         cutoff = cutoff_now()
         scored = [t for t in triples if "metrics" in t]
         if scored:
-            b = max(scored, key=lambda t: t["metrics"]["f1"])
+            b = max(scored, key=lambda t: _screen_f1(t["metrics"]))
             tick(" → ".join(b["arch"]), b["metrics"]["f1"])
         if leaderboard_cb:
             leaderboard_cb(top5_of(singles + pairs + triples))
+    # screening at reduced fidelity: report the effective fold count
+    board = {"singles": singles, "pairs": pairs, "triples": triples,
+             "total": total, "pruned": sum(1 for t in triples
+                                           if "pruned_bound" in t),
+             "screen_folds": k_s}
     if ckpt:
         ckpt.close()
-    return {"singles": singles, "pairs": pairs, "triples": triples,
-            "total": total,
-            "pruned": sum(1 for t in triples if "pruned_bound" in t)}
+    return board
 
 
 # --------------------------------------------------------------------------
@@ -522,10 +799,16 @@ def validate_arch(arch, factories, X, y, groups, seed: int = 42,
             try:                        # inner OOF within the fold only
                 P_tr = _oof_proba(_layer_est(name, factories, pos, wn),
                                   F_tr, list(y_tr), g_tr, k_in, seed)
-            except Exception:           # tiny fold: in-sample fallback
-                est = fit_maybe_grouped(_layer_est(name, factories, pos,
-                                                   wn), F_tr, y_tr, g_tr)
-                P_tr = est.predict_proba(F_tr)
+            except Exception as exc:
+                # A tiny/degenerate inner fold must NOT fall back to
+                # IN-SAMPLE probabilities: those leak the training rows
+                # into the chaining features and inflate this fold's
+                # OOF metrics — the overall winner could then be picked
+                # partly on a leaky fold (fixed 2026-09-05).  Fail the
+                # architecture instead; the error-tolerant wrapper
+                # records it and the rankings skip it.
+                raise RuntimeError(
+                    f"inner OOF failed for layer {name!r}: {exc}") from exc
             est = fit_maybe_grouped(_layer_est(name, factories, pos, wn),
                                     F_tr, y_tr, g_tr)
             F_tr = np.hstack([F_tr, P_tr])
@@ -604,37 +887,132 @@ class SequentialChain:
             np.argmax(self.predict_proba(X), axis=1)]
 
 
+class AveragedChain:
+    """
+    B4 (2026-09-05 program): the deployable winner refit at several
+    seeds whose predict_proba is the SEED-AVERAGE — the cheap
+    robustness boost for fold-dependent chains.  Speaks the sklearn
+    protocol so bundles / Platt / threshold / predict keep working.
+    """
+
+    def __init__(self, estimators: list, k: int = 3, seed: int = 42,
+                 n_seeds: int = 3):
+        self.estimators = list(estimators)     # unfitted, clone-safe
+        self.k = k
+        self.seed = seed
+        self.n_seeds = n_seeds
+
+    def get_params(self, deep=True):
+        return {"estimators": list(self.estimators), "k": self.k,
+                "seed": self.seed, "n_seeds": self.n_seeds}
+
+    def set_params(self, **params):
+        for key, value in params.items():
+            setattr(self, key, value)
+        return self
+
+    def fit(self, X, y, groups=None):
+        self.fitted_ = []
+        for i in range(self.n_seeds):
+            chain = SequentialChain(
+                [modeling.clone(e) for e in self.estimators],
+                k=self.k, seed=self.seed + i).fit(X, y, groups=groups)
+            self.fitted_.append(chain)
+        self.classes_ = self.fitted_[0].classes_
+        return self
+
+    def predict_proba(self, X):
+        probas = [c.predict_proba(X) for c in self.fitted_]
+        return np.mean(probas, axis=0)
+
+    def predict(self, X):
+        return np.asarray(self.classes_)[
+            np.argmax(self.predict_proba(X), axis=1)]
+
+
 def chain_factory(arch, factories, k: int = 3, seed: int = 42):
     """Factory for a SequentialChain over the given architecture."""
     return lambda: SequentialChain(  # noqa: E731
         [factories[n]() for n in arch], k=k, seed=seed)
 
 
+def tune_chain(arch, X, y, groups, wavenumbers, seed: int = 42,
+               cnn_epochs: int = 40, progress=None) -> dict:
+    """
+    B1 of the 2026-09-05 Speed&Accuracy program: greedy PER-LAYER
+    hyperparameter tuning of a chain.  Layer i is grid-tuned with the
+    project's grouped inner CV (modeling._tune_hyperparams — the same
+    machinery evaluate_models uses) on the features it actually sees:
+    X plus the TUNED previous layers' grouped-OOF probabilities, i.e.
+    the exact stacking context the chain runs in.  Leakage-free: each
+    layer is tuned on its own features only.
+
+    Returns {"estimators": [unfitted, tuned, clone-safe per layer],
+             "params": [best-params dict per layer]}.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    classes = sorted(set(y))
+    ye = np.searchsorted(np.asarray(classes), np.asarray(y)).tolist()
+    min_class = int(min(np.bincount(np.asarray(ye))))
+    specs = {s["name"]: s for s in modeling.model_specs()}
+    factories = _factories(wavenumbers, cnn_epochs)
+    g = list(groups) if groups is not None else None
+    tuned, params = [], []
+    feats = X
+    for pos, name in enumerate(arch):
+        if progress:
+            progress(f"tuning chain layer {pos + 1}/{len(arch)}: {name}")
+        # WN-aligned models at chained positions tune AND deploy on the
+        # spectral columns only — feats carries appended probability
+        # columns that band/peak features cannot read (same wrap rule as
+        # _layer_est; before 2026-09-05 this was missing here and made
+        # tuning of any band-feature chain raise -> silently skipped).
+        wn_aligned = (pos >= 1 and wavenumbers is not None
+                      and name in WN_ALIGNED_MODELS)
+        tune_feats = (feats[:, :len(wavenumbers)] if wn_aligned else feats)
+        spec = specs.get(name)
+        est = grid = None
+        if spec is not None and not spec.get("ensemble"):
+            if spec.get("needs_wn"):
+                if wavenumbers is not None:
+                    est, grid = spec["make"](np.asarray(wavenumbers))
+            else:
+                est, grid = spec["estimator"], spec.get("grid")
+        if est is None or not grid:
+            # 1D-CNN (empty grid by design) / Ensemble — keep defaults
+            est_t, bp = _layer_est(name, factories, pos, wavenumbers), {}
+        else:
+            _fitted, bp = modeling._tune_hyperparams(
+                modeling.as_env_device(modeling.clone(est)), grid,
+                tune_feats, ye, min_class, g)
+            base = (modeling.as_env_device(
+                modeling.clone(est).set_params(**bp)) if bp else
+                    _layer_est(name, factories, pos, wavenumbers))
+            est_t = _sliced(base, len(wavenumbers)) if wn_aligned else base
+        tuned.append(est_t)
+        params.append(bp)
+        if pos < len(arch) - 1:
+            P = _oof_proba(modeling.clone(est_t), feats, ye, g,
+                           min(3, min_class), seed)
+            feats = np.hstack([feats, P])
+    return {"estimators": tuned, "params": params}
+
+
 # --------------------------------------------------------------------------
 # dataset preparation (mirrors reproduce_study — GUI parity)
 # --------------------------------------------------------------------------
-def prepare_dataset(root: str, mode: str = "standard", demo: bool = False):
+def prepare_dataset(root: str, mode: str = "standard"):
     """Returns (X, y, groups, wavenumbers, grid, params, meta)."""
     import dataset as ds
     import preprocessing as pp
     from clinical_data import load_clinical_dataset
 
     params = pp.PreprocessParams().validate()
-    flagged = None
-    if demo:
-        import tempfile
-        src = ds.find_default_source_spectrum()
-        r = ds.generate_demo_data(src, os.path.join(tempfile.mkdtemp(),
-                                                    "demo"))
-        spectra = ds.load_folder(r)
-        labels = [s.label for s in spectra]
-        groups = None
-    else:
-        cd = load_clinical_dataset(root)
-        spectra = cd.spectra
-        labels = [s.label for s in spectra]
-        groups = cd.groups or None
-        flagged = cd.flagged or None
+    cd = load_clinical_dataset(root)
+    spectra = cd.spectra
+    labels = [s.label for s in spectra]
+    groups = cd.groups or None
+    flagged = cd.flagged or None
     grid = ds.common_grid(spectra)
     X_raw, _ = ds.to_matrix(spectra, grid)
     keep = [i for i, lab in enumerate(labels) if lab.strip()]
@@ -748,12 +1126,30 @@ def build_report(board: dict, validated: dict, baseline: dict,
 # --------------------------------------------------------------------------
 # top-N validation + winner finalization (shared by CLI and GUI worker)
 # --------------------------------------------------------------------------
+def _worker_validate(task):
+    """Nested-validate one architecture (validate_top's pool worker)."""
+    _pin_threads()
+    arch, factories, X, y, groups, seed, k_outer, wn = task
+    try:
+        m = validate_arch(arch, factories, X, y, groups, seed=seed,
+                          k_outer=k_outer, wn=wn)
+        return arch, m, None
+    except Exception as exc:
+        return arch, None, f"{type(exc).__name__}: {exc}"
+
+
 def validate_top(board: dict, X, y, groups, wavenumbers, top: int = 20,
                  seed: int = 42, k_outer: int = 5, cnn_epochs: int = 40,
-                 model_names: list | None = None,
+                 model_names: list | None = None, jobs: int = -2,
                  progress=None) -> dict[int, list]:
     """Nested full validation of the top-N screening architectures per
-    level.  Returns {level: [{"arch", "metrics"}]}."""
+    level.  Returns {level: [{"arch", "metrics"}]}.
+
+    The architectures are independent — they validate in a joblib
+    process pool (clamped by _safe_jobs, CPU-pinned workers; jobs=1
+    keeps the old serial loop).  Results are collected back into the
+    original screening-rank order, so the returned structure is
+    identical to the serial version."""
     factories = _factories(wavenumbers, cnn_epochs)
     if model_names is None and any(
             e["arch"][0] == "Ensemble (top-3)" for e in board["singles"]):
@@ -763,39 +1159,62 @@ def validate_top(board: dict, X, y, groups, wavenumbers, top: int = 20,
             key=lambda s: -s["metrics"]["f1"])][:3]
         factories["Ensemble (top-3)"] = _ensemble_factory(
             top3, factories, wn=wavenumbers)
-    validated: dict[int, list] = {}
+    cand: dict[int, list] = {}
     for level, key in ((1, "singles"), (2, "pairs"), (3, "triples")):
-        cands = sorted((e for e in board[key] if "metrics" in e),
-                       key=lambda e: -e["metrics"]["f1"])
-        validated[level] = []
-        for entry in cands[:top]:
-            arch = tuple(n for n in entry["arch"] if n in factories)
-            if len(arch) != entry["level"]:
-                continue
-            if progress:
-                progress(f"validating {len(arch)}-model "
-                         f"{_fmt_arch(arch)}")
-            try:
-                m = validate_arch(arch, factories, X, y, groups,
-                                  seed=seed, k_outer=k_outer,
-                                  wn=wavenumbers)
-                validated[level].append({"arch": arch, "metrics": m})
-            except Exception as exc:
-                if progress:
-                    progress(f"validation failed for {_fmt_arch(arch)}: "
-                             f"{exc}")
+        archs = [tuple(n for n in e["arch"] if n in factories)
+                 for e in sorted((e for e in board[key] if "metrics" in e),
+                                 key=lambda e: -_screen_f1(
+                                     e["metrics"]))[:top]]
+        cand[level] = [a for a in archs if len(a) == level]
+    tasks = [(a, factories, X, y, groups, seed, k_outer, wavenumbers)
+             for level in (1, 2, 3) for a in cand[level]]
+    by_arch: dict = {}
+    jobs = _safe_jobs(jobs)
+    if jobs > 1:
+        from joblib import Parallel, delayed
+        with _child_cpu_only():
+            for arch, m, err in Parallel(
+                    n_jobs=jobs, max_nbytes=100,
+                    return_as="generator")(
+                    delayed(_worker_validate)(t) for t in tasks):
+                if err and progress:
+                    progress(f"validation failed for "
+                             f"{_fmt_arch(arch)}: {err}")
+                elif progress:
+                    progress(f"validated {len(arch)}-model "
+                             f"{_fmt_arch(arch)}")
+                if m is not None:
+                    by_arch[arch] = m
+    else:
+        for t in tasks:
+            arch, m, err = _worker_validate(t)
+            if err and progress:
+                progress(f"validation failed for {_fmt_arch(arch)}: {err}")
+            elif progress:
+                progress(f"validating {len(arch)}-model {_fmt_arch(arch)}")
+            if m is not None:
+                by_arch[arch] = m
+    validated: dict[int, list] = {}
+    for level in (1, 2, 3):
+        validated[level] = [{"arch": a, "metrics": by_arch[a]}
+                            for a in cand[level] if a in by_arch]
     return validated
 
 
 def finalize_winner(validated: dict, X, y, groups, wavenumbers,
                     board: dict | None = None, k: int = 3, seed: int = 42,
-                    cnn_epochs: int = 40) -> dict | None:
+                    cnn_epochs: int = 40, tune: bool = True,
+                    progress=None) -> dict | None:
     """
     Pick the overall validated winner, fit its deployable
     SequentialChain on all data, and derive the binary threshold +
     Platt calibrator from its nested-OOF probabilities.
+    tune=True (B1): first greedily grid-tune each layer of the winning
+    chain on its own stacking context, nested-validate the tuned chain,
+    and deploy it when it is not worse than the untuned one (both F1s
+    and the per-layer best params are returned).
     Returns {"arch", "chain", "classes", "threshold", "calibrator",
-             "metrics"} or None.
+             "metrics", "tuned", "tuned_metrics", "tune_params"} or None.
     """
     winner = pick_overall(validated)
     if winner is None:
@@ -809,21 +1228,51 @@ def finalize_winner(validated: dict, X, y, groups, wavenumbers,
             key=lambda s: -s["metrics"]["f1"])][:3]
         factories["Ensemble (top-3)"] = _ensemble_factory(
             top3, factories, wn=wavenumbers)
-    chain = SequentialChain(
-        [_layer_est(n, factories, i, wavenumbers)
-         for i, n in enumerate(winner["arch"])],
-        k=k, seed=seed).fit(X, y, groups=groups)
+    tuned = False
+    tuned_metrics = None
+    tune_params: list = []
+    ests = [_layer_est(n, factories, i, wavenumbers)
+            for i, n in enumerate(winner["arch"])]
+    if tune and len(winner["arch"]) >= 2:
+        try:
+            if progress:
+                progress("tuning the winning chain (per layer)")
+            tc = tune_chain(winner["arch"], X, y, groups, wavenumbers,
+                            seed=seed, cnn_epochs=cnn_epochs,
+                            progress=progress)
+            ests = tc["estimators"]
+            tune_params = tc["params"]
+            tm = validate_arch(winner["arch"],
+                               {n: (lambda e=e: modeling.clone(e))
+                                for n, e in zip(winner["arch"], ests)},
+                               X, y, groups, seed=seed, wn=wavenumbers)
+            tuned_metrics = tm
+            if tm["f1"] >= m["f1"] - 1e-9:
+                tuned = True          # deploy the tuned chain
+            else:
+                ests = [_layer_est(n, factories, i, wavenumbers)
+                        for i, n in enumerate(winner["arch"])]
+        except Exception as exc:
+            if progress:
+                progress(f"chain tuning skipped: {exc}")
+            ests = [_layer_est(n, factories, i, wavenumbers)
+                    for i, n in enumerate(winner["arch"])]
+    chain = AveragedChain(ests, k=k, seed=seed,
+                          n_seeds=3).fit(X, y, groups=groups)
     classes = sorted(set(y))
+    oof_m = tuned_metrics if tuned else m
     thr, calibrator = None, None
-    if m["oof_proba"].shape[1] == 2:
-        # m["y_true"] is already class-encoded (validate_arch)
-        yv = (np.asarray(m["y_true"]) == 1).astype(int)
-        pv = m["oof_proba"][:, 1]
+    if oof_m["oof_proba"].shape[1] == 2:
+        # oof_m["y_true"] is already class-encoded (validate_arch)
+        yv = (np.asarray(oof_m["y_true"]) == 1).astype(int)
+        pv = oof_m["oof_proba"][:, 1]
         thr_t, _f1, _j = modeling.best_f1_threshold(yv, pv)
         thr = float(thr_t)
         calibrator = clin.fit_platt(yv, pv)
     return {"arch": winner["arch"], "chain": chain, "classes": classes,
-            "threshold": thr, "calibrator": calibrator, "metrics": m}
+            "threshold": thr, "calibrator": calibrator, "metrics": m,
+            "tuned": tuned, "tuned_metrics": tuned_metrics,
+            "tune_params": tune_params}
 
 
 # --------------------------------------------------------------------------
@@ -882,18 +1331,16 @@ def significance_of(validated, winner, board, X, y, groups, wavenumbers,
         return None
 
 
+def _dumpable(m):
+    """JSON-safe metrics dict (ndarrays → lists)."""
+    return {k: (v.tolist() if isinstance(v, np.ndarray) else v)
+            for k, v in m.items()}
+
+
 def persist_run(out_dir: str, board: dict, validated: dict, winner,
                 significance: dict | None = None):
     """Write validated.json / winner.json / significance.json so the
     next app start can restore the winner into the Train page."""
-    def _dumpable(m):
-        out = {}
-        for k, v in m.items():
-            if isinstance(v, np.ndarray):
-                out[k] = v.tolist()
-            else:
-                out[k] = v
-        return out
 
     if significance is not None:
         with open(os.path.join(out_dir, "significance.json"), "w",
@@ -906,8 +1353,9 @@ def persist_run(out_dir: str, board: dict, validated: dict, winner,
 # --------------------------------------------------------------------------
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="3SSE architecture search")
-    ap.add_argument("--data", default=DEFAULT_DATA)
-    ap.add_argument("--demo", action="store_true")
+    ap.add_argument("--data", default=DEFAULT_DATA,
+                    help="dataset root (default: auto-detected, "
+                         "currently %(default)s)")
     ap.add_argument("--mode", default="paired",
                     choices=["standard", "paired", "paired-pqn"])
     ap.add_argument("--k", type=int, default=3,
@@ -918,21 +1366,22 @@ def main(argv=None) -> int:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--models", default=None,
                     help="comma-separated subset for quick tests")
-    ap.add_argument("--prune-pairs", type=int, default=0,
-                    help="beam: evaluate triples only for the top-K pairs")
+    ap.add_argument("--prune-pairs", type=int, default=50,
+                    help="beam: evaluate triples only for the top-K "
+                         "pairs (0 = all)")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--skip-validation", action="store_true")
     ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
 
+    if not os.path.isdir(args.data):
+        print(f"[3sse] data folder not found: {args.data} "
+              "(pass --data PATH or set RAMAN_DATA_DIR)")
+        return 2
+
     out_dir = args.out or os.path.join(APP_DIR, "study_run_3sse")
     os.makedirs(out_dir, exist_ok=True)
-    if args.demo and args.mode != "standard":
-        print("[3sse] demo data has no patient groups — using standard "
-              "mode")
-        args.mode = "standard"
-    X, y, g, wn, grid, params, meta = prepare_dataset(
-        args.data, args.mode, demo=args.demo)
+    X, y, g, wn, grid, params, meta = prepare_dataset(args.data, args.mode)
     print(f"[3sse] {meta['n_spectra']} spectra / "
           f"{meta['n_patients']} patients · mode {args.mode}")
     model_names = ([m.strip() for m in args.models.split(",")]

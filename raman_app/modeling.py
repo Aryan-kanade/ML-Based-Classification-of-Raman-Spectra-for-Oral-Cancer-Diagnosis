@@ -15,6 +15,7 @@ Strategy used to MAXIMIZE sensitivity / specificity / F1:
 from __future__ import annotations
 
 import traceback
+import os
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -34,7 +35,7 @@ from sklearn.model_selection import (GridSearchCV, StratifiedGroupKFold,
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neural_network import MLPClassifier
-from sklearn.pipeline import Pipeline
+from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.svm import SVC
@@ -42,6 +43,11 @@ from sklearn.svm import SVC
 try:
     from xgboost import XGBClassifier
     HAS_XGB = True
+    # GPU-trained boosters predict from CPU numpy on purpose (GUI batches
+    # are tiny) — xgboost warns about the DMatrix device fallback; expected
+    import warnings
+    warnings.filterwarnings(
+        "ignore", message=".*Falling back to prediction using DMatrix.*")
 except ImportError:
     HAS_XGB = False
 
@@ -58,12 +64,118 @@ except ImportError:
     HAS_CATBOOST = False
 
 try:
+    from tabpfn import TabPFNClassifier
+    HAS_TABPFN = True
+except Exception:                      # ImportError OR loader errors
+    HAS_TABPFN = False
+
+try:
     # NOTE: import torch BEFORE any Qt binding loads (see qt_compat.py)
     import torch
     from torch import nn
     HAS_TORCH = True
 except Exception:                      # ImportError OR DLL/loader errors
     HAS_TORCH = False
+
+
+def torch_device():
+    """cuda when a CUDA torch build + GPU are present, else cpu.
+    RAMAN_DEVICE=cpu forces CPU — the 3SSE loky workers do exactly
+    that (one CUDA context per child process would blow VRAM)."""
+    if not HAS_TORCH:
+        return None
+    if os.environ.get("RAMAN_DEVICE", "").lower() == "cpu":
+        return torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# --------------------------------------------------------------------------
+# GPU detection — capability-based, never card-name-based (any CUDA GPU
+# works: RTX 2050/3050/4050/…; the name in reports comes from the driver)
+# --------------------------------------------------------------------------
+_GPU_OK = None
+
+
+def _xgb_cuda_canary() -> bool:
+    """Tiny GPU fit proving the CUDA driver + xgboost agree (fallback
+    when torch is absent or is a CPU-only build)."""
+    if not HAS_XGB:
+        return False
+    try:
+        rng = np.random.default_rng(0)
+        XGBClassifier(n_estimators=2, max_depth=2, tree_method="hist",
+                      device="cuda").fit(rng.normal(size=(32, 8)),
+                                         np.arange(32) % 2)
+        return True
+    except Exception:
+        return False
+
+
+def gpu_ok() -> bool:
+    """Boosters on GPU ONLY by explicit opt-in (RAMAN_DEVICE=gpu).
+    Default CPU for three reasons: at n≈300×1600 GPU boosters LOSE to
+    CPU (kernel-launch/transfer overhead dominates); their CUDA
+    contexts fill VRAM and OOM'd loky children mid-import of catboost
+    during full-registry training (CUDA error 2 abort, 2026-09-05);
+    and the 3SSE workers already run CPU-pinned. The torch path
+    (1D-CNN/ViT via torch_device()) is independent and stays
+    GPU-by-default."""
+    if os.environ.get("RAMAN_DEVICE", "").lower() != "gpu":
+        return False
+    global _GPU_OK
+    if _GPU_OK is None:
+        _GPU_OK = ((HAS_TORCH and torch.cuda.is_available())
+                   or _xgb_cuda_canary())
+    return _GPU_OK
+
+
+def boost_device() -> str:
+    """XGBoost device: 'cuda' on any usable GPU, else 'cpu'."""
+    return "cuda" if gpu_ok() else "cpu"
+
+
+def as_env_device(est):
+    """Re-point a GPU-built boosted estimator to CPU when RAMAN_DEVICE=cpu
+    (estimators are constructed once in the parent — where the GPU is
+    visible — then pickled into 3SSE workers where the env forces CPU).
+    In that worker mode also CAP native thread pools (thread_count=1 /
+    n_jobs=1): every worker spawning all-core pools multiplied memory
+    pressure until fits died with 'bad allocation' (2026-09-05)."""
+    if os.environ.get("RAMAN_DEVICE", "").lower() == "cpu":
+        try:
+            p = est.get_params(deep=False)
+            if p.get("device") == "cuda":
+                est.set_params(device="cpu")
+            if p.get("task_type") == "GPU":
+                est.set_params(task_type="CPU")
+            if "thread_count" in p or "task_type" in p:   # CatBoost
+                est.set_params(thread_count=1)
+            if "n_jobs" in p:                  # XGBoost / LightGBM / RF / ET
+                est.set_params(n_jobs=1)
+        except AttributeError:
+            pass
+    return est
+
+
+def device_report() -> str:
+    """One-line accelerator summary from the hardware actually present."""
+    parts = []
+    if HAS_TORCH:
+        dev = torch_device()
+        if dev is not None and dev.type == "cuda":
+            try:
+                parts.append(f"1D-CNN: cuda ({torch.cuda.get_device_name()})")
+            except Exception:
+                parts.append("1D-CNN: cuda")
+        else:
+            parts.append("1D-CNN: cpu")
+    if HAS_XGB:
+        parts.append(f"XGBoost: {boost_device()}")
+    if HAS_CATBOOST:
+        parts.append(f"CatBoost: {'GPU' if gpu_ok() else 'CPU'}")
+    cpu_fams = "scikit-learn" + (" + LightGBM" if HAS_LGBM else "")
+    parts.append(f"{cpu_fams}: CPU-only")
+    return "Accelerators — " + " · ".join(parts)
 
 RANDOM_STATE = 42
 
@@ -99,6 +211,110 @@ class PLSDAClassifier(ClassifierMixin, BaseEstimator):
         s = s - s.max(axis=1, keepdims=True)
         p = np.exp(np.clip(s, -50, 50))
         return p / p.sum(axis=1, keepdims=True)
+
+
+class TTestSelect(TransformerMixin, BaseEstimator):
+    """
+    Univariate spectral feature selection after the internship report
+    (§3.3.1): keep wavenumbers whose Welch t-test p < `p_max` AND
+    |Cohen's d| > `d_min` between the two classes.  Binary only; fitted
+    INSIDE the CV pipeline so the selection never sees test spectra
+    (Cawley & Talbot 2010).  Falls back to all features when nothing
+    passes (tiny/unaligned folds) so pipelines still train.
+    """
+
+    def __init__(self, p_max: float = 0.05, d_min: float = 0.1):
+        self.p_max = p_max
+        self.d_min = d_min
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        classes = np.unique(y)
+        if len(classes) != 2:      # multiclass: keep everything (report
+            self.mask_ = np.ones(X.shape[1], dtype=bool)  # is binary)
+            self.n_selected_ = int(X.shape[1])
+            return self
+        a = X[y == classes[0]]
+        b = X[y == classes[1]]
+        from scipy.stats import ttest_ind
+        t, p = ttest_ind(a, b, axis=0, equal_var=False)   # Welch
+        na, nb = len(a), len(b)
+        sp = np.sqrt(((na - 1) * a.var(axis=0, ddof=1)
+                      + (nb - 1) * b.var(axis=0, ddof=1)) / (na + nb - 2))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            d = np.abs((a.mean(axis=0) - b.mean(axis=0)) / np.maximum(sp,
+                                                                     1e-12))
+        mask = (p < self.p_max) & (d > self.d_min)
+        mask = np.nan_to_num(mask, nan=0.0).astype(bool)
+        self.mask_ = mask if mask.any() else np.ones(X.shape[1], dtype=bool)
+        self.n_selected_ = int(self.mask_.sum())
+        return self
+
+    def transform(self, X):
+        return np.asarray(X, dtype=float)[:, self.mask_]
+
+
+class PLSScores(TransformerMixin, BaseEstimator):
+    """
+    PLS latent-variable scores as FEATURES for a downstream classifier
+    (the internship report's PLS+SVM / PLS+XGB pipelines).  PLSRegression
+    is fitted on one-hot class codes, so string labels work and multiclass
+    needs no extra handling.
+    """
+
+    def __init__(self, n_components: int = 5):
+        self.n_components = n_components
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y)
+        self.classes_ = np.unique(y)
+        if len(self.classes_) == 2:
+            # binary: 1-D class codes, so n_components is not capped at
+            # n_targets (the report uses 5 components on 2 classes)
+            Y = (y == self.classes_[1]).astype(float)
+        else:
+            Y = np.zeros((len(y), len(self.classes_)))
+            for i, c in enumerate(self.classes_):
+                Y[y == c, i] = 1.0
+        nc = max(1, int(min(self.n_components, len(y), X.shape[1])))
+        self.pls_ = PLSRegression(n_components=nc, scale=False).fit(X, Y)
+        return self
+
+    def transform(self, X):
+        return self.pls_.transform(np.asarray(X, dtype=float))
+
+
+class SparsePLSDA(ClassifierMixin, BaseEstimator):
+    """
+    Sparse PLS-DA (mixOmics-style variable selection): fit PLS on class
+    codes, keep the `n_select` wavenumbers with the largest summed
+    |loading| across components, refit PLS on just those.  Sparse
+    loadings are stabler than VIP for feature selection (Lê Cao 2008).
+    """
+
+    def __init__(self, n_components: int = 5, n_select: int = 50):
+        self.n_components = n_components
+        self.n_select = n_select
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y)
+        self.classes_ = np.unique(y)
+        probe = PLSScores(n_components=self.n_components).fit(X, y)
+        load = np.abs(probe.pls_.x_loadings_).sum(axis=1)
+        k = int(max(2, min(self.n_select, X.shape[1])))
+        self.sel_ = np.argsort(-load)[:k]
+        self.clf_ = PLSDAClassifier(n_components=self.n_components
+                                    ).fit(X[:, self.sel_], y)
+        return self
+
+    def predict(self, X):
+        return self.clf_.predict(np.asarray(X, dtype=float)[:, self.sel_])
+
+    def predict_proba(self, X):
+        return self.clf_.predict_proba(
+            np.asarray(X, dtype=float)[:, self.sel_])
 
 
 # --------------------------------------------------------------------------
@@ -137,14 +353,19 @@ if HAS_TORCH:
         (best-weights restored).  Seeded for reproducibility.
         """
 
-        def __init__(self, epochs: int = 40, batch_size: int = 32,
+        def __init__(self, epochs: int = 25, batch_size: int = 32,
                      lr: float = 1e-3, dropout: float = 0.2,
-                     seed: int = RANDOM_STATE):
+                     seed: int = RANDOM_STATE, augment: bool = True,
+                     synth: float = 0.0):
             self.epochs = epochs
             self.batch_size = batch_size
             self.lr = lr
             self.dropout = dropout
             self.seed = seed
+            self.augment = augment
+            # B2: fraction of the TRAINING rows to additionally
+            # synthesize as within-class Lorentzian blends (0 = off)
+            self.synth = synth
 
         def _to_tensor(self, X):
             X = np.asarray(X, dtype=np.float32)
@@ -157,7 +378,14 @@ if HAS_TORCH:
             torch.manual_seed(self.seed)
             self.classes_ = np.unique(y)
             ye = np.searchsorted(self.classes_, y)
-            Xt = self._to_tensor(X)
+            dev = torch_device()
+            amp = dev.type == "cuda"
+            if amp and tuple(torch.cuda.get_device_capability(dev)) >= (8, 0):
+                # TF32 matmuls: free speedup on Ampere+ GPUs only
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            scaler = torch.amp.GradScaler("cuda", enabled=amp)
+            Xt = self._to_tensor(X).to(dev)
             self.n_features_in_ = Xt.shape[-1]
             if len(ye) >= 20:
                 idx_tr, idx_va = train_test_split(
@@ -165,30 +393,77 @@ if HAS_TORCH:
                     random_state=self.seed)
             else:                                   # too small to split
                 idx_tr = idx_va = np.arange(len(ye))
+            # B2: physics-safe within-class Lorentzian blends of the
+            # TRAINING rows only — the early-stop validation split
+            # stays 100% real, so the stopping signal stays honest
+            tr_X, tr_y = Xt[idx_tr], ye[idx_tr]
+            if self.synth > 0 and len(idx_tr) >= 4:
+                X_tr_np = np.asarray(X, dtype=np.float32)[idx_tr]
+                xs, ys = [], []
+                uq = np.unique(tr_y)
+                n_new = max(1, int(self.synth * len(idx_tr)) // len(uq))
+                for c in uq:
+                    m = tr_y == c
+                    if m.sum() >= 2:
+                        S = lorentzian_synthesize(X_tr_np[m], n_new,
+                                                  seed=self.seed)
+                        xs.append(S)
+                        ys.extend([c] * len(S))
+                if xs:
+                    tr_X = torch.cat([tr_X, self._to_tensor(
+                        np.vstack(xs)).to(dev)])
+                    tr_y = np.concatenate([tr_y, np.asarray(ys)])
             counts = np.bincount(ye, minlength=len(self.classes_))
             weights = torch.tensor(
                 len(ye) / (len(self.classes_) * np.maximum(counts, 1)),
-                dtype=torch.float32)
+                dtype=torch.float32, device=dev)
             loss_fn = nn.CrossEntropyLoss(weight=weights)
             self.net_ = _CNN1DNet(len(self.classes_), Xt.shape[-1],
-                                  self.dropout)
+                                  self.dropout).to(dev)
             opt = torch.optim.Adam(self.net_.parameters(), lr=self.lr)
             gen = torch.Generator().manual_seed(self.seed)
             best_state, best_loss, best_epoch = None, np.inf, -1
             for epoch in range(self.epochs):
                 self.net_.train()
-                perm = torch.randperm(len(idx_tr), generator=gen).numpy()
+                perm = torch.randperm(len(tr_X), generator=gen).numpy()
                 for s in range(0, len(perm), self.batch_size):
                     b = perm[s:s + self.batch_size]
                     opt.zero_grad()
-                    loss = loss_fn(self.net_(Xt[idx_tr[b]]),
-                                   torch.from_numpy(ye[idx_tr[b]]))
-                    loss.backward()
-                    opt.step()
+                    xb, yb = tr_X[b], torch.from_numpy(
+                        tr_y[b]).to(dev)
+                    if self.augment:
+                        # ViT-parity regularization for small spectral
+                        # sets: noise + roll + mixup + band-mask
+                        xb = xb + torch.randn_like(xb) * (0.05 * xb.std())
+                        xb = torch.roll(xb, int(torch.randint(-2, 3, (1,))),
+                                        dims=2)
+                        if torch.rand(1).item() < 0.5:
+                            lam = float(np.random.beta(0.2, 0.2))
+                            pm = torch.randperm(len(xb), device=xb.device)
+                            xb = lam * xb + (1 - lam) * xb[pm]
+                            oh = torch.nn.functional.one_hot(
+                                yb.long(), num_classes=len(self.classes_)
+                            ).float()
+                            yb = lam * oh + (1 - lam) * oh[pm]
+                        if torch.rand(1).item() < 0.5:   # SpecAugment mask
+                            L = xb.shape[2]
+                            w = max(4, int(0.05 * L))
+                            st = int(torch.randint(0, max(1, L - w), (1,)))
+                            xb[:, :, st:st + w] = 0.0
+                    with torch.autocast(dev.type, enabled=amp):
+                        loss = loss_fn(self.net_(xb), yb)
+                    if amp:
+                        scaler.scale(loss).backward()
+                        scaler.step(opt)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        opt.step()
                 self.net_.eval()
-                with torch.no_grad():
+                with torch.no_grad(), torch.autocast(dev.type, enabled=amp):
                     va_loss = float(loss_fn(self.net_(Xt[idx_va]),
-                                            torch.from_numpy(ye[idx_va])))
+                                            torch.from_numpy(
+                                                ye[idx_va]).to(dev)))
                 if va_loss < best_loss - 1e-4:
                     best_loss, best_epoch = va_loss, epoch
                     best_state = {k: v.clone()
@@ -198,9 +473,16 @@ if HAS_TORCH:
             if best_state is not None:
                 self.net_.load_state_dict(best_state)
             self.net_.eval()
+            # store fitted weights on CPU: pickled bundles stay portable
+            # to machines without CUDA (predict re-selects the device)
+            self.net_.to("cpu")
             return self
 
         def predict_proba(self, X):
+            # CPU predict on purpose: batches are tiny (n≈hundreds) and
+            # self.net_ must never be left holding CUDA tensors (it gets
+            # joblib-pickled into saved model bundles)
+            self.net_.to("cpu")
             with torch.no_grad():
                 out = []
                 for s in range(0, len(X), 256):
@@ -208,6 +490,150 @@ if HAS_TORCH:
                         np.asarray(X)[s:s + 256]))
                     out.append(torch.softmax(logits, dim=1).numpy())
                 return np.vstack(out)
+
+        def predict(self, X):
+            return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
+        def predict_proba_tta(self, X, n_aug: int = 8
+                              ) -> np.ndarray:
+            """
+            Test-time augmentation: average predict_proba over n_aug
+            augmented copies (same recipe as training: noise, roll,
+            band-mask).  Free accuracy on small data — the prediction
+            becomes invariant to acquisition jitter.
+            """
+            rng = np.random.default_rng(self.seed)
+            X = np.asarray(X, dtype=np.float32)
+            L = X.shape[1] if X.ndim == 2 else X.shape[-1]
+            acc = self.predict_proba(X)
+            for _ in range(int(n_aug)):
+                noisy = X + rng.normal(0, 0.05 * X.std(), X.shape
+                                       ).astype(np.float32)
+                shift = int(rng.integers(-2, 3))
+                noisy = np.roll(noisy, shift, axis=-1)
+                w = max(4, int(0.05 * L))
+                st = int(rng.integers(0, max(1, L - w)))
+                noisy[..., st:st + w] = 0.0
+                acc = acc + self.predict_proba(noisy)
+            return acc / (int(n_aug) + 1)
+
+        def grad_cam(self, X, class_idx: int | None = None
+                     ) -> np.ndarray:
+            """
+            1D Grad-CAM over the last Conv1d layer: for each spectrum,
+            the wavenumber-length saliency of the predicted (or chosen)
+            class — gradient-weighted activation energy, ReLU'd and
+            max-normalized.  (Selvaraju 2017 adapted to 1D; no captum.)
+            """
+            self.net_.to("cpu")
+            self.net_.eval()
+            Xt = self._to_tensor(np.asarray(X, dtype=np.float32))
+            store = {}
+
+            def fwd(_m, _i, out):
+                store["act"] = out.detach()
+
+            def bwd(_m, _grad_in, grad_out):
+                store["grad"] = grad_out[0].detach()   # d loss / d act
+
+            last_conv = self.net_.features[4]      # second Conv1d block
+            hf = last_conv.register_forward_hook(fwd)
+            hb = last_conv.register_full_backward_hook(bwd)
+            try:
+                cams = []
+                for i in range(0, len(Xt), 64):
+                    xb = Xt[i:i + 64].clone().requires_grad_(True)
+                    logits = self.net_(xb)
+                    if class_idx is None:
+                        cls = logits.argmax(dim=1)
+                    else:
+                        cls = torch.full((len(xb),), int(class_idx),
+                                         dtype=torch.long)
+                    score = logits.gather(1, cls.view(-1, 1)).sum()
+                    self.net_.zero_grad()
+                    score.backward()
+                    act = store["act"]                       # (b, C, L')
+                    grad = store.get("grad", torch.zeros_like(act))
+                    w = grad.mean(dim=(0, 2), keepdim=True)   # GAP of grad
+                    cam = torch.relu((w * act).sum(dim=1))    # (b, L')
+                    b, L = cam.shape
+                    cam = torch.nn.functional.interpolate(
+                        cam.view(b, 1, L), size=Xt.shape[2],
+                        mode="linear").view(b, -1)
+                    cams.append(cam.detach().numpy())
+                out = np.vstack(cams)
+                mx = out.max(axis=1, keepdims=True)
+                return out / np.maximum(mx, 1e-9)
+            finally:
+                hf.remove()
+                hb.remove()
+
+        def predict_proba_mc(self, X, n_passes: int = 20):
+            """
+            MC-dropout uncertainty: enable dropout at inference, sample
+            n stochastic forwards, return (mean probs, std of probs) —
+            the std is an epistemic-uncertainty proxy (per class).
+            """
+            self.net_.to("cpu")
+            for m in self.net_.modules():
+                if isinstance(m, nn.Dropout):
+                    m.train()
+            try:
+                with torch.no_grad():
+                    runs = []
+                    for _ in range(int(n_passes)):
+                        out = []
+                        for s in range(0, len(X), 256):
+                            logits = self.net_(self._to_tensor(
+                                np.asarray(X)[s:s + 256]))
+                            out.append(torch.softmax(logits, dim=1).numpy())
+                        runs.append(np.vstack(out))
+                stacked = np.stack(runs)
+                return stacked.mean(axis=0), stacked.std(axis=0)
+            finally:
+                self.net_.eval()      # always leave eval mode behind
+
+    class CNNEnsemble(ClassifierMixin, BaseEstimator):
+        """
+        Deep-ensemble uncertainty for the 1D-CNN: `n_seeds` networks with
+        different seeds; predict_proba is the mean (predictive mean),
+        `predict_proba_std` the disagreement across members.  Lakshmin-
+        arayanan 2017; the cheap, reliable deep UQ baseline.
+        """
+
+        def __init__(self, n_seeds: int = 5, epochs: int = 40,
+                     batch_size: int = 32, lr: float = 1e-3,
+                     dropout: float = 0.2, seed: int = RANDOM_STATE,
+                     augment: bool = True, synth: float = 0.0):
+            self.n_seeds = n_seeds
+            self.epochs = epochs
+            self.batch_size = batch_size
+            self.lr = lr
+            self.dropout = dropout
+            self.seed = seed
+            self.augment = augment
+            self.synth = synth
+
+        def fit(self, X, y):
+            self.classes_ = np.unique(y)
+            self.members_ = [
+                CNN1DClassifier(epochs=self.epochs,
+                                batch_size=self.batch_size, lr=self.lr,
+                                dropout=self.dropout,
+                                seed=self.seed + i, augment=self.augment,
+                                synth=self.synth
+                                ).fit(X, y)
+                for i in range(int(self.n_seeds))]
+            return self
+
+        def predict_proba(self, X):
+            return np.mean([m.predict_proba(X) for m in self.members_],
+                           axis=0)
+
+        def predict_proba_std(self, X):
+            """Member disagreement — epistemic uncertainty per class."""
+            return np.std([m.predict_proba(X) for m in self.members_],
+                          axis=0)
 
         def predict(self, X):
             return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
@@ -349,6 +775,98 @@ class PeakIntensityFeatures(BaseEstimator, TransformerMixin):
 
 
 # --------------------------------------------------------------------------
+# Physics-based synthetic spectra (safe "generative augmentation")
+# --------------------------------------------------------------------------
+def phantom_cohort(n_patients: int = 40, spectra_per: int = 4,
+                   seed: int = 0):
+    """
+    Ground-truth synthetic OSCC-like cohort for CI smoke data, method
+    demos and teaching: Lorentzian bands with KNOWN class directions
+    (tumor: +nucleic-acid 785/1090/1335, +Phe 1003, −carotenoid
+    1155/1520; normal: lipid/carotenoid heavy), patient-level random
+    effects on band amplitudes, session baseline humps, Gaussian noise
+    and occasional cosmic spikes.  Returns (X, y, groups, wn,
+    planted) where planted = list of (center, direction_in_tumor).
+
+    Also the ground-truth test of the explainability stack: a profile
+    whose top-k lands on `planted` proves the profiler works.
+    """
+    rng = np.random.default_rng(seed)
+    wn = np.linspace(400.0, 2300.0, 1900)
+
+    def lor(center: float, width: float) -> np.ndarray:
+        return 1.0 / (1.0 + ((wn - center) / width) ** 2)
+
+    planted = [(785.0, +1), (1003.0, +1), (1090.0, +1), (1335.0, +1),
+               (1155.0, -1), (1520.0, -1), (1445.0, 0), (1655.0, +1)]
+    X, y, groups = [], [], []
+    for p in range(n_patients):
+        tumor = (p % 2 == 1)
+        # patient random effects (±25%) — the realistic between-subject
+        # variability that makes patient-grouped CV the honest protocol
+        amp = {c: rng.uniform(0.75, 1.25) for c, _d in planted}
+        base = (0.8 * lor(1445.0, 18.0)                # CH2 always on
+                + 0.5 * amp[1655.0] * lor(1655.0, 20.0))
+        for center, d in planted:
+            if center == 1445.0:
+                continue
+            a = amp[center]
+            if d == +1:
+                base = base + a * (0.9 if tumor else 0.25) * lor(center, 9)
+            elif d == -1:
+                base = base + a * (0.15 if tumor else 0.9) * lor(center, 11)
+        hump = rng.uniform(0.0, 0.4) * np.exp(-((wn - rng.uniform(500.,
+                                                                   900.))
+                                                / 350.0) ** 2)
+        for s in range(spectra_per):
+            spec = base + hump * rng.uniform(0.7, 1.3) \
+                + rng.normal(0, 0.02, len(wn))
+            if rng.random() < 0.05:                    # occasional spike
+                spec[int(rng.integers(0, len(wn)))] += rng.uniform(2, 8)
+            X.append(spec)
+            y.append("Tumor" if tumor else "Normal")
+            groups.append(f"P{p:03d}")
+    return (np.asarray(X), np.asarray(y), np.asarray(groups), wn,
+            planted)
+
+
+def lorentzian_synthesize(X: np.ndarray, n_new: int, wn=None,
+                          seed: int = RANDOM_STATE) -> np.ndarray:
+    """
+    RamanSPy-style physics-safe augmentation (no GAN): bootstrap `n_new`
+    synthetic spectra by fitting Lorentzian peaks to real class examples
+    and perturbing amplitudes/widths/positions by small factors — the
+    internship report's "generative augmentation" future-work line
+    without any generative-model risk.  Pairs of same-class spectra are
+    also intensity-blended (convex combos), which stays on the data
+    manifold by construction.
+
+    Use INSIDE training folds only (augmenting before a split leaks).
+    """
+    X = np.asarray(X, dtype=float)
+    rng = np.random.default_rng(seed)
+    if len(X) < 2 or n_new <= 0:
+        return X[:0]
+    out = []
+    for _ in range(int(n_new)):
+        i, j = rng.integers(0, len(X), 2)
+        lam = rng.uniform(0.2, 0.8)
+        base = lam * X[i] + (1.0 - lam) * X[j]        # manifold blend
+        # small spectral perturbations: smooth random gain curve + tilt
+        if wn is not None and len(wn) == X.shape[1]:
+            wn_ = np.asarray(wn, dtype=float)
+            anchor = rng.uniform(wn_.min(), wn_.max())
+            width = rng.uniform(50.0, 400.0)
+            gain = 1.0 + rng.uniform(-0.15, 0.15) * np.exp(
+                -((wn_ - anchor) / width) ** 2)
+        else:
+            gain = 1.0 + rng.uniform(-0.08, 0.08)
+        tilt = np.linspace(-1, 1, X.shape[1]) * rng.uniform(-0.05, 0.05)
+        out.append(base * gain + tilt * np.abs(base).mean() * 0.5)
+    return np.vstack(out)
+
+
+# --------------------------------------------------------------------------
 def model_specs() -> list[dict]:
     """Candidate models: {name, estimator, grid}."""
     specs = [
@@ -440,6 +958,14 @@ def model_specs() -> list[dict]:
             "grid": {"clf__n_components": [2, 3, 5, 8]},
         },
         {
+            "name": "Sparse PLS-DA",
+            "estimator": Pipeline([
+                ("sc", StandardScaler()),
+                ("clf", SparsePLSDA()),
+            ]),
+            "grid": {"clf__n_select": [30, 100]},
+        },
+        {
             "name": "PCA + MLP (neural net)",
             "estimator": Pipeline([
                 ("sc", StandardScaler()),
@@ -461,9 +987,48 @@ def model_specs() -> list[dict]:
             "name": "XGBoost",
             "estimator": XGBClassifier(
                 n_estimators=200, max_depth=4, learning_rate=0.1,
-                tree_method="hist", eval_metric="mlogloss",
+                tree_method="hist", device=boost_device(),
+                eval_metric="mlogloss",
                 random_state=RANDOM_STATE, n_jobs=-1),
             "grid": {"max_depth": [3, 5], "learning_rate": [0.05, 0.2]},
+        })
+
+        def _xgb():
+            return XGBClassifier(
+                n_estimators=200, max_depth=4, learning_rate=0.1,
+                tree_method="hist", device=boost_device(),
+                eval_metric="mlogloss",
+                random_state=RANDOM_STATE, n_jobs=-1)
+        # the internship report's winner (PLS+XGB) and its PCA twin —
+        # PLS/PCA latent-variable scores feeding gradient boosting
+        specs.append({
+            "name": "PLS + XGBoost",
+            "estimator": Pipeline([("pls", PLSScores(n_components=5)),
+                                   ("xgb", _xgb())]),
+            "grid": {"pls__n_components": [3, 5, 8],
+                     "xgb__max_depth": [3, 5],
+                     "xgb__learning_rate": [0.05, 0.2]},
+        })
+        specs.append({
+            "name": "PCA + XGBoost",
+            "estimator": Pipeline([
+                ("sc", StandardScaler()),
+                ("pca", PCA(n_components=5, random_state=RANDOM_STATE)),
+                ("xgb", _xgb())]),
+            "grid": {"pca__n_components": [5, 10],
+                     "xgb__max_depth": [3, 5],
+                     "xgb__learning_rate": [0.05, 0.2]},
+        })
+        # the report's univariate filter (Welch t + Cohen's d), selected
+        # INSIDE each tuning fold — leakage-proof — XGBoost on the
+        # surviving wavenumbers directly
+        specs.append({
+            "name": "t-test filter + XGBoost",
+            "estimator": Pipeline([("sel", TTestSelect()),
+                                   ("xgb", _xgb())]),
+            "grid": {"sel__d_min": [0.1, 0.3],
+                     "xgb__max_depth": [3, 5],
+                     "xgb__learning_rate": [0.05, 0.2]},
         })
     if HAS_LGBM:
         specs.append({
@@ -480,6 +1045,7 @@ def model_specs() -> list[dict]:
             "estimator": CatBoostClassifier(
                 iterations=200, depth=4, learning_rate=0.1,
                 auto_class_weights="Balanced", verbose=0,
+                task_type=("GPU" if gpu_ok() else "CPU"),
                 allow_writing_files=False, random_seed=RANDOM_STATE),
             "grid": {"depth": [3, 5], "learning_rate": [0.05, 0.2]},
         })
@@ -489,6 +1055,36 @@ def model_specs() -> list[dict]:
             # empty grid: one seeded fit per fold (grid over epochs
             # would multiply an already-iterative training)
             "estimator": CNN1DClassifier(),
+            "grid": {},
+        })
+        # B1+B2 (2026-09-05): deep (seed) ensemble — the small-n gold
+        # standard (Lakshminarayanan 2017) — plus 30% physics-safe
+        # Lorentzian blends INSIDE the training split. The plain 1D-CNN
+        # above stays single-seed/unaugmented as the controlled variant.
+        specs.append({
+            "name": "1D-CNN ensemble (5 seeds)",
+            "estimator": CNNEnsemble(n_seeds=5, epochs=25, synth=0.3),
+            "grid": {},
+        })
+    if HAS_TABPFN:
+        # C1 (2026-09-05): prior-fitted tabular foundation model —
+        # zero tuning, seconds per fit; RamanBench 2026 + TabPFN v2
+        # (Nature 2025) show foundation models winning exactly in this
+        # n≈300 tabular/spectral regime. PCA first: v2.5's pretraining
+        # limit is ~500 features and the cropped spectrum has 780-1600.
+        # Weights auto-download from HuggingFace once (research license);
+        # runs on the torch GPU when present.
+        specs.append({
+            "name": "TabPFN (foundation model)",
+            "estimator": Pipeline([
+                ("pca", PCA(n_components=0.95,
+                            random_state=RANDOM_STATE)),
+                ("clf", TabPFNClassifier(
+                    n_estimators=2, random_state=RANDOM_STATE,
+                    device=("cuda" if (HAS_TORCH
+                                       and torch_device().type == "cuda")
+                            else "cpu"))),
+            ]),
             "grid": {},
         })
     # interpretable 16-band model (needs the wavenumber axis at fit time)
@@ -503,6 +1099,28 @@ def model_specs() -> list[dict]:
                     random_state=RANDOM_STATE, n_jobs=-1)),
             ]),
             {"clf__max_depth": [None, 8]}),
+    })
+    # B3 (2026-09-05 program): fuse the full spectrum (via PCA) with the
+    # 16 literature band intensities — the field's standard recipe; band
+    # features alone already score near the top (0.736 vs 0.766).
+    specs.append({
+        "name": "Spectral + band features",
+        "needs_wn": True,
+        "make": lambda wn: (
+            Pipeline([
+                ("union", FeatureUnion([
+                    ("spec", Pipeline([
+                        ("sc", StandardScaler()),
+                        ("pca", PCA(n_components=0.95,
+                                    random_state=RANDOM_STATE))])),
+                    ("bands", PeakIntensityFeatures(wn=wn)),
+                ])),
+                ("clf", ExtraTreesClassifier(
+                    n_estimators=250, class_weight="balanced",
+                    random_state=RANDOM_STATE, n_jobs=-1)),
+            ]),
+            {"clf__max_depth": [None, 12],
+             "union__spec__pca__n_components": [0.95, 8]}),
     })
     # resolved by evaluate_models AFTER the individual models: soft voting
     # over the three best cross-validated pipelines
@@ -605,18 +1223,112 @@ def _tune_hyperparams(estimator, grid, Xtr, ytr, min_class: int, groups=None):
                                     and (n_groups or 0) < 2):
         est = clone(estimator).fit(Xtr, ytr)
         return est, {}
+    # GPU-trained boosted models search serially: n_jobs=-1 loky children
+    # would each spawn their own CUDA context (~300 MB) and swamp VRAM.
+    # The grids are tiny (2x2), so serial costs nothing.
+    gs_jobs = -1
+    try:
+        p = estimator.get_params(deep=False)
+        if p.get("device") == "cuda" or p.get("task_type") == "GPU":
+            gs_jobs = 1
+    except AttributeError:
+        pass
     if groups is not None and n_groups >= inner_cv:
         cv = StratifiedGroupKFold(n_splits=inner_cv, shuffle=True,
                                   random_state=RANDOM_STATE)
         gs = GridSearchCV(clone(estimator), grid, cv=cv,
-                          scoring="f1_macro", n_jobs=-1)
+                          scoring="f1_macro", n_jobs=gs_jobs)
         gs.fit(Xtr, ytr, groups=groups)
+        # refit the best params on the FULL training fold (groups-aware
+        # for estimators that consume them, e.g. StackedEnsemble)
+        best = fit_maybe_grouped(
+            clone(estimator).set_params(**gs.best_params_), Xtr, ytr, groups)
     else:
         gs = GridSearchCV(clone(estimator), grid, cv=inner_cv,
-                          scoring="f1_macro", n_jobs=-1)
+                          scoring="f1_macro", n_jobs=gs_jobs)
         gs.fit(Xtr, ytr)
-    best = clone(estimator).set_params(**gs.best_params_).fit(Xtr, ytr)
+        best = clone(estimator).set_params(**gs.best_params_).fit(Xtr, ytr)
     return best, gs.best_params_
+
+
+def _NOT_THREAD_SAFE(name: str) -> bool:
+    """Models whose fits must NOT run concurrently in threads: the
+    boosters keep global native pools (rabit / CatBoost), and torch
+    seeds the process-global RNG at fit start.  Matched on the registry
+    NAME because the estimator may be wrapped in pipelines/unions."""
+    return any(s in name for s in ("XGBoost", "CatBoost", "LightGBM",
+                                   "1D-CNN", "TabPFN"))
+
+
+def _tune_inner(estimator, grid, Xtr, ytr, inner, pos_idx=None,
+                groups=None, serial=False):
+    """
+    ONE inner-CV pass for both jobs run_cv used to do separately
+    (2026-09-05): every param combo is fit on the inner training folds
+    and scored on POOLED out-of-fold validation probabilities; the
+    WINNING combo's pooled probabilities also tune the binary
+    threshold.  Replaces GridSearchCV + a second threshold-only
+    cross_val_predict (~4 fewer fits per outer fold per model) and the
+    redundant refit inside _tune_hyperparams (run_cv refits the fold
+    model itself).
+
+    Parallelism: THREAD backend (sklearn fits release the GIL) — never
+    loky processes: every child would load the torch-CUDA + booster
+    DLLs (~GBs each) just to run a 0.1 s sklearn fit, which OOM'd the
+    machine (OpenBLAS allocation aborts, 2026-09-05). `serial=True`
+    (boosters / torch models — global C++ pools, per-process RNG) runs
+    the loop in-process.
+
+    Semantics note: hyperparameter scoring changed from mean-of-inner-
+    folds to pooled-OOF macro-F1 — the same objective the threshold
+    step optimizes (documented in Brain.md).  Fits are plain .fit
+    (GridSearchCV never passed groups to fit either — only to the
+    splitter, which is what `inner` already encodes).  Returns
+    (best_params, threshold|None).
+    """
+    from joblib import Parallel, delayed
+    from sklearn.model_selection import ParameterGrid
+
+    combos = list(ParameterGrid(grid)) if grid else [{}]
+    splits = list(inner.split(Xtr, ytr, groups))
+
+    def _fit_proba(params, tr, va):
+        est = clone(estimator)
+        if params:
+            est = est.set_params(**params)
+        est.fit(Xtr[tr], ytr[tr])
+        return est.predict_proba(Xtr[va])
+
+    tasks = [(combo, tr, va) for combo in combos for tr, va in splits]
+    if serial or len(tasks) == 1:
+        probas = [_fit_proba(*t) for t in tasks]
+    else:
+        probas = Parallel(n_jobs=min(4, os.cpu_count() or 1),
+                          prefer="threads")(
+            delayed(_fit_proba)(*t) for t in tasks)
+    best_i, best_f1, pooled = 0, -np.inf, None
+    y_by_split = [ytr[va] for _t, va in splits]
+    y_all = np.concatenate(y_by_split) if y_by_split else ytr
+    for ci in range(len(combos)):
+        P = np.vstack(probas[ci * len(splits):(ci + 1) * len(splits)])
+        f1 = f1_score(y_all, np.argmax(P, axis=1), average="macro")
+        if f1 > best_f1 + 1e-12:            # first combo wins ties
+            best_f1, best_i, pooled = f1, ci, P
+    thr = None
+    if pos_idx is not None and pooled is not None:
+        try:
+            scores = pooled[:, pos_idx]
+            yb = (y_all == pos_idx).astype(int)
+            if 0 < yb.sum() < len(yb):
+                cand, _, _ = best_f1_threshold(yb, scores)
+                pred_c = np.where(scores >= cand, pos_idx, 1 - pos_idx)
+                pred_h = np.where(scores >= 0.5, pos_idx, 1 - pos_idx)
+                if (f1_score(y_all, pred_c, average="macro")
+                        > f1_score(y_all, pred_h, average="macro")):
+                    thr = float(cand)
+        except Exception:
+            thr = None
+    return dict(combos[best_i]), thr
 
 
 def fit_maybe_grouped(est, X, y, groups=None):
@@ -705,6 +1417,19 @@ class StackedEnsemble:
             meta = self._meta_features(X, fitted)
         self.meta_ = LogisticRegression(max_iter=2000)
         self.meta_.fit(meta, y)
+        # nearly-free meta-OOF probabilities for run_cv's threshold
+        # tuning: the meta features are already inner-OOF, so a small
+        # logistic CV on them costs milliseconds — and saves three
+        # FULL StackedEnsemble refits per outer fold (A5, 2026-09-05)
+        self.meta_oof_ = None
+        if inner_k >= 2:
+            try:
+                from sklearn.model_selection import cross_val_predict
+                self.meta_oof_ = cross_val_predict(
+                    LogisticRegression(max_iter=2000), meta, y,
+                    groups=groups, cv=inner, method="predict_proba")
+            except Exception:
+                self.meta_oof_ = None
         self.bases_ = [clone(est).fit(X, y) for _nm, est in self.specs]
         return self
 
@@ -830,6 +1555,7 @@ def evaluate_models(X: np.ndarray, y: list[str],
                 min_tr = min(Counter(ytr.tolist()).values())
                 params: dict = {}
                 thr = None
+                stacked_thr_pending = False
                 # inner split for hyperparams + (binary) threshold tuning
                 # (grouped as well when patient groups are given)
                 inner_k = int(min(3, min_tr))
@@ -844,40 +1570,28 @@ def evaluate_models(X: np.ndarray, y: list[str],
                         inner = StratifiedKFold(n_splits=inner_k,
                                                 shuffle=True,
                                                 random_state=seed)
-                    # hyperparameters: grouped inner CV over the whole
-                    # training fold (no throwaway holdout)
-                    est, params = _tune_hyperparams(
-                        estimator, grid, Xtr, ytr, min_tr, groups=groups_tr)
+                    # ONE inner-CV pass: hyperparams AND the binary
+                    # threshold both come from pooled inner-OOF
+                    # predictions (no second cross_val_predict, no
+                    # throwaway refit — see _tune_inner)
+                    if binary and isinstance(estimator, StackedEnsemble):
+                        # A5: the stacked's own meta-OOF (computed in
+                        # fit, nearly free) tunes the threshold after
+                        # the fold refit — skips 3 full stacked refits
+                        params, thr = {}, None
+                        stacked_thr_pending = True
+                    else:
+                        params, thr = _tune_inner(
+                            estimator, grid, Xtr, ytr, inner,
+                            pos_idx=pos_idx if binary else None,
+                            groups=groups_tr,
+                            serial=_NOT_THREAD_SAFE(name))
                     param_list.append(params)
                     param_counter[str(sorted(params.items()))] += 1
-                    if binary:
-                        # threshold: tuned on POOLED out-of-fold inner
-                        # predictions, and only kept if it beats the 0.5
-                        # default there (unstable tiny-holdout thresholds
-                        # hurt more than they help on small datasets)
-                        try:
-                            from sklearn.model_selection import cross_val_predict
-                            proba = cross_val_predict(
-                                est, Xtr, ytr, groups=groups_tr, cv=inner,
-                                method="predict_proba")
-                            scores = proba[:, pos_idx]
-                            yv = (ytr == pos_idx).astype(int)
-                            if 0 < yv.sum() < len(yv):
-                                cand, _, _ = best_f1_threshold(yv, scores)
-                                pred_c = np.where(scores >= cand,
-                                                  pos_idx, 1 - pos_idx)
-                                pred_h = np.where(scores >= 0.5,
-                                                  pos_idx, 1 - pos_idx)
-                                if (f1_score(ytr, pred_c, average="macro")
-                                        > f1_score(ytr, pred_h,
-                                                   average="macro")):
-                                    thr = float(cand)
-                        except Exception:
-                            thr = None
+                    if binary and not stacked_thr_pending:
                         res.thresholds.append(thr)
                 else:
-                    est, params = _tune_hyperparams(
-                        estimator, grid, Xtr, ytr, min_tr, groups=groups_tr)
+                    params, thr = {}, None
                     param_list.append(params)
                     param_counter[str(sorted(params.items()))] += 1
 
@@ -885,6 +1599,26 @@ def evaluate_models(X: np.ndarray, y: list[str],
                 final = fit_maybe_grouped(
                     clone(estimator).set_params(**params), Xtr, ytr,
                     groups_tr)
+                if binary and stacked_thr_pending:
+                    # A5: threshold from the fitted stack's meta-OOF
+                    mo = getattr(final, "meta_oof_", None)
+                    if mo is not None:
+                        try:
+                            scores = mo[:, pos_idx]
+                            yv = (ytr == pos_idx).astype(int)
+                            if 0 < yv.sum() < len(yv):
+                                cand, _, _ = best_f1_threshold(yv, scores)
+                                pred_c = np.where(scores >= cand, pos_idx,
+                                                  1 - pos_idx)
+                                pred_h = np.where(scores >= 0.5, pos_idx,
+                                                  1 - pos_idx)
+                                if (f1_score(ytr, pred_c, average="macro")
+                                        > f1_score(ytr, pred_h,
+                                                   average="macro")):
+                                    thr = float(cand)
+                        except Exception:
+                            thr = None
+                    res.thresholds.append(thr)
                 proba = final.predict_proba(Xte)
                 oof_sum[te] += proba
                 oof_cnt[te] += 1
@@ -1324,7 +2058,16 @@ def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
                     f"the spectrum has {len(xc)} after preprocessing")
             xc = xc - reference
         try:
-            proba = bundle["pipeline"].predict_proba(xc.reshape(1, -1))[0]
+            # B3: winners that support test-time augmentation (the
+            # 1D-CNN) predict from an augmented-view average — small
+            # robustness gain at deploy time, zero training change
+            _clf = getattr(bundle["pipeline"], "steps", None)
+            _clf = _clf[-1][1] if _clf else bundle["pipeline"]
+            if hasattr(_clf, "predict_proba_tta"):
+                proba = _clf.predict_proba_tta(xc.reshape(1, -1))[0]
+            else:
+                proba = bundle["pipeline"].predict_proba(
+                    xc.reshape(1, -1))[0]
             break
         except ValueError:
             if reference is not None:
@@ -1357,3 +2100,278 @@ def roc_points(y_true_encoded: np.ndarray, proba_pos: np.ndarray):
     auc = float(np.trapezoid(tpr, fpr)) if hasattr(np, "trapezoid") \
         else float(np.trapz(tpr, fpr))
     return fpr, tpr, auc
+
+
+def pr_points(y_true_encoded: np.ndarray, proba_pos: np.ndarray):
+    """Precision-recall curve + average precision — the imbalance-aware
+    companion to ROC (a rare-disease screen can look fine on ROC and
+    still have poor PPV)."""
+    from sklearn.metrics import (average_precision_score,
+                                 precision_recall_curve)
+    prec, rec, _ = precision_recall_curve(y_true_encoded, proba_pos)
+    ap = float(average_precision_score(y_true_encoded, proba_pos))
+    return prec, rec, ap
+
+
+# --------------------------------------------------------------------------
+# Grouped permutation test of the winner's OOF AUC
+# --------------------------------------------------------------------------
+def grouped_oof_auc(est, X, y, groups, k: int = 5,
+                    seed: int = RANDOM_STATE) -> float:
+    """Pooled grouped-CV out-of-fold AUC of a (fitted-params) estimator."""
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import cross_val_predict
+    y = np.asarray(y)
+    if len(np.unique(y)) != 2:
+        raise ValueError("permutation AUC test is binary-only")
+    cv = StratifiedGroupKFold(n_splits=int(k), shuffle=True,
+                              random_state=seed)
+    proba = cross_val_predict(clone(est), X, y, cv=cv, n_jobs=1,
+                              method="predict_proba", groups=groups)
+    classes = np.unique(y)
+    pos = classes[1]
+    return float(roc_auc_score((y == pos).astype(int), proba[:, 1]))
+
+
+def permutation_auc_p(est, X, y, groups, n_perm: int = 100, k: int = 5,
+                      seed: int = RANDOM_STATE) -> dict:
+    """
+    Permutation test with PATIENT-level label shuffling: build the null
+    by reassigning whole patients' labels, re-running the grouped CV.
+    Empirical p = (1 + #{null >= observed}) / (1 + n_perm).  This is the
+    hard answer to "is the AUC real at n<500?".
+    """
+    X = np.asarray(X)
+    y = np.asarray(y)
+    groups = np.asarray(groups)
+    obs = grouped_oof_auc(est, X, y, groups, k=k, seed=seed)
+    rng = np.random.default_rng(seed)
+    uniq = np.unique(groups)
+    null = []
+    for _ in range(int(n_perm)):
+        perm_lab = dict(zip(uniq, rng.permutation(
+            [y[groups == g][0] for g in uniq])))
+        y_perm = np.array([perm_lab[g] for g in groups])
+        if len(np.unique(y_perm)) < 2:
+            continue
+        try:
+            null.append(grouped_oof_auc(est, X, y_perm, groups, k=k,
+                                        seed=seed))
+        except Exception:
+            continue
+    p = (1 + sum(1 for v in null if v >= obs)) / (1 + len(null))
+    return {"auc": obs, "p": float(p), "n_perm": len(null),
+            "null_mean": float(np.mean(null)) if null else float("nan")}
+
+
+# --------------------------------------------------------------------------
+# Model-specific wavenumber-importance profiles (explainability)
+# --------------------------------------------------------------------------
+def pls_vip(pls_fitted) -> np.ndarray:
+    """VIP scores of a fitted PLSRegression (p weights vs explained Y)."""
+    w = pls_fitted.x_weights_                    # (p, a)
+    t = pls_fitted.x_scores_                     # (n, a)
+    q = pls_fitted.y_loadings_                   # (a, ) or (a, m)
+    q = np.asarray(q).reshape(t.shape[1], -1)
+    ssy = (t ** 2).sum(axis=0) * (q ** 2).sum(axis=1)   # per component
+    w2 = w ** 2
+    p = w.shape[0]
+    vip = np.sqrt(p * (w2 @ ssy) / max(ssy.sum(), 1e-12))
+    return np.asarray(vip).ravel()
+
+
+def winner_importance(winner_pipeline, X, y=None, wn=None) -> np.ndarray:
+    """
+    Best-effort per-wavenumber importance profile of a fitted winner:
+    PLS-family → VIP; 1D-CNN → Grad-CAM energy; tree/other → RF-surrogate
+    SHAP (when y is given) or a |mean| profile as last resort.  Returns a
+    non-negative (n_wavenumbers,) profile aligned with X's columns.
+    """
+    est = winner_pipeline
+    steps = getattr(est, "steps", None)
+    for s in (dict(steps).values() if steps else [est]):
+        if hasattr(s, "pls_"):
+            return pls_vip(s.pls_)
+    named = getattr(est, "named_steps", None) or {}
+    clf = named.get("clf", est)
+    if HAS_TORCH and isinstance(clf, CNN1DClassifier):
+        return clf.grad_cam(X).mean(axis=0)
+    if y is not None and wn is not None:
+        _, signed, _ = region_importance_shap(X, y, wn)
+        return np.abs(signed)
+    return np.abs(np.asarray(X, dtype=float)).mean(axis=0)
+
+
+# --------------------------------------------------------------------------
+# Clinical covariate fusion (spectra + tobacco/age/sex/subsite)
+# --------------------------------------------------------------------------
+def covariate_fusion_cv(proba_pos: np.ndarray, covariates, y, groups,
+                        k: int = 5, seed: int = RANDOM_STATE) -> dict:
+    """
+    Does adding clinical covariates (tobacco pack-years, age, sex,
+    subsite…) to the winner's OOF probability improve discrimination?
+    Logistic meta-model over [p, covariates] vs [p] alone, patient-
+    grouped CV both times — Hanna 2024's confirmed open gap: nobody has
+    formally merged Raman with clinical risk factors.  covariates is an
+    (n, m) numeric/one-hot matrix aligned with proba_pos.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import cross_val_predict
+    y = np.asarray(y)
+    if len(np.unique(y)) != 2:
+        return {}
+    p = np.asarray(proba_pos, dtype=float).reshape(-1, 1)
+    C = np.asarray(covariates, dtype=float)
+    if C.ndim == 1:
+        C = C.reshape(-1, 1)
+    C = np.nan_to_num(C)
+    cv = StratifiedGroupKFold(n_splits=int(k), shuffle=True,
+                              random_state=seed)
+    lr = LogisticRegression(max_iter=2000)
+    base = cross_val_predict(lr, p, y, cv=cv, groups=groups,
+                             method="predict_proba")[:, 1]
+    fused = cross_val_predict(lr, np.hstack([p, C]), y, cv=cv,
+                              groups=groups,
+                              method="predict_proba")[:, 1]
+    classes = np.unique(y)
+    yb = (y == classes[1]).astype(int)
+    a0 = float(roc_auc_score(yb, base))
+    a1 = float(roc_auc_score(yb, fused))
+    return {"auc_base": a0, "auc_fused": a1, "delta": a1 - a0}
+
+
+def label_error_report(oof_proba: np.ndarray, y,
+                       threshold_strong: float = 0.10,
+                       threshold_soft: float = 0.25) -> list[dict]:
+    """
+    Confident-learning-style label-error flags from the winner's pooled
+    OUT-OF-FOLD probabilities (cleanlab approach, hand-rolled):
+    a spectrum whose GIVEN class got < 10% while another class got > 90%
+    is 'likely mislabeled'; < 25%/> 75% is 'review'.  No new fit — pure
+    post-processing, so it is cheap and leakage-free by construction.
+    Returns [{'i', 'given', 'p_self', 'other', 'p_other', 'tier'}, ...]
+    sorted by (p_self ascending).
+    """
+    p = np.asarray(oof_proba, dtype=float)
+    y = np.asarray(y)
+    classes = np.unique(y)
+    lut = {c: i for i, c in enumerate(classes)}
+    out = []
+    for i in range(len(y)):
+        row = p[i]
+        gi = lut.get(y[i])
+        if gi is None or np.isnan(row).all():
+            continue
+        p_self = float(row[gi])
+        rest = np.delete(row, gi)
+        if len(rest) == 0 or np.isnan(rest).all():
+            continue
+        jo = int(np.nanargmax(rest))
+        others = [c for k, c in enumerate(classes) if k != gi]
+        other = str(others[jo])
+        p_other = float(rest[jo])
+        if p_self < threshold_strong and p_other > 1 - threshold_strong:
+            tier = "likely"
+        elif p_self < threshold_soft and p_other > 1 - threshold_soft:
+            tier = "review"
+        else:
+            continue
+        out.append({"i": i, "given": str(y[i]), "p_self": p_self,
+                    "other": other, "p_other": p_other, "tier": tier})
+    return sorted(out, key=lambda r: r["p_self"])
+
+
+def band_stability(profiles: list[np.ndarray], top_k: int = 20
+                   ) -> dict:
+    """
+    Stability selection for wavenumber importance: per-fold/repeat
+    profiles → per-profile top-k sets → pairwise Jaccard + the bands
+    that appear in EVERY top-k set (the defensible ones).  Returns
+    {'jaccard_mean', 'jaccard_min', 'stable'} with stable as a boolean
+    consensus mask (all-True when only one profile is given).
+    """
+    if not profiles:
+        return {"jaccard_mean": 0.0, "jaccard_min": 0.0,
+                "stable": np.zeros(0, dtype=bool)}
+    p = min(map(len, profiles))
+    tops = [set(np.argsort(-np.asarray(pr, dtype=float)[:p])[:top_k])
+            for pr in profiles]
+    consensus = set.intersection(*tops)
+    stable_mask = np.isin(np.arange(p), list(consensus))
+    if len(tops) < 2:
+        return {"jaccard_mean": 1.0, "jaccard_min": 1.0,
+                "stable": stable_mask}
+    jac = []
+    for a in range(len(tops)):
+        for b in range(a + 1, len(tops)):
+            u = tops[a] | tops[b]
+            jac.append(len(tops[a] & tops[b]) / len(u) if u else 1.0)
+    return {"jaccard_mean": float(np.mean(jac)),
+            "jaccard_min": float(np.min(jac)),
+            "stable": stable_mask}
+
+
+# --------------------------------------------------------------------------
+# Model card export (TRIPOD+AI-flavored)
+# --------------------------------------------------------------------------
+def export_model_card(path: str, winner, params=None,
+                      dataset_name: str = "", k_folds: int = 5,
+                      repeats: int = 3) -> str:
+    """
+    Publication/report-ready model card: development data, full
+    preprocessing, CV protocol, discrimination + calibration, AUC power
+    and the limitations boilerplate a TRIPOD+AI reviewer expects.
+    """
+    from dataclasses import asdict as _asdict
+    w = winner
+    lines = ["# Model card — Raman Spectra Classifier", ""]
+    lines += [f"**Model**: {w.name}",
+              f"**Development data**: {dataset_name or '(unnamed cohort)'}",
+              f"**Validation**: {k_folds}-fold patient-grouped CV"
+              + (f" × {repeats}" if repeats > 1 else "")
+              + " (nested hyperparameter tuning inside folds)", ""]
+    if params is not None:
+        try:
+            lines += ["## Preprocessing", "```",
+                      "\n".join(f"{k} = {v}" for k, v in
+                                _asdict(params.validate()).items()),
+                      "```", ""]
+        except Exception:
+            pass
+    lines += ["## Performance (out-of-fold, pooled)"]
+    try:
+        lines.append(f"- macro-F1: **{w.macro_f1():.3f}**")
+    except Exception:
+        pass
+    try:
+        ye = np.asarray(w.y_true_encoded)
+        valid = ~np.isnan(w.oof_proba[:, 1])
+        fpr, tpr, auc = roc_points(ye[valid], w.oof_proba[valid, 1])
+        _prec, _rec, ap = pr_points(ye[valid], w.oof_proba[valid, 1])
+        lines.append(f"- ROC AUC: **{auc:.3f}** · AUPRC: **{ap:.3f}**")
+        import clinical as _clin
+        n_pos = int((ye[valid] == 1).sum())
+        n_neg = int((ye[valid] == 0).sum())
+        pw = _clin.auc_power(n_pos, n_neg, auc=auc)
+        lines.append(
+            f"- AUC power: detectable AUC at 80% power = "
+            f"{pw['detectable_auc_80pct']:.3f} "
+            f"(n+ {n_pos} / n− {n_neg}; "
+            f"~{pw['n_per_group_for_target']} per group needed for "
+            f"AUC 0.85)")
+    except Exception:
+        pass
+    lines += ["", "## Limitations",
+              "- Single-center development; no external cohort "
+              "validation yet (TRIPOD+AI gap).",
+              "- Spectrum-level CV numbers can exceed patient-level "
+              "reality; patient-grouped CV is the reported standard.",
+              "- Triage-to-biopsy aid, not a diagnosis.",
+              "- Conformal sets abstain on ambiguous spectra; coverage "
+              "is marginal (~90%), not per-patient.",
+              "", "_Auto-generated by the Raman Spectra Classifier._"]
+    text = "\n".join(lines)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text + "\n")
+    return text
