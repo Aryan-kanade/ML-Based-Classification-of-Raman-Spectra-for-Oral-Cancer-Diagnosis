@@ -3,7 +3,9 @@ clinical_data.py — loader for the clinical Raman dataset layout:
 
     <root>/<class>/<patient folder>/<spectrum>.csv
 
-e.g.  D:\\BARC\\Data\\Normal\\Patient_15\\17122024TDOC15NH0_interpolated.csv
+e.g.  <root>/Normal/Patient_07/20250107_site07_n0_interpolated.csv
+
+<root> is found per device by find_data_root() — no hardcoded paths.
 
 The class label comes from the TOP-LEVEL folder (never the filename —
 several filenames are malformed), and every patient folder yields a
@@ -14,6 +16,8 @@ puts one subject on both sides leaks).
 Automatic data hygiene (everything is reported, nothing is deleted from
 disk):
   * white/black/dark/background reference spectra are excluded,
+  * spectra whose TH*/NH* site token contradicts the class folder are
+    dropped (mislabeled acquisitions),
   * byte-identical duplicate spectra are collapsed to one copy,
   * spectra that appear IDENTICALLY under two different classes are
     dropped entirely (impossible labels — pure leakage).
@@ -85,6 +89,55 @@ def is_clinical_layout(folder: str) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------
+# Portable dataset-root discovery (works on any device — no hand-edits)
+# --------------------------------------------------------------------------
+# per-DEVICE pointer: the home dir does not travel with a copied project
+# folder, so each machine remembers its own dataset location here.
+DATA_POINTER = os.path.join(os.path.expanduser("~"), ".raman_app_data_dir")
+
+
+def find_data_root() -> str | None:
+    """
+    First existing clinical-layout folder, checked in order:
+      1. RAMAN_DATA_DIR environment variable (explicit override),
+      2. the ~/.raman_app_data_dir pointer (auto-written the first time
+         a clinical folder is loaded in the GUI),
+      3. Data/ next to this package, ~/Desktop/data/Data, ~/Data,
+         raman_app/Data.
+    Returns None when no candidate exists — callers fall back to --data /
+    Browse.  Every candidate is validated with is_clinical_layout().
+    """
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    home = os.path.expanduser("~")
+    cands: list[str] = []
+    env = os.environ.get("RAMAN_DATA_DIR")
+    if env:
+        cands.append(env)
+    try:
+        with open(DATA_POINTER, encoding="utf-8") as fh:
+            cands.append(fh.read().strip())
+    except OSError:
+        pass
+    cands += [os.path.join(app_dir, "..", "Data"),
+              os.path.join(home, "Desktop", "data", "Data"),
+              os.path.join(home, "Data"),
+              os.path.join(app_dir, "Data")]
+    for c in cands:
+        if c and is_clinical_layout(c):
+            return os.path.normpath(c)
+    return None
+
+
+def remember_data_root(path: str):
+    """Persist the chosen dataset root for THIS device (see DATA_POINTER)."""
+    try:
+        with open(DATA_POINTER, "w", encoding="utf-8") as fh:
+            fh.write(path)
+    except OSError:
+        pass                     # best-effort: the candidates still work
+
+
 def subject_key(patient_folder: str) -> str:
     """Normalize a patient folder name to a subject key.
 
@@ -132,11 +185,15 @@ def load_clinical_dataset(root: str) -> ClinicalData:
         "references_excluded": [],
         "duplicates_dropped": [],      # (kept_path, dropped_path)
         "cross_class_dropped": [],     # paths dropped for impossible labels
+        "site_token_dropped": [],      # TH*/NH* token contradicts class folder
         "load_errors": [],
         "grid_identical": True,
     }
 
     # ---- 1. scan class/patient/file --------------------------------------
+    # spectra are loaded AS-IS over their full axis (15.5-3862 cm-1 on
+    # this instrument) — no edge trimming, every data point is kept
+    # (user decision 2026-09-04)
     records = []                    # (class, subject, rel, path, wn, it)
     for cls_dir in sorted(os.listdir(root)):
         cls_path = os.path.join(root, cls_dir)
@@ -155,6 +212,18 @@ def load_clinical_dataset(root: str) -> ClinicalData:
                 if any(m in fn.lower() for m in REFERENCE_MARKERS):
                     report["references_excluded"].append(rel)
                     continue
+                # site-token vs folder-class check (2026-09-05 audit): a
+                # TH*/NH* site token contradicting its class folder is a
+                # mislabeled acquisition (a tumor-site file inside Normal/
+                # trains as Normal and no dedupe can catch a unique copy).
+                # Only fires for unambiguous files (one clear token).
+                if label in ("Normal", "Tumor"):
+                    has_t = re.search(r"TH\d", fn) is not None
+                    has_n = re.search(r"NH\d", fn) is not None
+                    if ((label == "Normal" and has_t and not has_n)
+                            or (label == "Tumor" and has_n and not has_t)):
+                        report["site_token_dropped"].append(rel)
+                        continue
                 path = os.path.join(pat_path, fn)
                 try:
                     wn, it = ds.load_spectrum(path)
@@ -285,9 +354,11 @@ def format_report(report: dict) -> str:
     lines.append(f"Kept: {report.get('n_spectra')} spectra / "
                  f"{report.get('n_subjects')} subjects "
                  f"({len(both)} subjects have both classes)")
-    lines.append(f"Shared wavenumber grid: "
-                 f"{'identical in every file' if report.get('grid_identical')
-                   else 'NOT identical - interpolating to common grid'}")
+    # {..} inside an f-string must stay on ONE line — a newline
+    # there is 3.12+-only syntax and broke the app on a Python 3.11 device.
+    grid_txt = ("identical in every file" if report.get("grid_identical")
+                else "NOT identical - interpolating to common grid")
+    lines.append(f"Shared wavenumber grid: {grid_txt}")
     refs = report.get("references_excluded", [])
     lines.append(f"Reference spectra excluded: {len(refs)}")
     for r in refs:

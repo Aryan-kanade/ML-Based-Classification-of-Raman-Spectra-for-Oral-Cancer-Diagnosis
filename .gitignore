@@ -16,7 +16,6 @@ raman_app/data_report.txt
 raman_app/result_report.txt
 raman_app/result_report.html
 raman_app/*.joblib
-raman_app/demo_data/
 raman_app/vit_outputs/
 raman_app/study_run*/
 *.zip
@@ -24,4 +23,12 @@ raman_app/study_run*/
 # Python / tooling
 __pycache__/
 *.pyc
+.ruff_cache/
 .zcode/
+
+# Scratch / local bench + run logs (not source)
+raman_app/_i.txt
+raman_app/bench/
+raman_app/study_*.log
+raman_app/repro_out/
+raman_app/report_replication.md

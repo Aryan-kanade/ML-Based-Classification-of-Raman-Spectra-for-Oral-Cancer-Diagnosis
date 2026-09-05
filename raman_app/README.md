@@ -5,7 +5,7 @@ A desktop application (Python + Qt) that classifies Raman spectra
 specificity and F1 score**.
 
 It loads a folder of 2-column `.txt` spectra, auto-detects the class of
-each file from its name (`P01_cAg_785_C8_3.txt` → class **C8**),
+each file from its name (`S07_tissue_C8.txt` → class **C8**),
 preprocesses them with standard Raman pipelines, cross-validates a suite
 of machine-learning models, and automatically keeps the model with the
 best **macro-F1 / sensitivity / specificity**.
@@ -18,13 +18,13 @@ it at a folder like `D:\BARC\Data`:
 ```
 Data/
 ├── Normal/                 <- class label = this folder's name
-│   ├── Patient_15/         <- all spectra of one subject stay together
-│   │   ├── 17122024TDOC15NH0_interpolated.csv
+│   ├── Patient_07/         <- all spectra of one subject stay together
+│   │   ├── 20250107_site07_n0_interpolated.csv
 │   │   └── ...
-│   └── TDOC058 Spectra pro/
-│       └── 04082025TDOC058TH0.csv
+│   └── Subject058 Spectra pro/
+│       └── 20250804_site58_t0.csv
 └── Tumor/
-    └── Patient_15/ ...
+    └── Patient_07/ ...
 ```
 
 Loading is automatic (GUI *Folder…* button or `python vit_train.py` with no
@@ -33,15 +33,18 @@ Loading is automatic (GUI *Folder…* button or `python vit_train.py` with no
 * **labels** every spectrum from the top-level folder (Normal/Tumor;
   Control/Healthy/Benign → Normal, Cancer/Malignant → Tumor) — never
   from the filename (some are malformed),
-* derives a **patient key** from the folder name (`Patient_15`,
-  `TDOC015`, `TDOC058 Spectra pro` → subject *S15/S58*) — the dataset is
+* derives a **patient key** from the folder name (`Patient_07`,
+  `Subject007`, `Subject058 Spectra pro` → subject *S7/S58*) — the dataset is
   **paired** (the same subject usually has Normal *and* Tumor spectra),
   so every split and every CV fold is **grouped by patient**: one
   subject never appears on both sides of a split,
 * **excludes instrument references** (filenames containing
   white/black/dark/bkg/background/ref/blank/calib),
-* **collapses exact duplicate spectra** (e.g. `Patient_15–19` content is
-  byte-identical to `TDOC015–019`),
+* **drops mislabeled acquisitions** — a `TH*` (tumor-site) token inside
+  `Normal/` or an `NH*` (normal-site) token inside `Tumor/` contradicts
+  the folder label and is excluded (impossible labels),
+* **collapses exact duplicate spectra** (e.g. one subject exported twice
+  under two folder names),
 * **drops spectra that appear identically under two different classes**
   (impossible labels — pure leakage),
 * verifies whether all files share one wavenumber grid (they do: 2271
@@ -58,7 +61,6 @@ identical files dropped).
 ```bat
 run_app.bat               :: double-click launcher (no console window)
 python main.py            # same, from a terminal
-python main.py --smoke    # headless end-to-end test
 ```
 
 ## Workflow in the GUI
@@ -67,9 +69,6 @@ python main.py --smoke    # headless end-to-end test
    (2-column `.txt`/`.dat`/`.csv` files: wavenumber TAB intensity).
    The class of each file is parsed from the `C<number>` token in the
    filename; you can edit any label by double-clicking the *Class* column.
-   Only one real spectrum right now? Press *Generate demo data* on the
-   Start page — it derives a synthetic 3-class dataset (C1/C5/C8) from it
-   for testing.
 2. **Preprocess** — tune wavelet denoising, Savitzky–Golay smoothing
    (+ optional derivative), ALS baseline correction and normalization;
    preview the effect on the selected spectrum (the processed panel also
@@ -146,7 +145,6 @@ patches of 32, linearly embedded, and classified by a small transformer
 encoder (dim 128, depth 4, 4 heads, CLS-token head).
 
 ```bat
-python vit_train.py              :: train (demo data by default, 10 epochs)
 python vit_train.py --data D:\data\my_spectra --epochs 25
 python vit_test.py               :: re-evaluate the held-out test set
 ```
@@ -163,9 +161,9 @@ are stored in the checkpoint).
 
 | file | purpose |
 |---|---|
-| `main.py` | entry point (`--smoke` runs the headless test) |
+| `main.py` | entry point (launches the GUI) |
 | `gui.py` | Qt main window (PyQt5/PyQt6/PySide6 auto-detected) |
-| `dataset.py` | spectrum loading, class parsing, demo-data generator |
+| `dataset.py` | spectrum loading, class parsing, common grid |
 | `clinical_data.py` | clinical layout loader: folder labels, patient groups, dedupe, hygiene report |
 | `optimize.py` | preprocessing auto-tune (grouped CV grid search) |
 | `preprocessing.py` | wavelet denoise · Savitzky–Golay · ALS baseline · normalization |
@@ -177,14 +175,12 @@ are stored in the checkpoint).
 | `vit_model.py` | spectral Vision Transformer model + checkpoint I/O |
 | `vit_train.py` | train the ViT on a spectra folder (curves + confusion matrix) |
 | `vit_test.py` | re-evaluate a trained ViT checkpoint on its test set |
-| `smoke_test.py` | headless end-to-end verification |
 
 ## Testing
 
 ```bat
 python test_all.py    :: fast unit/regression tests (synthetic data, ~30s)
 python gui_test.py    :: headless end-to-end GUI flow (offscreen)
-python smoke_test.py  :: headless pipeline check on demo data
 python deep_test.py   :: adversarial sweep: error paths, workers, CLI
 ```
 
@@ -195,7 +191,6 @@ One command reproduces the whole pipeline headlessly with a fixed seed
 
 ```bat
 python reproduce_study.py                      :: clinical data at Data\
-python reproduce_study.py --demo --mini        :: quick synthetic check
 python reproduce_study.py --mode paired-pqn    :: margin mode + PQN
 ```
 
@@ -276,9 +271,7 @@ Each core method follows the primary literature:
 
 ## Notes
 
-* The generated `demo_data/` is **synthetic** (derived from one real
-  spectrum) — use it to test the workflow, not for scientific claims.
-* Replace it with your real labeled folder whenever it is available; no
-  code changes are needed.
-* Python 3.9+ recommended. On very new Python versions PyQt5 wheels may
-  be missing — the app falls back to PyQt6/PySide6 automatically.
+* Python 3.9+ recommended (the source avoids 3.12-only f-string syntax,
+  so a project copy runs on older Pythons too). On very new Python
+  versions PyQt5 wheels may be missing — the app falls back to
+  PyQt6/PySide6 automatically.
