@@ -49,19 +49,32 @@ def band_psi(wn_a, X_a, wn_b, X_b) -> float:
     Mean population-stability index over coarse wavenumber bins:
     quantifies distribution drift between the internal training cohort
     and the external one (PSI < 0.1 stable, > 0.25 major shift).
+    Bins are restricted to the SHARED axis range of the two cohorts —
+    zero-filling out-of-range bins fabricated drift whenever the
+    measurement ranges differed (fixed 2026-09-05).
     """
+    wa, wb = np.asarray(wn_a, float), np.asarray(wn_b, float)
+    lo = max(float(wa.min()), float(wb.min()))
+    hi = min(float(wa.max()), float(wb.max()))
+
+    def _edges():
+        return [e for e in np.arange(400.0, 2400.0, 100.0)
+                if e >= lo and e + 100.0 <= hi]
+
     def _prof(wn, X):
         wn = np.asarray(wn, float)
-        # coarse 100 cm-1 bin means, normalized to unit sum
-        edges = np.arange(400, 2400, 100.0)
+        # coarse 100 cm-1 bin means over the SHARED bins, normalized
         prof = []
-        for lo in edges[:-1]:
-            m = (wn >= lo) & (wn < lo + 100)
-            prof.append(np.mean(X[:, m]) if m.sum() else 0.0)
+        for e in _edges():
+            m = (wn >= e) & (wn < e + 100.0)
+            if m.sum():
+                prof.append(np.mean(X[:, m]))
         v = np.abs(np.array(prof))
         return v / max(v.sum(), 1e-12)
 
-    pa, pb = _prof(wn_a, X_a), _prof(wn_b, X_b)
+    pa, pb = _prof(wa, X_a), _prof(wb, X_b)
+    if len(pa) == 0 or len(pb) == 0:
+        return float("nan")
     n = min(len(pa), len(pb))
     pa, pb = pa[:n] + 1e-4, pb[:n] + 1e-4
     pa, pb = pa / pa.sum(), pb / pb.sum()
@@ -100,7 +113,25 @@ def main(argv=None) -> int:
           f"{len(set(groups)) if groups else 0} patients")
 
     wn_ext = np.asarray(grid, float)
-    Xp = pp.preprocess_matrix(X, params, wn=wn_ext)
+    # REGRAIN onto the model's training axis (2026-09-05): every GUI
+    # predict path interpolates onto bundle["wavenumbers"]; feeding the
+    # external cohort's own grid crashed on different point counts and
+    # silently misaligned predictions when the counts coincided.
+    wn_b = np.asarray(bundle["wavenumbers"], float)
+    if wn_b[0] > wn_b[-1]:                      # tolerate descending axes
+        wn_b = wn_b[::-1]
+    lo_b, hi_b = float(wn_b.min()), float(wn_b.max())
+    if wn_ext[0] > lo_b + 1.0 or wn_ext[-1] < hi_b - 1.0:
+        print(f"[external] external axis {wn_ext[0]:.1f}-"
+              f"{wn_ext[-1]:.1f} cm-1 does not cover the model grid "
+              f"{lo_b:.1f}-{hi_b:.1f} — refusing to fabricate the "
+              f"missing region")
+        return 2
+    if not np.allclose(wn_ext, wn_b):
+        Xr = np.stack([np.interp(wn_b, wn_ext, row) for row in X])
+    else:
+        Xr = X
+    Xp = pp.preprocess_matrix(Xr, params, wn=wn_b)
     pipe = bundle["pipeline"]
     proba = pipe.predict_proba(Xp)
     pred = np.array(classes)[np.argmax(proba, axis=1)]
@@ -124,11 +155,14 @@ def main(argv=None) -> int:
     if args.internal and os.path.isdir(args.internal):
         try:
             Xi, _yi, wi_i, _g = _load(args.internal)
-            psi = band_psi(wi_i, Xi, wn_ext, X)
+            # compare PREPROCESSED profiles (raw intensities let baseline
+            # differences dominate the "band drift" verdict)
+            pi = pp.preprocess_matrix(Xi, params, wn=wi_i)
+            psi = band_psi(wi_i, pi, wn_b, Xp)
             verdict = ("stable" if psi < 0.1 else
                        "moderate shift" if psi < 0.25 else "MAJOR SHIFT")
-            print(f"[external] band-profile PSI vs internal: {psi:.3f} "
-                  f"— {verdict}")
+            print(f"[external] band-profile PSI vs internal "
+                  f"(preprocessed, shared range): {psi:.3f} — {verdict}")
         except Exception as e:
             print(f"[external] drift check skipped: {e}")
     return 0

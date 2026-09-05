@@ -373,9 +373,12 @@ if HAS_TORCH:
                 X = X[:, None, :]                    # (n, 1, length)
             return torch.from_numpy(X)
 
-        def fit(self, X, y):
+        def fit(self, X, y, groups=None):
             from sklearn.model_selection import train_test_split
             torch.manual_seed(self.seed)
+            # seeded numpy Generator for mixup (the legacy global RNG made
+            # CNN fits nondeterministic despite the configured seed)
+            np_rng = np.random.default_rng(self.seed)
             self.classes_ = np.unique(y)
             ye = np.searchsorted(self.classes_, y)
             dev = torch_device()
@@ -388,9 +391,19 @@ if HAS_TORCH:
             Xt = self._to_tensor(X).to(dev)
             self.n_features_in_ = Xt.shape[-1]
             if len(ye) >= 20:
-                idx_tr, idx_va = train_test_split(
-                    np.arange(len(ye)), test_size=0.15, stratify=ye,
-                    random_state=self.seed)
+                if groups is not None and len(set(groups)) >= 8:
+                    # GROUPED early-stop split (2026-09-05): hold out
+                    # whole PATIENTS — a per-spectrum split let the val
+                    # patients' other spectra train the net, making
+                    # val-loss optimistic (late, biased stopping).
+                    from sklearn.model_selection import GroupShuffleSplit
+                    idx_tr, idx_va = next(GroupShuffleSplit(
+                        n_splits=1, test_size=0.15,
+                        random_state=self.seed).split(X, ye, groups))
+                else:
+                    idx_tr, idx_va = train_test_split(
+                        np.arange(len(ye)), test_size=0.15, stratify=ye,
+                        random_state=self.seed)
             else:                                   # too small to split
                 idx_tr = idx_va = np.arange(len(ye))
             # B2: physics-safe within-class Lorentzian blends of the
@@ -438,7 +451,7 @@ if HAS_TORCH:
                         xb = torch.roll(xb, int(torch.randint(-2, 3, (1,))),
                                         dims=2)
                         if torch.rand(1).item() < 0.5:
-                            lam = float(np.random.beta(0.2, 0.2))
+                            lam = float(np_rng.beta(0.2, 0.2))
                             pm = torch.randperm(len(xb), device=xb.device)
                             xb = lam * xb + (1 - lam) * xb[pm]
                             oh = torch.nn.functional.one_hot(
@@ -652,7 +665,7 @@ class CalibratedSVC(ClassifierMixin, BaseEstimator):
         self.class_weight = class_weight
         self.random_state = random_state
 
-    def fit(self, X, y):
+    def fit(self, X, y, groups=None):
         from sklearn.calibration import CalibratedClassifierCV
         self.classes_ = np.unique(y)
         base = SVC(C=self.C, gamma=self.gamma,
@@ -661,7 +674,21 @@ class CalibratedSVC(ClassifierMixin, BaseEstimator):
         counts = np.bincount(np.searchsorted(self.classes_, y),
                              minlength=len(self.classes_))
         cv = int(min(3, counts.min()))
-        if cv >= 2 and len(self.classes_) >= 2:
+        n_groups = len(set(groups)) if groups is not None else None
+        if groups is not None and cv >= 2 and (n_groups or 0) >= cv:
+            # GROUPED calibration (2026-09-05): same-patient spectra must
+            # never straddle a calibration split — plain StratifiedKFold
+            # here leaked patients into the sigmoid fit and biased every
+            # downstream probability.  Precomputed index splits avoid
+            # routing `groups` through CalibratedClassifierCV.fit.
+            from sklearn.model_selection import StratifiedGroupKFold
+            gkf = StratifiedGroupKFold(n_splits=cv, shuffle=True,
+                                       random_state=self.random_state)
+            splits = list(gkf.split(X, y, groups))
+            self.model_ = CalibratedClassifierCV(
+                base, method="sigmoid", ensemble=False,
+                cv=splits).fit(X, y)
+        elif cv >= 2 and len(self.classes_) >= 2:
             skf = StratifiedKFold(n_splits=cv, shuffle=True,
                                   random_state=self.random_state)
             self.model_ = CalibratedClassifierCV(
@@ -1255,9 +1282,12 @@ def _NOT_THREAD_SAFE(name: str) -> bool:
     """Models whose fits must NOT run concurrently in threads: the
     boosters keep global native pools (rabit / CatBoost), and torch
     seeds the process-global RNG at fit start.  Matched on the registry
-    NAME because the estimator may be wrapped in pipelines/unions."""
+    NAME because the estimator may be wrapped in pipelines/unions.
+    Ensemble/stacked wrappers are included: their VOTERS are routinely
+    boosters or the CNN and the wrapper's own name hides that."""
     return any(s in name for s in ("XGBoost", "CatBoost", "LightGBM",
-                                   "1D-CNN", "TabPFN"))
+                                   "1D-CNN", "TabPFN",
+                                   "Ensemble", "Stacked"))
 
 
 def _tune_inner(estimator, grid, Xtr, ytr, inner, pos_idx=None,
@@ -2041,7 +2071,18 @@ def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
 
     order = np.argsort(wavenumbers)
     wn, it = np.asarray(wavenumbers)[order], np.asarray(intensities)[order]
-    grid = bundle["wavenumbers"]
+    grid = np.asarray(bundle["wavenumbers"], dtype=float)
+    # overlap guard (2026-09-05): np.interp CONSTANT-extrapolates, so a
+    # spectrum whose measured axis does not span the training grid would
+    # silently be filled with edge intensities and confidently
+    # mispredicted.  1 cm-1 tolerance for boundary rounding.
+    lo, hi = float(grid.min()), float(grid.max())
+    if float(wn[0]) > lo + 1.0 or float(wn[-1]) < hi - 1.0:
+        raise ValueError(
+            f"spectrum axis {float(wn[0]):.1f}-{float(wn[-1]):.1f} cm-1 "
+            f"does not cover the model's wavenumber range "
+            f"{lo:.1f}-{hi:.1f} — interpolation would fabricate the "
+            f"missing region")
     y = np.interp(grid, wn, it)
     params = _as_params(bundle["prep_params"])
     # apply the crop range exactly as at training time (the model expects

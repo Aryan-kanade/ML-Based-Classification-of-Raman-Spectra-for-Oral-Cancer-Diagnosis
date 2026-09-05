@@ -3,7 +3,7 @@ gui.py — user-friendly Qt main window with sidebar wizard navigation
 (PyQt5 / PyQt6 / PySide6 via qt_compat).
 
 Pages (left sidebar steps):
-  Start        — welcome, progress checklist, one-click actions
+  Start        — welcome, progress checklist, quick actions
   Data         — load a folder of spectra, fix class labels
   Preprocess   — tune the Raman pipeline, live preview
   Train        — cross-validate the model suite, best sens/spec/F1
@@ -18,6 +18,7 @@ shortcuts, wait cursors.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import traceback
 from dataclasses import asdict
@@ -30,7 +31,7 @@ from qt_compat import (QtWidgets, QtCore, Signal, QAction, ALIGN_CENTER,
                        ALIGN_LEFT, ALIGN_RIGHT, ALIGN_VCENTER, NO_PEN,
                        PEN_DASH, PAINTER_AA, HEADER_STRETCH,
                        HEADER_RESIZE, IS_SELECTABLE,
-                       IS_ENABLED, IS_EDITABLE, QT_VERTICAL, QT_HORIZONTAL,
+                       IS_ENABLED, IS_EDITABLE, QT_HORIZONTAL,
                        BINDING, EDIT_NO, EDIT_DC, EDIT_SC, SELECT_ROWS,
                        WAIT_CURSOR, TEXT_RICH)
 
@@ -43,15 +44,21 @@ import clinical_data as cdata
 import study_stats as sstats
 from preprocessing import PreprocessParams, HAS_PYWT
 import plotting
+from plotting import (COL_ANNOT, COL_MAIN, COL_RESULT, COL_SIGN_NEG,
+                               COL_SIGN_POS, COL_ZERO)
 import ui_helpers as uh
 from ui_helpers import TIPS, STYLESHEET
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DEMO_DIR = os.path.join(APP_DIR, "demo_data")
 
 # bump when the model suite changes so saved checkbox states don't hide
 # newly added models
-SUITE_VERSION = 5
+SUITE_VERSION = 7          # 22 models (v7: +Spectral + band features;
+                           # v6 stage-2: +Sparse PLS-DA, PLS/PCA/t-test+XGB)
+
+# bump when PreprocessParams defaults change so old saved values (e.g.
+# crop 400/1800) don't silently override the new defaults
+PARAMS_VERSION = 3
 
 # every GUI log line is mirrored to a rotating session log on disk
 import logging                                    # noqa: E402
@@ -74,6 +81,13 @@ NAV_LABELS = ["Start", "Data", "Preprocess", "Train", "Predict", "Result"]
 NEXT_LABELS = ["Next: load your data  →", "Next: preprocess  →",
                "Next: train && evaluate  →", "Next: predict  →",
                "Next: final result  →", ""]
+
+
+def _bold_font():
+    f = qc.QtGui.QFont()
+    f.setBold(True)
+    f.setPointSizeF(9)
+    return f
 
 
 def sanitize(name: str) -> str:
@@ -174,9 +188,11 @@ class PipelineWorker(QtCore.QThread):
 
 
 class FuncWorker(QtCore.QThread):
-    """Run any callable off the UI thread (diagnostics buttons)."""
+    """Run any callable off the UI thread (diagnostics buttons, Model
+    Lab)."""
     done = Signal(object)
     failed = Signal(str)
+    progress = Signal(str)              # optional live status lines
 
     def __init__(self, fn, parent=None):
         super().__init__(parent)
@@ -221,8 +237,17 @@ class SeqSearchWorker(QtCore.QThread):
         self._cancel.set()
 
     def run(self):
+        # import in its OWN try: if `import sequential` fails, matching
+        # `except sequential.SearchCancelled` below would raise NameError
+        # DURING handler matching (outside any try) — the thread died
+        # without emitting `failed` and every button stayed disabled.
         try:
             import sequential
+            _cancelled = sequential.SearchCancelled
+        except Exception as imp_exc:
+            self.failed.emit(f"import sequential failed:\n{imp_exc}")
+            return
+        try:
 
             def prog(done, total, best, f1, eta):
                 self.progress.emit(
@@ -244,7 +269,7 @@ class SeqSearchWorker(QtCore.QThread):
                 cnn_epochs=cnn_eff, resume_path=self.resume_path,
                 progress_cb=prog, cancel_check=self._cancel.is_set,
                 leaderboard_cb=lambda t5: self.leaderboard.emit(t5))
-        except sequential.SearchCancelled:
+        except _cancelled:
             self.cancelled.emit()
             return
         except Exception:
@@ -305,38 +330,55 @@ class PredictWorker(QtCore.QThread):
 
     def _auto_reference(self, path: str, cache: dict):
         """
-        Margin mode on a clinical tree: build the reference from the
-        SAME patient's normal-class folder (<root>/Normal/<patient>).
-        Returns None when the tree has no matching normal side.
+        Margin mode: build the reference from the SAME patient's
+        Normal-class folder in the surrounding clinical tree. The tree
+        is discovered by walking UP from the file, so ANY input
+        selection works — whole tree, class folder, single/multiple
+        patient folders, mixed file lists, any nesting depth.
+        Returns None when no tree with a Normal side is found.
         """
         import paired as paired_mod
+        f_abs = os.path.abspath(path)
         try:
-            rel = os.path.relpath(os.path.abspath(path),
-                                  os.path.abspath(self.root))
-            parts = rel.replace("\\", "/").split("/")
-            if len(parts) < 3:
-                return None                    # not <class>/<patient>/file
-            patient = parts[-2]
-            if patient in cache:
-                return cache[patient]
-            for cls_dir in sorted(os.listdir(self.root)):
-                if not cls_dir.lower().startswith(self.NORMAL_SYNONYMS):
-                    continue
-                ref_dir = os.path.join(self.root, cls_dir, patient)
-                if not os.path.isdir(ref_dir):
-                    continue
-                ref_files = [os.path.join(ref_dir, fn)
-                             for fn in sorted(os.listdir(ref_dir))
-                             if fn.lower().endswith((".txt", ".dat",
-                                                    ".csv"))]
-                if ref_files:
-                    vec = paired_mod.reference_vector(self.bundle,
-                                                      ref_files)
-                    cache[patient] = vec
-                    return vec
-            cache[patient] = None
+            d = os.path.dirname(f_abs)
+            for _ in range(6):                 # deep trees: <=5 levels above
+                try:
+                    subs = os.listdir(d)
+                except OSError:
+                    break
+                normal_dirs = [c for c in sorted(subs)
+                               if c.lower().startswith(self.NORMAL_SYNONYMS)
+                               and os.path.isdir(os.path.join(d, c))]
+                if normal_dirs:
+                    parts = os.path.relpath(f_abs, d).replace(
+                        "\\", "/").split("/")
+                    if len(parts) >= 2:
+                        patient = parts[1]
+                        key = (d, patient)
+                        if key in cache:
+                            if cache[key] is not None:
+                                return cache[key]
+                        else:
+                            for cls_dir in normal_dirs:
+                                ref_dir = os.path.join(d, cls_dir, patient)
+                                if not os.path.isdir(ref_dir):
+                                    continue
+                                ref_files = []
+                                for dp, _dns, fns in os.walk(ref_dir):
+                                    ref_files += [
+                                        os.path.join(dp, fn)
+                                        for fn in sorted(fns)
+                                        if fn.lower().endswith(
+                                            (".txt", ".dat", ".csv"))]
+                                if ref_files:
+                                    vec = paired_mod.reference_vector(
+                                        self.bundle, ref_files)
+                                    cache[key] = vec
+                                    return vec
+                            cache[key] = None
+                d = os.path.dirname(d)
         except Exception:
-            cache[patient] = None
+            pass
         return None
 
     def run(self):
@@ -437,8 +479,34 @@ class SidebarNav(QtWidgets.QWidget):
         self.group = QtWidgets.QButtonGroup(self)
         self.group.setExclusive(True)
         self.buttons: list[QtWidgets.QPushButton] = []
+        # Segoe MDL2 glyphs (native on Windows 10/11); graceful fallback
+        glyphs = ["\ue80f", "\ue8b7", "\ue713", "\ue9d9", "\ue768",
+                  "\ue9f9"]
+        icon_font = None
+        try:
+            from qt_compat import QtGui
+            if "Segoe MDL2 Assets" in QtGui.QFontDatabase.families():
+                icon_font = "Segoe MDL2 Assets"
+        except Exception:
+            icon_font = None
         for idx, label in enumerate(NAV_LABELS):
             b = QtWidgets.QPushButton(label)
+            if icon_font:
+                # keep the label in the app font, icon in MDL2: a rich
+                # label would restyle everything, so draw the glyph into
+                # a small pixmap icon instead
+                pm = qc.QtGui.QPixmap(18, 18)
+                pm.fill(QtCore.Qt.transparent)
+                p = qc.QtGui.QPainter(pm)
+                p.setRenderHint(PAINTER_AA)
+                f = qc.QtGui.QFont(icon_font)
+                f.setPointSizeF(10.5)
+                p.setFont(f)
+                p.setPen(qc.QtGui.QColor("#64748b"))
+                p.drawText(pm.rect(), ALIGN_CENTER, glyphs[idx])
+                p.end()
+                b.setIcon(qc.QtGui.QIcon(pm))
+                b.setIconSize(QtCore.QSize(18, 18))
             b.setCheckable(True)
             b.setProperty("nav", True)
             self.group.addButton(b, idx)
@@ -933,6 +1001,14 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Raman Spectra Classifier")
         self.resize(1280, 840)
+        self.setMinimumSize(1100, 700)   # layout never collapses
+
+        # cap native-thread models app-wide: CatBoost/XGBoost/LightGBM/RF
+        # with ALL cores multiplied by CV folds OOM'd the machine
+        # ("bad allocation" killed whole runs, 2026-09-05).  Power users:
+        # set RAMAN_DEVICE=gpu before starting to keep GPU CatBoost.
+        os.environ.setdefault("RAMAN_DEVICE", "cpu")
+        self._install_excepthook()
 
         # ---- state ----
         self.spectra: list[dataset.Spectrum] = []
@@ -942,6 +1018,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._opt_worker = None
         self._pred_worker = None
         self._lc_data: tuple | None = None     # (X, y, groups) for curves
+        self._lc_data_key = None               # _data_key at train time
+        self._train_row_map: list | None = None  # OOF row -> table row
         self._lc_wn: np.ndarray | None = None  # cropped wavenumber axis
         self._pred_rows: list[tuple[str, str, float]] = []  # last predictions
         self._pred_probs: list[dict[str, float]] = []  # full per-class probs
@@ -972,6 +1050,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._seq_worker: SeqSearchWorker | None = None
         self._seq_payload: dict | None = None
         self._analysis_worker: FuncWorker | None = None
+        self._diag_panels: dict[str, tuple] = {}   # key -> (frame,canvas,cap)
+        self._winner_row = None                    # cm+roc side-by-side row
+        self._diag_queue: list = []                # serial auto-run chain
+        # debounced live preprocess preview (started by _schedule_preview)
+        self._preview_timer = QtCore.QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(350)
+        self._preview_timer.timeout.connect(self.preview_preprocess)
         self.bundle: dict | None = None
         self._loading_table = False
         self._previewed_for: str | None = None
@@ -1006,13 +1092,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 not self.log_dock.isVisible()))
         self.statusBar().addWidget(b_log)
 
-        self.log("Ready. Open your spectra folder, or use One-click "
-                 "demo on the Start page.")
+        self.log("Ready. Open your spectra folder on the Start page.")
 
-        # restore last session's data folder, if still there
+        # restore last session's data folder; on a new device (stale or
+        # missing saved path) auto-detect the dataset root instead
         self.settings.pop("files", None)          # legacy setting
         folder = self.settings.get("folder", "")
-        if folder and os.path.isdir(folder):
+        if not (folder and os.path.isdir(folder)):
+            folder = cdata.find_data_root() or ""
+        if folder:
             self.log(f"Restoring last session: {folder}")
             self.load_folder(folder, quiet=True)
         self.update_welcome()
@@ -1150,7 +1238,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack = PageStack()
         mv.addWidget(self.stack, 1)
 
-        # footer: back / next navigation
+        # footer: back / next navigation with step dots
         footer = QtWidgets.QHBoxLayout()
         footer.setSpacing(10)
         self.b_back = QtWidgets.QPushButton("Back")
@@ -1158,6 +1246,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_back.clicked.connect(self.go_back)
         footer.addWidget(self.b_back)
         footer.addStretch(1)
+        self._step_dots: list[QtWidgets.QLabel] = []
+        dots_row = QtWidgets.QWidget()
+        dots_lay = QtWidgets.QHBoxLayout(dots_row)
+        dots_lay.setContentsMargins(0, 0, 0, 0)
+        dots_lay.setSpacing(6)
+        for i in range(len(NAV_LABELS)):
+            dot = QtWidgets.QLabel("●")
+            dot.setObjectName("StepArrow")     # subdued by default
+            dot.setFixedWidth(12)
+            dots_lay.addWidget(dot)
+            self._step_dots.append(dot)
+        footer.addWidget(dots_row)
+        footer.addSpacing(6)
         self.next_btn = QtWidgets.QPushButton("")
         self.next_btn.setProperty("primary", True)
         self.next_btn.setMinimumHeight(38)
@@ -1165,6 +1266,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.next_btn.clicked.connect(self.go_next)
         footer.addWidget(self.next_btn)
         mv.addLayout(footer)
+        # Ctrl+1..6 jump straight to a page
+        _Shortcut = (getattr(qc.QtGui, "QShortcut", None)
+                     or QtWidgets.QShortcut)   # Qt5: QtWidgets
+        for i in range(len(NAV_LABELS)):
+            _Shortcut(
+                qc.QtGui.QKeySequence(f"Ctrl+{i + 1}"), self,
+                lambda i=i: self.go_to(i))
 
         hbody.addWidget(main_col, 1)
 
@@ -1190,6 +1298,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 (None, None, None),
                 ("&Load model…", self.browse_model, "Ctrl+L"),
                 ("&Save best model…", self.save_model, "Ctrl+S"),
+                (None, None, None),
+                ("&Reset session (keep training)…", self.reset_session,
+                 None),
                 (None, None, None),
                 ("E&xit", self.close, "Ctrl+Q")):
             if text is None:
@@ -1252,25 +1363,29 @@ class MainWindow(QtWidgets.QMainWindow):
         page = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(page)
         v.setSpacing(10)
+        columns = QtWidgets.QHBoxLayout()
+        columns.setSpacing(10)
 
-        # gradient hero panel with live status pills
+        # ---- left ~60%: hero + workflow step chips ----------------------
+        left_col = QtWidgets.QVBoxLayout()
+        left_col.setSpacing(10)
         hero = QtWidgets.QFrame()
         hero.setObjectName("Hero")
         hv = QtWidgets.QHBoxLayout(hero)
         hv.setContentsMargins(22, 18, 22, 18)
         hv.setSpacing(16)
-        left = QtWidgets.QVBoxLayout()
-        left.setSpacing(6)
+        hleft = QtWidgets.QVBoxLayout()
+        hleft.setSpacing(6)
         title = QtWidgets.QLabel("Raman Spectra Classifier")
         title.setObjectName("HeroTitle")
-        left.addWidget(title)
+        hleft.addWidget(title)
         sub = QtWidgets.QLabel(
             "Oral-cancer detection from SERS Raman spectra — automatically "
             "picks the model with the best <b>sensitivity, specificity and "
             "F1 score</b>.")
         sub.setObjectName("HeroSub")
         sub.setWordWrap(True)
-        left.addWidget(sub)
+        hleft.addWidget(sub)
         self.hero_pills = [uh.pill("no data", "white"),
                            uh.pill("0 classes", "white"),
                            uh.pill("0 patients", "white")]
@@ -1279,11 +1394,42 @@ class MainWindow(QtWidgets.QMainWindow):
         for p in self.hero_pills:
             pills_row.addWidget(p)
         pills_row.addStretch(1)
-        left.addSpacing(4)
-        left.addLayout(pills_row)
-        hv.addLayout(left, 1)
-        v.addWidget(hero)
+        hleft.addSpacing(4)
+        hleft.addLayout(pills_row)
+        hv.addLayout(hleft, 1)
+        glyph = QtWidgets.QLabel("〰")
+        glyph.setObjectName("HeroGlyph")
+        hv.addWidget(glyph, 0, ALIGN_VCENTER)
+        left_col.addWidget(hero, 1)
+        # the workflow, in the app's step-chip language
+        flow = QtWidgets.QHBoxLayout()
+        flow.setSpacing(4)
+        for i, step in enumerate(("Load data", "Preprocess", "Train",
+                                  "Predict", "Result")):
+            if i:
+                arrow = QtWidgets.QLabel("→")
+                arrow.setObjectName("StepArrow")
+                flow.addWidget(arrow)
+            flow.addWidget(uh.step_chip(f"{i + 1}  {step}"))
+        flow.addStretch(1)
+        left_col.addLayout(flow)
+        note = QtWidgets.QLabel(
+            "Data and settings are remembered between sessions. Move with "
+            "the sidebar, Back / Next, or Ctrl+1–6.")
+        note.setObjectName("CardHint")
+        note.setWordWrap(True)
+        left_col.addWidget(note)
+        # the F1 walkthrough, surfaced — fills the column instead of space
+        how, hov = self.card("How to use this app")
+        htxt = QtWidgets.QLabel(uh.HOW_TO)
+        htxt.setWordWrap(True)
+        hov.addWidget(htxt)
+        left_col.addWidget(how, 2)
+        columns.addLayout(left_col, 3)
 
+        # ---- right ~40%: progress + quick actions -----------------------
+        right_col = QtWidgets.QVBoxLayout()
+        right_col.setSpacing(10)
         prog, pv = self.card("Your progress")
         self.w_lbl_data = QtWidgets.QLabel("")
         self.w_lbl_model = QtWidgets.QLabel("")
@@ -1291,45 +1437,30 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in (self.w_lbl_data, self.w_lbl_model, self.w_lbl_saved):
             w.setTextFormat(TEXT_RICH)
             pv.addWidget(w)
-        v.addWidget(prog)
+            pv.addStretch(1)  # spread the three status lines
+        right_col.addWidget(prog, 1)
 
         actions, av = self.card("Quick actions")
-        grid = QtWidgets.QGridLayout()
+        act_col = QtWidgets.QVBoxLayout()
+        act_col.setSpacing(10)
         big = [("Load data folder", self.act_load_folder,
-                "Browse for the folder with your labeled spectra.", False),
-               ("Generate demo data", self.act_demo,
-                "Create a synthetic 3-class dataset to try the app.",
-                False),
-               ("One-click demo", self.quick_start,
-                "Demo data, preprocessing, model comparison, best model "
-                "— all in one go.", True),
+                "Browse for the folder with your labeled spectra.", True),
                ("Predict with saved model", self.act_predict,
                 "Skip training — load a saved model and classify new "
                 "spectra.", False)]
-        for i, (text, slot, tip, primary) in enumerate(big):
+        for text, slot, tip, primary in big:
             b = QtWidgets.QPushButton(text)
             b.setProperty("primary", primary)
             b.setMinimumHeight(46)
             b.setToolTip(tip)
             b.setCursor(qc.POINTING_HAND)
             b.clicked.connect(slot)
-            grid.addWidget(b, i // 2, i % 2)
-        grid.setVerticalSpacing(10)
-        grid.setHorizontalSpacing(10)
-        av.addLayout(grid)
-        v.addWidget(actions)
+            act_col.addWidget(b, 1)  # buttons grow into the card
+        av.addLayout(act_col)
+        right_col.addWidget(actions, 1)
+        columns.addLayout(right_col, 2)
 
-        tips, tv = self.card("Typical workflow")
-        tv.addWidget(QtWidgets.QLabel(
-            "1 Load data  →  2 check preprocessing  →  3 train & save "
-            "the best model  →  4 predict new spectra.\n"
-            "Use the sidebar (or Back / Next below) to move between "
-            "steps. Data and settings are remembered."))
-        tv.addWidget(QtWidgets.QLabel(
-            "Note: the demo dataset is synthetic — load your real "
-            "labeled data for actual results."))
-        v.addWidget(tips)
-        v.addStretch(1)
+        v.addLayout(columns, 1)  # columns take all extra height — no void
         return page
 
     # ------------------------------------------------------------- Data page
@@ -1368,10 +1499,11 @@ class MainWindow(QtWidgets.QMainWindow):
         tbl_card, tv = self.card("Spectra && classes")
         self.table = QtWidgets.QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["File", "Patient", "Class (double-click to edit)", "Points",
+            ["File", "Patient", "Class", "Points",
              "WN min", "WN max", "Quality"])
         self.table.horizontalHeader().setSectionResizeMode(0, HEADER_STRETCH)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(26)
         self.table.setEditTriggers(EDIT_DC | EDIT_SC)
         self.table.setSelectionBehavior(SELECT_ROWS)
         self.table.setAlternatingRowColors(True)
@@ -1390,6 +1522,12 @@ class MainWindow(QtWidgets.QMainWindow):
                           "in the plot.")
         b_plot.clicked.connect(self.plot_selected)
         row.addWidget(b_plot)
+        b_view = QtWidgets.QPushButton("View file…")
+        b_view.setToolTip("Inspect one file at a time — step through the "
+                          "dataset with Prev/Next and see raw vs "
+                          "preprocessed side by side.")
+        b_view.clicked.connect(self.view_file_dialog)
+        row.addWidget(b_view)
         b_means = QtWidgets.QPushButton("Plot class means")
         b_means.clicked.connect(self.plot_class_means)
         row.addWidget(b_means)
@@ -1397,6 +1535,7 @@ class MainWindow(QtWidgets.QMainWindow):
         vv.addLayout(row)
         holder, self.data_canvas = plotting.canvas_with_toolbar(
             width=7, height=4)
+        holder.setMinimumHeight(340)    # floor like every other canvas
         vv.addWidget(holder, 1)
         mid.addWidget(view_card)
         mid.setStretchFactor(0, 3)
@@ -1407,44 +1546,98 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------ Preprocess page
     def _build_preprocess_page(self):
         page = QtWidgets.QWidget()
-        h = QtWidgets.QHBoxLayout(page)
-        h.setSpacing(10)
+        v = QtWidgets.QVBoxLayout(page)
+        v.setSpacing(10)
 
         param_card, pv = self.card("Pipeline parameters",
                                    "Defaults suit most Raman data — tweak "
-                                   "and press Preview.")
-        form = QtWidgets.QFormLayout()
-        form.setSpacing(6)
+                                   "anything, the preview below updates "
+                                   "itself.")
 
-        form.addRow(self.section_label("REGION (cm-1)"))
+        # ---- live pipeline strip: the whole effective pipeline at a glance
+        strip = QtWidgets.QHBoxLayout()
+        strip.setSpacing(4)
+        self._strip_chips: dict[str, QtWidgets.QLabel] = {}
+        for key, text in (("region", "① Region"), ("despike", "② Despike"),
+                          ("wavelet", "③ Wavelet"), ("smooth", "④ Smooth"),
+                          ("baseline", "⑤ Baseline"),
+                          ("normalize", "⑥ Normalize")):
+            if self._strip_chips:
+                arrow = QtWidgets.QLabel("→")
+                arrow.setObjectName("StepArrow")
+                strip.addWidget(arrow)
+            chip = uh.step_chip(text)
+            self._strip_chips[key] = chip
+            strip.addWidget(chip)
+        strip.addStretch(1)
+        pv.addLayout(strip)
+
+        grid = QtWidgets.QGridLayout()
+        grid.setSpacing(10)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        self._panel_headers: dict[int, tuple] = {}   # num -> (label, base)
+
+        def _hbox(*widgets):
+            r = QtWidgets.QHBoxLayout()
+            r.setSpacing(6)
+            for w in widgets:
+                r.addWidget(w)
+            r.addStretch(1)
+            wrap = QtWidgets.QWidget()
+            wrap.setLayout(r)
+            return wrap
+
+        def panel(num, title, *rows):
+            """Bordered step panel: numbered header + a proper two-column
+            FORM — full label words on the left, fields on the right, so
+            nothing ever truncates.  Rows are ("Label", widgets...)
+            tuples or a single spanning widget (checkboxes)."""
+            frame = QtWidgets.QFrame()
+            frame.setObjectName("DiagPanel")
+            p = QtWidgets.QVBoxLayout(frame)
+            p.setContentsMargins(12, 8, 12, 10)
+            p.setSpacing(7)
+            head = QtWidgets.QLabel(f"{num} · {title}")
+            head.setObjectName("SectionLabel")
+            p.addWidget(head)
+            self._panel_headers[num] = (head, f"{num} · {title}")
+            form = QtWidgets.QFormLayout()
+            form.setSpacing(7)
+            for row in rows:
+                if isinstance(row, tuple):
+                    field = (row[1] if len(row) == 2 else _hbox(*row[1:]))
+                    form.addRow(row[0] + ":", field)
+                else:
+                    form.addRow(row)          # spanning widget
+            p.addLayout(form)
+            frame.setMinimumWidth(300)   # labels can never be squeezed out
+            return frame
+
+        # ---- region ---------------------------------------------------
         self.spin_crop_min = QtWidgets.QDoubleSpinBox()
         self.spin_crop_min.setRange(0, 5000)
         self.spin_crop_min.setDecimals(0)
         self.spin_crop_min.setSingleStep(50)
-        self.spin_crop_min.setValue(400)
+        self.spin_crop_min.setValue(500)
         self.spin_crop_min.setToolTip(
-            "Keep only this wavenumber range (0 = no limit). The "
-            "fingerprint region 400-1800 usually works best — outside it "
-            "the signal is mostly noise.")
+            "Keep only this wavenumber range (0 = no limit). The default "
+            "500-2000 is the tuned working range — widen to 15-3862 to "
+            "use the whole spectrum.")
         self.spin_crop_max = QtWidgets.QDoubleSpinBox()
         self.spin_crop_max.setRange(0, 5000)
         self.spin_crop_max.setDecimals(0)
         self.spin_crop_max.setSingleStep(50)
-        self.spin_crop_max.setValue(1800)
+        self.spin_crop_max.setValue(2000)
         self.spin_crop_max.setToolTip(
             "Upper end of the kept range (0 = no limit).")
-        crop_row = QtWidgets.QHBoxLayout()
-        crop_row.setContentsMargins(0, 0, 0, 0)
-        crop_row.addWidget(self.spin_crop_min)
-        crop_row.addWidget(QtWidgets.QLabel("to"))
-        crop_row.addWidget(self.spin_crop_max)
-        wrap = QtWidgets.QWidget()
-        wrap.setLayout(crop_row)
-        form.addRow("Keep range", wrap)
+        grid.addWidget(panel(
+            1, "REGION (cm-1)",
+            ("Keep range", self.spin_crop_min, QtWidgets.QLabel("to"),
+             self.spin_crop_max)), 0, 0)
 
-        form.addRow(self.section_label("DENOISING"))
-        self.chk_despike = QtWidgets.QCheckBox(
-            "Despike cosmic rays (Whitaker-Hayes)")
+        # ---- denoising: one line per stage ----------------------------
+        self.chk_despike = QtWidgets.QCheckBox("Despike cosmic rays")
         self.chk_despike.setChecked(False)
         self.chk_despike.setToolTip(
             "Repairs single-point cosmic-ray spikes (Whitaker & Hayes "
@@ -1452,14 +1645,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "not recoverable this way — EXCLUDING them scored better, so "
             "despiking is off by default and spiked spectra are excluded "
             "(Quality column) instead.")
-        form.addRow(self.chk_despike)
         self.spin_despike_z = QtWidgets.QDoubleSpinBox()
         self.spin_despike_z.setRange(3.0, 20.0)
         self.spin_despike_z.setSingleStep(0.5)
         self.spin_despike_z.setValue(7.0)
         self.spin_despike_z.setToolTip("Spike sensitivity: lower = more "
                                        "aggressive (7 is the paper default).")
-        form.addRow("Spike Z threshold", self.spin_despike_z)
         self.chk_wavelet = QtWidgets.QCheckBox("Wavelet denoising")
         self.chk_wavelet.setChecked(True)
         self.chk_wavelet.setEnabled(HAS_PYWT)
@@ -1467,102 +1658,318 @@ class MainWindow(QtWidgets.QMainWindow):
         if not HAS_PYWT:
             self.chk_wavelet.setToolTip("PyWavelets not installed "
                                         "(pip install PyWavelets)")
-        form.addRow(self.chk_wavelet)
         self.combo_wavelet = QtWidgets.QComboBox()
         self.combo_wavelet.addItems(["sym4", "sym6", "sym8", "db4", "db6",
-                                     "coif3", "coif5"])
+                                     "coif5"])
         self.combo_wavelet.setCurrentIndex(
             self.combo_wavelet.findText("sym8"))  # match PreprocessParams
-        self.combo_wavelet.setToolTip(TIPS["wavelet_name"])
-        form.addRow("Wavelet", self.combo_wavelet)
+        self.combo_wavelet.setToolTip(TIPS["wavelet_name"]
+                                      + "\ncoif5: the internship report's "
+                                        "choice (good on peak mixtures).")
         self.spin_level = QtWidgets.QSpinBox()
         self.spin_level.setRange(1, 8)
         self.spin_level.setValue(4)
         self.spin_level.setToolTip(TIPS["level"])
-        form.addRow("Decomposition level", self.spin_level)
+        self.combo_wthresh = QtWidgets.QComboBox()
+        self.combo_wthresh.addItems(["universal", "bayes", "sure"])
+        self.combo_wthresh.setToolTip(
+            "Threshold rule for the wavelet shrinkage.\n"
+            "universal: one fixed threshold (VisuShrink) — safe, can "
+            "over-smooth small peaks.\nbayes: adaptive per level "
+            "(BayesShrink) — measured best noise cut here.\nsure: adaptive "
+            "per level via Stein's Unbiased Risk Estimate (the internship "
+            "report's method).")
+        self.combo_wmode = QtWidgets.QComboBox()
+        self.combo_wmode.addItems(["soft", "hard", "garrote"])
+        self.combo_wmode.setToolTip(
+            "How coefficients shrink:\nsoft — smooth, slight peak-height "
+            "bias.\nhard — keeps peak heights, can ring.\ngarrote — between "
+            "the two (Gao 1998); keeps weak peaks best.")
+        self.spin_wcycle = QtWidgets.QSpinBox()
+        self.spin_wcycle.setRange(0, 5)
+        self.spin_wcycle.setValue(0)
+        self.spin_wcycle.setToolTip(
+            "Cycle-spinning (0 = off): average the denoising over +-N "
+            "circular shifts — translation-invariant, removes wiggle "
+            "artifacts near peaks at 2N+1x the cost.")
+        grid.addWidget(panel(
+            2, "DENOISING",
+            self.chk_despike,
+            ("Spike Z threshold", self.spin_despike_z),
+            self.chk_wavelet,
+            ("Wavelet", self.combo_wavelet),
+            ("Decomposition level", self.spin_level),
+            ("Threshold rule", self.combo_wthresh),
+            ("Shrinkage mode", self.combo_wmode),
+            ("Cycle-spin shifts", self.spin_wcycle)), 0, 1)
 
-        form.addRow(self.section_label("SMOOTHING"))
+        # ---- one line: smoothing · baseline · normalization ------------
         self.spin_sg_window = QtWidgets.QSpinBox()
         self.spin_sg_window.setRange(5, 51)
         self.spin_sg_window.setSingleStep(2)
         self.spin_sg_window.setValue(11)
         self.spin_sg_window.setToolTip(TIPS["sg_window"])
-        form.addRow("Savitzky–Golay window", self.spin_sg_window)
         self.spin_sg_poly = QtWidgets.QSpinBox()
         self.spin_sg_poly.setRange(1, 5)
         self.spin_sg_poly.setValue(3)
         self.spin_sg_poly.setToolTip(TIPS["sg_poly"])
-        form.addRow("SG polynomial order", self.spin_sg_poly)
         self.combo_deriv = QtWidgets.QComboBox()
-        self.combo_deriv.addItems(["0 (smooth only)", "1 (1st derivative)",
-                                   "2 (2nd derivative)"])
-        self.combo_deriv.setToolTip(TIPS["deriv"])
-        form.addRow("SG derivative", self.combo_deriv)
-
-        form.addRow(self.section_label("BASELINE"))
+        self.combo_deriv.addItems(["0", "1", "2"])
+        self.combo_deriv.setToolTip(
+            TIPS["deriv"] + "\n0 = smooth only · 1 = 1st derivative · "
+            "2 = 2nd derivative")
         self.combo_baseline = QtWidgets.QComboBox()
-        self.combo_baseline.addItems(["als", "arpls"])
+        self.combo_baseline.addItems(["als", "arpls", "iarpls", "pspline",
+                                      "snip"])
         self.combo_baseline.setToolTip(
             "ALS: Eilers & Boelens asymmetric least squares (fast).\n"
-            "arpls: asymmetrically reweighted PLS (Baek 2015) — usually "
-            "handles broad fluorescence humps better.")
+            "arpls: asymmetrically reweighted PLS (Baek 2015).\n"
+            "iarpls: improved arPLS (Ye 2020) — best on steep fluorescent "
+            "decays.\npspline: penalized-spline arPLS — smoothest baseline."
+            "\nsnip: statistics of non-negativity — fast, conservative.\n"
+            "(arpls/iarpls/pspline/snip need pybaselines; λ used where "
+            "applicable)")
         if not preprocessing.HAS_PYBASELINES:
-            self.combo_baseline.setItemText(1, "arpls (needs pybaselines)")
-        form.addRow("Method", self.combo_baseline)
+            for i in range(1, 5):
+                self.combo_baseline.setItemText(
+                    i, self.combo_baseline.itemText(i)
+                    + " (needs pybaselines)")
         self.spin_lambda_exp = QtWidgets.QSpinBox()
         self.spin_lambda_exp.setRange(2, 9)
         self.spin_lambda_exp.setValue(5)
         self.spin_lambda_exp.setToolTip(TIPS["als_lambda"])
-        form.addRow("ALS lambda (10^)", self.spin_lambda_exp)
         self.spin_als_p = QtWidgets.QDoubleSpinBox()
         self.spin_als_p.setRange(0.001, 0.5)
         self.spin_als_p.setDecimals(3)
         self.spin_als_p.setSingleStep(0.005)
         self.spin_als_p.setValue(0.01)
         self.spin_als_p.setToolTip(TIPS["als_p"])
-        form.addRow("ALS p (asymmetry)", self.spin_als_p)
         self.spin_als_iter = QtWidgets.QSpinBox()
         self.spin_als_iter.setRange(5, 30)
         self.spin_als_iter.setValue(10)
         self.spin_als_iter.setToolTip(TIPS["als_niter"])
-        form.addRow("ALS iterations", self.spin_als_iter)
-
-        form.addRow(self.section_label("NORMALIZATION"))
         self.combo_norm = QtWidgets.QComboBox()
-        self.combo_norm.addItems(["vector", "snv", "none"])
-        self.combo_norm.setToolTip(TIPS["norm"])
-        form.addRow("Method", self.combo_norm)
+        self.combo_norm.addItems(["vector", "snv", "area", "minmax", "none"])
+        self.combo_norm.setToolTip(TIPS["norm"]
+                                   + "\narea: unit integrated intensity.\n"
+                                     "minmax: rescale to [0,1] (sensitive "
+                                     "to spikes).")
+        self.chk_detrend = QtWidgets.QCheckBox("Remove linear trend first")
+        self.chk_detrend.setToolTip(
+            "Subtract a least-squares straight line before denoising — "
+            "cleans broad fluorescence slope that baseline methods can "
+            "leave behind.")
+        self.chk_wncal = QtWidgets.QCheckBox("Align on Phe-1003 band")
+        self.chk_wncal.setToolTip(
+            "Wavenumber calibration: shift every spectrum so its "
+            "phenylalanine ~1003 cm-1 band sits on the cohort median "
+            "position (icoshift-style single anchor). Literature: axis "
+            "alignment mattered more than any intensity normalization.")
+        grid.addWidget(panel(
+            3, "SMOOTHING",
+            ("Savitzky–Golay window", self.spin_sg_window),
+            ("SG polynomial order", self.spin_sg_poly),
+            ("SG derivative", self.combo_deriv)), 1, 0)
+        grid.addWidget(panel(
+            4, "BASELINE",
+            ("Method", self.combo_baseline),
+            ("ALS lambda (10^n)", self.spin_lambda_exp),
+            ("ALS p (asymmetry)", self.spin_als_p),
+            ("ALS iterations", self.spin_als_iter)), 1, 1)
+        grid.addWidget(panel(
+            5, "NORMALIZE & ALIGN",
+            ("Method", self.combo_norm),
+            self.chk_detrend,
+            self.chk_wncal), 2, 0)
 
+        # ---- changes & reset panel fills the last slot ------------------
+        reset_frame = QtWidgets.QFrame()
+        reset_frame.setObjectName("DiagPanel")
+        rp = QtWidgets.QVBoxLayout(reset_frame)
+        rp.setContentsMargins(12, 8, 12, 10)
+        rp.setSpacing(7)
+        rhead = QtWidgets.QLabel("6 · CHANGES & RESET")
+        rhead.setObjectName("SectionLabel")
+        rp.addWidget(rhead)
+        self.params_diff_label = QtWidgets.QLabel(
+            "All parameters match the defaults.")
+        self.params_diff_label.setObjectName("CardHint")
+        self.params_diff_label.setWordWrap(True)
+        rp.addWidget(self.params_diff_label)
+        self.b_params_reset = QtWidgets.QPushButton("↺ Reset to defaults")
+        self.b_params_reset.setToolTip("Restore every preprocessing "
+                                       "parameter to its default value.")
+        self.b_params_reset.clicked.connect(self.reset_params)
+        rp.addWidget(self.b_params_reset)
+        b_saliva = QtWidgets.QPushButton("🧪 Saliva preset")
+        b_saliva.setToolTip(
+            "Saliva-SERS preset (the review-endorsed leading biofluid): "
+            "wide crop 400–2300 so the thiocyanate 2100–2136 QC band is "
+            "measured, despiking on, fast SNIP baseline, SNV norm.")
+        b_saliva.clicked.connect(
+            lambda: self._apply_params(
+                asdict(preprocessing.PreprocessParams.saliva())))
+        rp.addWidget(b_saliva)
+        rp.addStretch(1)
+        reset_frame.setMinimumWidth(300)
+        grid.addWidget(reset_frame, 2, 1)
+
+        # smart enabling: dependent fields gray out when their step is off
+        self.spin_despike_z.setEnabled(self.chk_despike.isChecked())
+        self.chk_despike.toggled.connect(
+            lambda on: self.spin_despike_z.setEnabled(on))
+        self.chk_wavelet.toggled.connect(lambda on: (
+            self.combo_wavelet.setEnabled(on and HAS_PYWT),
+            self.spin_level.setEnabled(on and HAS_PYWT)))
+
+        # ---- actions: full-width row BELOW the panels --------------------
+        pv.addLayout(grid)
+        btns = QtWidgets.QHBoxLayout()
         b_preview = QtWidgets.QPushButton("Preview spectrum")
         b_preview.setProperty("primary", True)
-        b_preview.setToolTip("Show raw vs preprocessed for the spectrum "
-                             "selected in the Data page.")
+        b_preview.setToolTip("One row per class (e.g. Normal and Tumor): "
+                             "raw vs preprocessed. A spectrum selected on "
+                             "the Data page represents its class. The "
+                             "preview also refreshes by itself after "
+                             "every parameter change.")
         b_preview.clicked.connect(self.preview_preprocess)
-        form.addRow(b_preview)
+        btns.addWidget(b_preview, 1)
         b_optimize = QtWidgets.QPushButton("Optimize preprocessing")
         b_optimize.setToolTip(
             "Tries crop-range / derivative / normalization combinations "
             "under patient-grouped cross-validation and applies the best "
             "one. Typically 1-3 minutes.")
         b_optimize.clicked.connect(self.run_optimize)
-        form.addRow(b_optimize)
+        btns.addWidget(b_optimize, 1)
+        pv.addLayout(btns)
         self.optimize_status = QtWidgets.QLabel(
             "Optimize tries combinations on your data and applies the "
             "winner (grouped CV, no leakage).")
         self.optimize_status.setObjectName("CardHint")
         self.optimize_status.setWordWrap(True)
         pv.addWidget(self.optimize_status)
-        pv.addLayout(form)
-        h.addWidget(param_card, 1)
+
+        # ---- live preview: any parameter tweak redraws (debounced) --
+        for w in (self.spin_crop_min, self.spin_crop_max, self.chk_despike,
+                  self.spin_despike_z, self.chk_wavelet, self.combo_wavelet,
+                  self.spin_level, self.spin_sg_window, self.spin_sg_poly,
+                  self.combo_deriv, self.combo_baseline,
+                  self.spin_lambda_exp, self.spin_als_p,
+                  self.spin_als_iter, self.combo_norm):
+            if isinstance(w, QtWidgets.QCheckBox):
+                w.toggled.connect(self._schedule_preview)
+            elif isinstance(w, QtWidgets.QComboBox):
+                w.currentIndexChanged.connect(self._schedule_preview)
+            else:
+                w.valueChanged.connect(self._schedule_preview)
 
         prev_card, cv = self.card("Preview",
-                                  "Left: raw on the common grid · "
-                                  "right: after the pipeline.")
+                                  "One row per class: raw (left) · after "
+                                  "the pipeline (right). The graph fills "
+                                  "the page width and updates itself "
+                                  "whenever you change a parameter.")
         holder, self.prep_canvas = plotting.canvas_with_toolbar(
-            width=9, height=5)
+            width=11, height=5)
+        self.prep_canvas.setMinimumHeight(400)   # keep rows readable
         cv.addWidget(holder, 1)
-        h.addWidget(prev_card, 3)
+        v.addWidget(param_card)
+        v.addWidget(prev_card)
+        self._update_pipeline_strip()
+        self._draw_prep_empty_state()
         return page
+
+    def _draw_prep_empty_state(self):
+        """Friendly placeholder until data is loaded."""
+        if self.spectra:
+            return
+        ax = plotting.clear(self.prep_canvas)
+        ax.text(0.5, 0.5, "Load data on the Data page —\nthe live preview "
+                "appears here as you tune the pipeline.",
+                ha="center", va="center", transform=ax.transAxes,
+                color=plotting.COL_RAW, fontsize=11)
+        ax.set_axis_off()
+        self.prep_canvas.draw_idle()
+
+    def _update_pipeline_strip(self):
+        """Refresh the live step chips over the parameter panels."""
+        chips = getattr(self, "_strip_chips", {})
+        if not chips:
+            return
+        wave_on = self.chk_wavelet.isChecked() and HAS_PYWT
+        vals = {
+            "region": (f"① Region {self.spin_crop_min.value():.0f}–"
+                       f"{self.spin_crop_max.value():.0f}", False),
+            "despike": ("② Despike " + (f"z {self.spin_despike_z.value():.1f}"
+                         if self.chk_despike.isChecked() else "off"),
+                        not self.chk_despike.isChecked()),
+            "wavelet": ("③ Wavelet " + (
+                        f"{self.combo_wavelet.currentText()}"
+                        f"·{self.spin_level.value()}"
+                        f" {self.combo_wthresh.currentText()}/"
+                        f"{self.combo_wmode.currentText()}"
+                        + (f" ⟲{self.spin_wcycle.value()}"
+                           if self.spin_wcycle.value() else "")
+                        if wave_on else "off"),
+                        not wave_on),
+            "smooth": (f"④ Smooth SG {self.spin_sg_window.value()}/"
+                       f"{self.spin_sg_poly.value()}·d"
+                       f"{self.combo_deriv.currentIndex()}", False),
+            "baseline": (f"⑤ Baseline {self.combo_baseline.currentText()} "
+                         f"λ10^{self.spin_lambda_exp.value()}", False),
+            "normalize": ("⑥ Normalize " + self.combo_norm.currentText(),
+                          self.combo_norm.currentText() == "none"),
+        }
+        for key, (text, is_off) in vals.items():
+            chip = chips.get(key)
+            if chip is not None:
+                chip.setText(text)
+                chip.setProperty("tone", "off" if is_off else "")
+                uh.repolish(chip)
+        self._update_modified_markers()
+
+    def _update_modified_markers(self):
+        """Amber 'modified' markers on panels whose values differ from
+        the PreprocessParams defaults + the CHANGES & RESET summary."""
+        try:
+            cur = asdict(self.read_params())
+            defaults = asdict(PreprocessParams())
+            diff = {k for k, v in defaults.items() if cur.get(k) != v}
+        except Exception:
+            diff = set()
+        groups = {1: ("crop_min", "crop_max"),
+                  2: ("despike", "despike_z", "wavelet", "wavelet_name",
+                      "wavelet_level"),
+                  3: ("sg_window", "sg_poly", "sg_deriv"),
+                  4: ("baseline_method", "als_lambda", "als_p",
+                      "als_niter"),
+                  5: ("norm",)}
+        for num, keys in groups.items():
+            entry = getattr(self, "_panel_headers", {}).get(num)
+            if entry is None:
+                continue
+            head, base = entry
+            head.setText(base + ("   • modified"
+                                 if diff & set(keys) else ""))
+        lbl = getattr(self, "params_diff_label", None)
+        if lbl is not None:
+            nice = {"crop_min": "region", "crop_max": "region",
+                    "despike": "despike", "despike_z": "despike",
+                    "wavelet": "wavelet", "wavelet_name": "wavelet",
+                    "wavelet_level": "wavelet", "sg_window": "smoothing",
+                    "sg_poly": "smoothing", "sg_deriv": "smoothing",
+                    "baseline_method": "baseline",
+                    "als_lambda": "baseline", "als_p": "baseline",
+                    "als_niter": "baseline", "norm": "normalization"}
+            changed = sorted({nice.get(k, k) for k in diff})
+            lbl.setText("Modified vs defaults: " + ", ".join(changed)
+                        if changed else
+                        "All parameters match the defaults.")
+
+    def reset_params(self):
+        """Restore every preprocessing parameter to its default value."""
+        self._apply_params(asdict(PreprocessParams()))
+        self._update_pipeline_strip()
+        self.log("Preprocessing parameters reset to defaults.")
 
     # ---------------------------------------------------------- Train page
     def _build_train_page(self):
@@ -1572,15 +1979,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---- left: controls ----
         ctrl, cv = self.card("Controls")
+        cv.addWidget(self.section_label("1 · MODE"))
         cv.addWidget(QtWidgets.QLabel("Classification mode:"))
         self.combo_mode = QtWidgets.QComboBox()
         for label, role in (
                 ("Standard", "standard"),
                 ("Margin — vs patient's own normal", "paired"),
                 ("Margin + PQN (Dieterle 2006)", "paired-pqn"),
-                ("3SSE architecture search (standard data)",
-                 "seq-standard"),
-                ("3SSE architecture search (paired data)", "seq-paired")):
+                ("3SSE search (standard data)", "seq-standard"),
+                ("3SSE search (paired data)", "seq-paired")):
             self.combo_mode.addItem(label, role)
         self.combo_mode.insertSeparator(3)
         self.combo_mode.setToolTip(
@@ -1630,7 +2037,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sb.addWidget(self.seq_counts)
         self.b_3sse_run = QtWidgets.QPushButton(
             "Run 3SSE architecture search now")
-        self.b_3sse_run.setObjectName("Primary")
+        self.b_3sse_run.setProperty("primary", True)   # styled CTA
         self.b_3sse_run.setToolTip(
             "Runs the full search on the loaded data with the checked "
             "models (paired data when patient groups exist, standard "
@@ -1640,7 +2047,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sb.addWidget(self.b_3sse_run)
         run_row = QtWidgets.QHBoxLayout()
         self.chk_3sse_fast = QtWidgets.QCheckBox(
-            "Fast screening (2-fold, skip 1D-CNN/CatBoost/XGBoost)")
+            "Fast screening (skip slow models)")
         self.chk_3sse_fast.setToolTip(
             "Quick preset: 2-fold screening and the three slowest "
             "models skipped — several times faster, good for "
@@ -1660,24 +2067,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seq_estimate.setObjectName("CardHint")
         sb.addWidget(self.seq_estimate)
         self.seq_counter = QtWidgets.QLabel("")
-        self.seq_counter.setStyleSheet(
-            "font-size:15pt; font-weight:700; color:#312e81;")
+        self.seq_counter.setObjectName("SeqCounter")
         self.seq_phase = QtWidgets.QLabel(
             "Ready — press Run (or pick a 3SSE mode and Start training).")
         self.seq_phase.setObjectName("CardHint")
         self.seq_best = QtWidgets.QLabel("")
         self.seq_best.setWordWrap(True)
-        self.seq_best.setStyleSheet("color:#475569;")
+        self.seq_best.setObjectName("CardHint")
         sb.addWidget(self.seq_counter)
         sb.addWidget(self.seq_phase)
         sb.addWidget(self.seq_best)
         self.seq_top5 = QtWidgets.QLabel("")
         self.seq_top5.setTextFormat(QtCore.Qt.RichText)
-        self.seq_top5.setStyleSheet(
-            "color:#334155; font-family:Consolas, monospace;")
+        self.seq_top5.setObjectName("SeqTop5")
         sb.addWidget(self.seq_top5)
         self.b_3sse_view = QtWidgets.QPushButton(
-            "View saved 3SSE results (last architecture search)…")
+            "View saved 3SSE results…")
         self.b_3sse_view.setFlat(True)
         self.b_3sse_view.setToolTip(
             "Open the ranking tables (single / 2-model / 3-model layers "
@@ -1688,6 +2093,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_mode.currentIndexChanged.connect(
             self._update_seq_card)
         cv.addSpacing(4)
+        cv.addWidget(self.section_label("2 · MODELS"))
         head_row = QtWidgets.QHBoxLayout()
         head_row.addWidget(QtWidgets.QLabel(
             "Models to compare (best F1 wins):"))
@@ -1699,13 +2105,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.model_checks: dict[str, QtWidgets.QCheckBox] = {}
         grid = QtWidgets.QGridLayout()
         grid.setVerticalSpacing(2)
-        grid.setHorizontalSpacing(18)
+        grid.setHorizontalSpacing(12)
         for i, name in enumerate(modeling.ALL_MODEL_NAMES):
             cb = QtWidgets.QCheckBox(name)
             cb.setChecked(True)
             self.model_checks[name] = cb
-            grid.addWidget(cb, i // 3, i % 3)          # 3 columns
-            cb.toggled.connect(self._models_changed)
+            grid.addWidget(cb, i // 2, i % 2)          # 2 columns: keeps
+            cb.toggled.connect(self._models_changed)   # the card narrow
         cv.addLayout(grid)
         sel_row = QtWidgets.QHBoxLayout()
         for label, preset in (("All", "all"), ("None", "none"),
@@ -1727,7 +2133,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sel_row.addStretch(1)
         cv.addLayout(sel_row)
         self._models_changed()               # initial counter + 3SSE card
-        cv.addWidget(self.section_label("CROSS-VALIDATION"))
+        cv.addWidget(self.section_label("3 · CROSS-VALIDATION"))
         cv_row = QtWidgets.QHBoxLayout()
         self.spin_folds = QtWidgets.QSpinBox()
         self.spin_folds.setRange(2, 10)
@@ -1776,6 +2182,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_train.setEnabled(False)          # until data is loaded
         self.b_train.clicked.connect(self.start_training)
         cv.addWidget(self.b_train)
+        self.b_model_lab = QtWidgets.QPushButton("⚡ Model Lab (one click)")
+        self.b_model_lab.setToolTip(
+            "Runs the whole optimization program unattended: paired "
+            "preprocessing sweep → fast 3SSE architecture search → "
+            "per-layer tuning of the winning chain → seed-averaged "
+            "deployable bundle. Results appear in the Diagnostics tab.")
+        self.b_model_lab.setEnabled(False)      # until data is loaded
+        self.b_model_lab.clicked.connect(self.run_model_lab)
+        cv.addWidget(self.b_model_lab)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setValue(0)
         cv.addWidget(self.progress)
@@ -1798,17 +2213,19 @@ class MainWindow(QtWidgets.QMainWindow):
         # 3SSE power feature sits BELOW the everyday train flow
         cv.addWidget(seq_card)
         cv.addStretch(1)
-        h.addWidget(ctrl, 1)
+        h.addWidget(ctrl, 1)     # no inner scroll: the card stays narrow
 
-        # ---- right: results (banner, comparison, charts, per-class) ----
-        right = QtWidgets.QSplitter(QT_VERTICAL)
+        # ---- right: pinned Result banner + every result card stacked —
+        # all visible in one page scroll, nothing behind a tab ----
+        right = QtWidgets.QWidget()
+        rv = QtWidgets.QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(10)
 
         banner, bv = self.card("Result")
         self.banner_title = QtWidgets.QLabel(
                                   "No model trained yet — press Start training")
-        self.banner_title.setStyleSheet(
-            "font-size:13pt; font-weight:800; color:#1e3a8a; "
-            "border:none; background:transparent;")
+        self.banner_title.setObjectName("BannerTitle")
         bv.addWidget(self.banner_title)
         stats_row = QtWidgets.QHBoxLayout()
         self.stat_values: dict[str, QtWidgets.QLabel] = {}
@@ -1843,7 +2260,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chain_flow = ChainFlowWidget([])
         self.chain_flow.hide()
         bv.addWidget(self.chain_flow)
-        right.addWidget(banner)
+        rv.addWidget(banner)
 
         cmp_card, cpv = self.card("Model comparison",
                                   "Mean ± std across CV folds; cells are "
@@ -1862,20 +2279,27 @@ class MainWindow(QtWidgets.QMainWindow):
             "Sensitivity: " + TIPS["sens"] + "\nSpecificity: " +
             TIPS["spec"] + "\nF1: " + TIPS["f1"])
         cpv.addWidget(self.compare_table)
-        right.addWidget(cmp_card)
 
-        charts, chv = self.card("Confusion matrix && ROC / per-class")
+        charts, chv = self.card("Confusion matrix · ROC · diagnostics")
         lc_row = QtWidgets.QHBoxLayout()
-        b_lc = QtWidgets.QPushButton("Data value: learning curve")
+        b_lc = QtWidgets.QPushButton("Learning curve")
         b_lc.setToolTip(
             "Computes macro-F1 at 25/50/75/100% of the patients with the "
             "winning model — shows whether collecting more patients "
-            "would improve results. Draws into the right chart.")
-        b_regions = QtWidgets.QPushButton("Spectral regions that matter")
+            "would improve results. The result appears directly below.")
+        b_regions = QtWidgets.QPushButton("Region importance")
         b_regions.setToolTip(
             "RandomForest importance mapped back onto the wavenumber "
             "axis, overlaid on the class-mean spectra — shows WHERE the "
-            "discriminative signal lives. Draws into the right chart.")
+            "discriminative signal lives. The result appears directly "
+            "below.")
+        b_band = QtWidgets.QPushButton("Band agreement")
+        b_band.setToolTip(
+            "Checks the winner's discriminative wavenumbers (SHAP for "
+            "trees, VIP for PLS models, Grad-CAM for the CNN) against "
+            "the literature band table AND the internship report's "
+            "significant bands — does the model rediscover the known "
+            "biochemistry?")
         self._diag_buttons: list[QtWidgets.QPushButton] = []
 
         def diag(button, handler):
@@ -1886,8 +2310,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         chv.addWidget(self.section_label("DATA VALUE & SIGNAL"))
         lc_row = QtWidgets.QHBoxLayout()
+        b_all = QtWidgets.QPushButton("Run all diagnostics")
+        b_all.setToolTip(
+            "Runs every diagnostic one after another — each result "
+            "appears in its own panel below. The same battery also runs "
+            "automatically after every training.")
+        lc_row.addWidget(diag(b_all, self.run_all_diagnostics))
         lc_row.addWidget(diag(b_lc, self.run_learning_curve))
         lc_row.addWidget(diag(b_regions, self.run_region_importance))
+        lc_row.addWidget(diag(b_band, self.run_band_agreement))
         lc_row.addStretch(1)
         chv.addLayout(lc_row)
         chv.addWidget(self.section_label("HONEST EVALUATION & STABILITY"))
@@ -1907,6 +2338,31 @@ class MainWindow(QtWidgets.QMainWindow):
             "configuration, not repeatedly. Needs clinical data (7+ "
             "patients).")
         lc2_row.addWidget(diag(b_honest, self.run_honest_check))
+        b_perm = QtWidgets.QPushButton("Permutation AUC")
+        b_perm.setToolTip(
+            "Shuffles PATIENT-level labels and re-runs the grouped CV "
+            "(50 permutations, 3-fold): empirical p-value for the "
+            "winner's out-of-fold AUC — the hard answer to 'is the "
+            "signal real at this sample size?'. Slow on deep winners.")
+        lc2_row.addWidget(diag(b_perm, self.run_permutation_auc))
+        b_fuse = QtWidgets.QPushButton("Fuse covariates (CSV)")
+        b_fuse.setToolTip(
+            "Loads a CSV keyed by patient ID (numeric columns, e.g. "
+            "tobacco pack-years, age; one-hot sex/subsite) and tests "
+            "whether a logistic meta-model on [winner probability + "
+            "covariates] beats the probability alone under patient-"
+            "grouped CV — Hanna 2024's open gap: no study has formally "
+            "merged Raman with clinical risk factors.")
+        lc2_row.addWidget(diag(b_fuse, self.run_covariate_fusion))
+        b_labels = QtWidgets.QPushButton("Label errors (OOF)")
+        b_labels.setToolTip(
+            "Confident-learning flags from the winner's out-of-fold "
+            "probabilities: spectra whose GIVEN class scored <10% while "
+            "another scored >90% are likely mislabeled (<25%/>75% = "
+            "review). Each flagged spectrum is selected in the Data "
+            "table — double-click its Class cell to correct it, then "
+            "retrain.")
+        lc2_row.addWidget(diag(b_labels, self.run_label_error_review))
         lc2_row.addWidget(diag(b_locked, self.run_locked_eval))
         lc2_row.addStretch(1)
         chv.addLayout(lc2_row)
@@ -1916,12 +2372,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "The strictest generalization check for small paired "
             "datasets: refit the winner once per left-out PATIENT "
             "(fixed parameters) and evaluate every patient unseen. "
-            "Draws per-patient accuracy into the right chart.")
+            "The per-patient accuracy chart appears directly below.")
         b_seeds = QtWidgets.QPushButton("Seed stability")
         b_seeds.setToolTip(
             "Macro-F1 of the fixed winner across 5 CV seeds — "
             "quantifies how much the numbers move just by re-running. "
-            "Boxplot into the right chart.")
+            "The boxplot appears directly below.")
         b_noise = QtWidgets.QPushButton("Noise robustness")
         b_noise.setToolTip(
             "Adds calibrated measurement noise (1/2/5% of signal "
@@ -1932,15 +2388,12 @@ class MainWindow(QtWidgets.QMainWindow):
         deep_row.addWidget(diag(b_noise, self.run_noise_check))
         deep_row.addStretch(1)
         chv.addLayout(deep_row)
-        plots = QtWidgets.QSplitter(QT_HORIZONTAL)
-        cm_holder, self.cm_canvas = plotting.canvas_with_toolbar(
-            width=5, height=4)
-        roc_holder, self.roc_canvas = plotting.canvas_with_toolbar(
-            width=5, height=4)
-        plots.addWidget(cm_holder)
-        plots.addWidget(roc_holder)
-        chv.addWidget(plots)
-        right.addWidget(charts)
+        # results appear INLINE below the buttons — one persistent panel
+        # per training/diagnostic result (nothing overwritten, nothing on
+        # another page); the card grows and the page scrolls
+        self.diag_stack = QtWidgets.QVBoxLayout()
+        self.diag_stack.setSpacing(10)
+        chv.addLayout(self.diag_stack)
 
         # biochemistry: what the signal is MADE of (proteins, nucleic
         # acids, collagen, keratin) and whether the model's bands match
@@ -1984,9 +2437,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bio_table.verticalHeader().setVisible(False)
         self.bio_table.setEditTriggers(EDIT_NO)
         self.bio_table.setAlternatingRowColors(True)
-        self.bio_table.setMaximumHeight(180)
+        self.bio_table.setMaximumHeight(220)
         bcv.addWidget(self.bio_table)
-        right.addWidget(bio_card)
 
         pc_card, pcv = self.card("Per-class metrics")
         self.perclass_table = QtWidgets.QTableWidget(0, 6)
@@ -1999,31 +2451,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.perclass_table.setEditTriggers(EDIT_NO)
         self.perclass_table.setAlternatingRowColors(True)
         pcv.addWidget(self.perclass_table)
-        right.addWidget(pc_card)
 
-        right.setStretchFactor(0, 3)
-        right.setStretchFactor(1, 3)
-        right.setStretchFactor(2, 3)
-        right.setStretchFactor(3, 4)
-        right.setStretchFactor(4, 2)
-        right.setSizes([240, 220, 220, 260, 160])
+        # every result card stacked in the column — one page scroll shows
+        # all graphs, no tab switching
+        rv.addWidget(charts)
+        rv.addWidget(cmp_card)
+        rv.addWidget(pc_card)
+        rv.addWidget(bio_card)
+        rv.addStretch(1)
         h.addWidget(right, 3)
         return page
 
     # -------------------------------------------------------- Predict page
     def _build_predict_page(self):
         page = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(page)
-        v.setSpacing(10)
+        h = QtWidgets.QHBoxLayout(page)
+        h.setSpacing(12)
 
-        hint = QtWidgets.QLabel(
-            "After predicting, the app jumps to the Result page with the "
-            "final verdict, the full prediction table and validation "
-            "charts.")
-        hint.setObjectName("CardHint")
-        hint.setWordWrap(True)
-        v.addWidget(hint)
-
+        # ---- left column: setup -------------------------------------------
+        left = QtWidgets.QVBoxLayout()
+        left.setSpacing(10)
         g, gv = self.card("1 — Trained model")
         row = QtWidgets.QHBoxLayout()
         self.model_path_edit = QtWidgets.QLineEdit()
@@ -2038,12 +2485,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.model_info.setWordWrap(True)
         self.model_info.setTextFormat(TEXT_RICH)
         gv.addWidget(self.model_info)
-        v.addWidget(g)
-
         # paired-reference row (visible only for paired-trained models)
         self.ref_row_widget = QtWidgets.QWidget()
         rr = QtWidgets.QHBoxLayout(self.ref_row_widget)
-        rr.setContentsMargins(0, 4, 0, 0)
+        rr.setContentsMargins(0, 6, 0, 0)
         rr.addWidget(QtWidgets.QLabel("Normal reference:"))
         self.ref_path_edit = QtWidgets.QLineEdit()
         self.ref_path_edit.setReadOnly(True)
@@ -2054,17 +2499,23 @@ class MainWindow(QtWidgets.QMainWindow):
         b_ref.clicked.connect(self.browse_reference)
         rr.addWidget(b_ref)
         self.ref_row_widget.setVisible(False)
-        v.addWidget(self.ref_row_widget)
+        gv.addWidget(self.ref_row_widget)
+        left.addWidget(g)
 
         g2, g2v = self.card("2 — Spectra to classify",
                             "Pick a folder of spectra or individual "
                             ".txt / .dat / .csv files — every spectrum "
-                            "is classified.")
+                            "is classified. Clinical trees auto-find each "
+                            "patient's normal reference for margin models.")
         row2 = QtWidgets.QHBoxLayout()
         self.spec_path_edit = QtWidgets.QLineEdit()
-        self.spec_path_edit.setReadOnly(True)
         self.spec_path_edit.setPlaceholderText(
-            "folder or spectrum file(s) to classify …")
+            "paste a folder path (or files separated by ;) — or use "
+            "Browse…")
+        self.spec_path_edit.textChanged.connect(
+            lambda _: self.b_predict.setEnabled(
+                bool(self.spec_path_edit.text().strip()) and self.bundle
+                is not None))
         row2.addWidget(self.spec_path_edit, 1)
         b_spec = QtWidgets.QPushButton("Browse folder…")
         b_spec.clicked.connect(self.browse_spectra)
@@ -2074,33 +2525,91 @@ class MainWindow(QtWidgets.QMainWindow):
                                 "instead of a whole folder.")
         b_spec_files.clicked.connect(self.browse_spectra_files)
         row2.addWidget(b_spec_files)
+        g2v.addLayout(row2)
         self.b_predict = QtWidgets.QPushButton("Predict")
         self.b_predict.setProperty("primary", True)
+        self.b_predict.setMinimumHeight(34)
         self.b_predict.setEnabled(False)
         self.b_predict.setToolTip(TIPS["predict"])
         self.b_predict.clicked.connect(self.run_prediction)
-        row2.addWidget(self.b_predict)
-        g2v.addLayout(row2)
-        v.addWidget(g2)
+        g2v.addWidget(self.b_predict)
+        self.b_live = QtWidgets.QPushButton("⏺ Live folder")
+        self.b_live.setCheckable(True)
+        self.b_live.setToolTip(
+            "Watch the chosen spectra folder and re-classify "
+            "automatically whenever new files land there — the clinical "
+            "acquisition rhythm (0.1–1 s/spectrum) with sub-100 ms "
+            "inference.")
+        self.b_live.toggled.connect(self._toggle_live_watch)
+        g2v.addWidget(self.b_live)
+        left.addWidget(g2)
+        # compact explainer fills the column instead of empty space
+        pair, paiv = self.card("How margin mode works")
+        ptxt = QtWidgets.QLabel(
+            "Margin mode compares each spectrum against the SAME "
+            "patient's normal reference — the prediction measures change "
+            "from that patient's own baseline, cancelling person-to-person "
+            "differences.\n\nLeave the reference empty: for clinical trees "
+            "the matching Normal folder is found automatically.")
+        ptxt.setObjectName("CardHint")
+        ptxt.setWordWrap(True)
+        paiv.addWidget(ptxt)
+        left.addWidget(pair)
+        left.addStretch(1)
+        lw = QtWidgets.QWidget()
+        lw.setLayout(left)
 
-        res, rv = self.card("3 — Result")
-        splitter = QtWidgets.QSplitter(QT_HORIZONTAL)
+        # ---- right column: live results ------------------------------------
+        right = QtWidgets.QVBoxLayout()
+        right.setSpacing(10)
+        res, rv = self.card("3 — Predictions",
+                            "During prediction: the first classified "
+                            "spectrum · after: every trace, the class "
+                            "counts and the full table.")
+        # live summary pills + status live INSIDE the predictions card
+        pills_row = QtWidgets.QHBoxLayout()
+        pills_row.setSpacing(8)
+        self.pred_pills = [uh.pill("—", "indigo"),
+                           uh.pill("—", "green"), uh.pill("—", "green")]
+        for p in self.pred_pills:
+            p.setVisible(False)
+            pills_row.addWidget(p)
+        pills_row.addStretch(1)
+        rv.addLayout(pills_row)
+        self.predict_status = QtWidgets.QLabel(
+            "Load a model and pick spectra — predictions appear here "
+            "live. Use the toolbar above the chart to zoom and pan.")
+        self.predict_status.setObjectName("CardHint")
+        self.predict_status.setWordWrap(True)
+        rv.addWidget(self.predict_status)
         pred_holder, self.pred_canvas = plotting.canvas_with_toolbar(
-            width=6, height=4)
-        splitter.addWidget(pred_holder)
-        self.pred_table = QtWidgets.QTableWidget(0, 3)
+            width=8, height=4.5)
+        pred_holder.setMinimumHeight(300)
+        rv.addWidget(pred_holder, 1)
+        self.pred_table = QtWidgets.QTableWidget(0, 5)
         self.pred_table.setHorizontalHeaderLabels(
-            ["File", "Prediction", "P(prediction)"])
+            ["File", "Prediction", "Triage", "Probability", "Set 90%"])
         self.pred_table.horizontalHeader().setSectionResizeMode(
             0, HEADER_STRETCH)
+        for col in (1, 2, 3, 4):
+            self.pred_table.horizontalHeader().setSectionResizeMode(
+                col, HEADER_RESIZE)
         self.pred_table.verticalHeader().setVisible(False)
+        self.pred_table.verticalHeader().setDefaultSectionSize(26)
         self.pred_table.setEditTriggers(EDIT_NO)
         self.pred_table.setAlternatingRowColors(True)
-        splitter.addWidget(self.pred_table)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        rv.addWidget(splitter, 1)
-        v.addWidget(res, 1)
+        self.pred_table.setMinimumHeight(160)
+        rv.addWidget(self.pred_table)
+        right.addWidget(res, 1)
+        rw = QtWidgets.QWidget()
+        rw.setLayout(right)
+        split = QtWidgets.QSplitter(QT_HORIZONTAL)
+        split.addWidget(lw)
+        split.addWidget(rw)
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 3)
+        split.setSizes([440, 760])
+        h.addWidget(split)
         return page
 
     # --------------------------------------------------------- Result page
@@ -2140,9 +2649,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # 2. model performance card
         perf, perfv = self.card("Model performance (cross-validated)")
         self.r_model_title = QtWidgets.QLabel("No model trained yet")
-        self.r_model_title.setStyleSheet(
-            "font-size:13pt; font-weight:800; color:#1e3a8a; "
-            "border:none; background:transparent;")
+        self.r_model_title.setObjectName("BannerTitle")
         perfv.addWidget(self.r_model_title)
         stats_row = QtWidgets.QHBoxLayout()
         self.r_stats: dict[str, QtWidgets.QLabel] = {}
@@ -2184,7 +2691,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.r_ppv_table.verticalHeader().setVisible(False)
         self.r_ppv_table.setEditTriggers(EDIT_NO)
         self.r_ppv_table.setAlternatingRowColors(True)
-        self.r_ppv_table.setMaximumHeight(120)
+        self.r_ppv_table.setMaximumHeight(160)
         self.r_ppv_table.setToolTip(
             "The same test has very different predictive values at "
             "different disease prevalence (Bayes). PPV/NPV are what a "
@@ -2202,7 +2709,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.r_triage_table.verticalHeader().setVisible(False)
         self.r_triage_table.setEditTriggers(EDIT_NO)
         self.r_triage_table.setAlternatingRowColors(True)
-        self.r_triage_table.setMaximumHeight(120)
+        self.r_triage_table.setMaximumHeight(160)
         self.r_triage_table.setToolTip(
             "Per 1,000 patients at each prevalence: biopsies the "
             "three-tier triage would order (positive + indeterminate), "
@@ -2220,6 +2727,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lockedv.addWidget(self.r_locked_label)
         self.r_locked_card = locked
         v.addWidget(perf)
+        v.addWidget(locked)      # was orphaned: FINAL result never showed
         # deep evaluation summary (LOPO / seeds / noise / Friedman)
         deep, deepv = self.card("Deep evaluation",
                                 "Leave-one-patient-out, seed stability "
@@ -2280,12 +2788,13 @@ class MainWindow(QtWidgets.QMainWindow):
         det, detv = self.card("Predictions",
                               "Every classified spectrum with its "
                               "confidence.")
-        self.r_pred_table = QtWidgets.QTableWidget(0, 4)
+        self.r_pred_table = QtWidgets.QTableWidget(0, 5)
         self.r_pred_table.setHorizontalHeaderLabels(
-            ["File", "Predicted class", "Triage", "Probability"])
+            ["File", "Predicted class", "Triage", "Probability",
+             "Set 90%"])
         self.r_pred_table.horizontalHeader().setSectionResizeMode(
             0, HEADER_STRETCH)
-        for col in (1, 2, 3):
+        for col in (1, 2, 3, 4):
             self.r_pred_table.horizontalHeader().setSectionResizeMode(
                 col, HEADER_RESIZE)
         self.r_pred_table.verticalHeader().setVisible(False)
@@ -2398,7 +2907,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.r_bio_table.verticalHeader().setVisible(False)
         self.r_bio_table.setEditTriggers(EDIT_NO)
         self.r_bio_table.setAlternatingRowColors(True)
-        self.r_bio_table.setMaximumHeight(200)
+        self.r_bio_table.setMaximumHeight(240)
         biocv.addWidget(self.r_bio_table)
         self.r_bio_hint = QtWidgets.QLabel("")
         self.r_bio_hint.setObjectName("CardHint")
@@ -2448,7 +2957,41 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(b_html)
         readv.addLayout(row)
         v.addWidget(read)
+
+        # ---- anchor pills: jump straight to any section of this page ----
+        anchors = [("Performance", "Model performance (cross-validated)"),
+                   ("FINAL", "Locked test-set evaluation (FINAL)"),
+                   ("Deep", "Deep evaluation"),
+                   ("Patients", "Per-patient performance (out-of-fold)"),
+                   ("Predictions", "Predictions"),
+                   ("Verdicts", "Patient verdicts"),
+                   ("Spectra", "Predicted spectra"),
+                   ("Validation", "Validation of the winning model"),
+                   ("Biochemistry", "Biochemistry of this prediction"),
+                   ("Reading", "What this means")]
+        by_title = {lbl.text(): lbl.parentWidget()
+                    for lbl in page.findChildren(QtWidgets.QLabel)
+                    if lbl.objectName() == "CardHeader"}
+        anchor_row = QtWidgets.QHBoxLayout()
+        anchor_row.setSpacing(6)
+        for name, title in anchors:
+            target = by_title.get(title)
+            if target is None:
+                continue
+            b = QtWidgets.QPushButton(name)
+            b.setToolTip(f"Jump to “{title}”")
+            b.setCursor(qc.POINTING_HAND)
+            b.clicked.connect(
+                lambda _=False, t=target: self._scroll_to_card(t))
+            anchor_row.addWidget(b)
+        anchor_row.addStretch(1)
+        v.insertLayout(0, anchor_row)
         return page
+
+    def _scroll_to_card(self, card):
+        """Scroll the Result page to one of its cards (anchor pills)."""
+        sa = self.stack.widget(TAB_RESULT)      # the wrapping QScrollArea
+        sa.ensureWidgetVisible(card, 0, 16)
 
     # ------------------------------------------------------ study manifest
     def freeze_study(self):
@@ -2515,13 +3058,435 @@ class MainWindow(QtWidgets.QMainWindow):
 
     POSITIVE_SYNONYMS = {"tumor", "tumour", "cancer", "malignant",
                          "positive"}
+    TRI_COLOR = {clin.TRIAGE_POSITIVE: "#b91c1c",
+                 clin.TRIAGE_INDETERMINATE: "#b45309",
+                 clin.TRIAGE_NEGATIVE: "#15803d"}
 
     def _positive_class(self) -> str | None:
         """The 'positive' class name for verdicts (Tumor/Cancer/...)."""
-        classes = set(self.winner.classes) if self.winner is not None else (
-            set(l for l in self.labels if l))
+        if self.winner is not None:
+            classes = set(self.winner.classes)
+        elif self.bundle is not None:
+            classes = set(self.bundle.get("classes") or [])
+        else:
+            classes = set(l for l in self.labels if l)
         pos = {c for c in classes if c.lower() in self.POSITIVE_SYNONYMS}
         return sorted(pos)[0] if pos else None
+
+    def _n_classes(self) -> int:
+        """Class count from the winner, a loaded bundle, or the data."""
+        if self.winner is not None:
+            return len(self.winner.classes)
+        if self.bundle is not None:
+            return len(self.bundle.get("classes") or [])
+        return len(set(l for l in self.labels if l))
+
+    def _threshold_now(self) -> float | None:
+        """Decision threshold from the winner or the loaded bundle, shown
+        in the Platt-calibrated probability space when a calibrator
+        exists."""
+        if (self.winner is not None
+                and getattr(self.winner, "threshold", None) is not None):
+            t = float(self.winner.threshold)
+        elif (self.bundle is not None
+                and self.bundle.get("threshold") is not None):
+            t = float(self.bundle["threshold"])
+        else:
+            return None
+        cal = (self.bundle or {}).get("calibrator")
+        if cal and self._n_classes() == 2:
+            t = clin.apply_platt(t, cal)
+        return t
+
+    def _fill_prediction_table(self, table):
+        """Shared Predict/Result table: file, predicted class, clinical
+        triage tier (binary models) and a confidence bar per spectrum."""
+        rows = self._pred_rows
+        pos = self._positive_class()
+        binary = self._n_classes() == 2
+        lo, hi = self._op_points_now()
+        threshold = self._threshold_now()
+        probs = self._pred_probs
+        tri = self.TRI_COLOR
+        table.setRowCount(len(rows))
+        for r, (fname, cls, p) in enumerate(rows):
+            it0 = QtWidgets.QTableWidgetItem(fname)
+            it1 = QtWidgets.QTableWidgetItem(cls)
+            it1.setTextAlignment(ALIGN_CENTER)
+            if pos and cls == pos:
+                it1.setForeground(qc.QtGui.QColor("#b91c1c"))
+                f = it1.font()
+                f.setBold(True)
+                it1.setFont(f)
+            # clinical triage tier from the full probability dict
+            tier = None
+            if pos and binary and len(probs) == len(rows):
+                tier = clin.triage(probs[r].get(pos, float("nan")),
+                                   lo, hi, fallback=threshold)
+            it2 = QtWidgets.QTableWidgetItem(tier or "–")
+            it2.setTextAlignment(ALIGN_CENTER)
+            it2.setToolTip(clin.TRIAGE_ACTIONS.get(tier, ""))
+            if tier in tri:
+                it2.setForeground(qc.QtGui.QColor(tri[tier]))
+                f2 = it2.font()
+                f2.setBold(True)
+                it2.setFont(f2)
+            table.setItem(r, 0, it0)
+            table.setItem(r, 1, it1)
+            table.setItem(r, 2, it2)
+            # probability as a slim confidence bar for the predicted class
+            bar = QtWidgets.QProgressBar()
+            bar.setRange(0, 1000)
+            bar.setValue(int(round(max(0.0, min(1.0, p)) * 1000)))
+            bar.setFormat(f"{p:.0%}")
+            bar.setFixedHeight(14)
+            color = "#dc2626" if (pos and cls == pos) else "#6366f1"
+            bar.setStyleSheet(
+                f"QProgressBar::chunk {{ background: {color}; "
+                "border-radius: 5px; }}")
+            if len(probs) == len(rows):
+                bar.setToolTip(" · ".join(
+                    f"{k} {v:.2f}" for k, v in sorted(
+                        probs[r].items(), key=lambda kv: -kv[1])))
+            table.setCellWidget(r, 3, bar)
+            # conformal prediction set (90%): classes that survive the
+            # OOF-calibrated threshold; empty set = principled abstain
+            if table.columnCount() > 4:
+                q = self._conformal_q()
+                it4 = QtWidgets.QTableWidgetItem("–")
+                if q is not None and len(probs) == len(rows):
+                    keep = [k for k, v in probs[r].items()
+                            if v >= 1.0 - q]
+                    it4 = QtWidgets.QTableWidgetItem(
+                        ", ".join(sorted(keep)) if keep else "∅ abstain")
+                    if not keep:
+                        it4.setForeground(qc.QtGui.QColor("#b45309"))
+                        f4 = it4.font()
+                        f4.setBold(True)
+                        it4.setFont(f4)
+                it4.setTextAlignment(ALIGN_CENTER)
+                it4.setToolTip(
+                    "Split-conformal set (90% coverage, calibrated on the "
+                    "winner's out-of-fold probabilities). Two classes = "
+                    "ambiguous; empty = the model abstains — treat as "
+                    "INDETERMINATE.")
+                table.setItem(r, 4, it4)
+
+    def _toggle_live_watch(self, on: bool):
+        """Live folder mode: watch the spectra folder, re-classify on
+        new files (debounced — acquisitions land in bursts)."""
+        if on:
+            folder = self.spec_path_edit.text().strip()
+            if not os.path.isdir(folder):
+                files = [r[0] for r in getattr(self, "_pred_rows", [])]
+                folder = os.path.dirname(files[0]) if files else folder
+            if not os.path.isdir(folder):
+                self.log("Live folder: pick the spectra folder first.")
+                self.b_live.setChecked(False)
+                return
+            self._watcher = qc.QtCore.QFileSystemWatcher([folder])
+            self._watcher.directoryChanged.connect(self._live_retrigger)
+            self.log(f"Live folder ON — auto-classifying new files in "
+                     f"{folder}")
+        else:
+            if getattr(self, "_watcher", None) is not None:
+                self._watcher.deleteLater()
+                self._watcher = None
+            self.log("Live folder OFF")
+
+    def _live_retrigger(self, _path=None):
+        qc.QtCore.QTimer.singleShot(800, self._live_fire)
+
+    def _live_fire(self):
+        """Incremental live classification: only files whose mtime is
+        new since the last pass get read + classified and APPENDED to
+        the table — the whole point of a real-time mode (B7) — with the
+        measured per-spectrum latency shown (C4)."""
+        if getattr(self, "_watcher", None) is None or self.bundle is None:
+            return
+        folder = self.spec_path_edit.text().strip()
+        if not os.path.isdir(folder):
+            return
+        import time as _time
+        try:
+            files = sorted(
+                os.path.join(folder, fn) for fn in os.listdir(folder)
+                if fn.lower().endswith((".txt", ".dat", ".csv")))
+            state = {f: os.path.getmtime(f) for f in files}
+        except OSError:
+            return
+        prev = getattr(self, "_live_state", None) or {}
+        new = [f for f, mt in state.items() if prev.get(f) != mt]
+        self._live_state = state
+        if not new:
+            return
+        t0 = _time.perf_counter()
+        added = 0
+        for path in new:
+            try:
+                # paired (margin) bundles are meaningless without the
+                # patient's normal reference — refuse instead of silently
+                # predicting absolute spectra (2026-09-05)
+                if (self.bundle or {}).get("paired") \
+                        and self._pred_reference is None:
+                    raise ValueError(
+                        "paired (margin) bundle: pick the patient's "
+                        "normal reference on the Predict page before "
+                        "enabling live mode")
+                wn, it = dataset.load_spectrum(path)
+                out = modeling.predict_with_bundle(
+                    self.bundle, wn, it,
+                    reference=(self._pred_reference
+                               if (self.bundle or {}).get("paired")
+                               else None))
+            except Exception as exc:
+                self.log(f"Live: {os.path.basename(path)} failed: {exc}")
+                continue
+            pmax = max(out["probabilities"].values())
+            self._pred_rows.append((os.path.basename(path),
+                                    out["prediction"], pmax))
+            self._pred_probs.append({k: float(v) for k, v in
+                                     out["probabilities"].items()})
+            added += 1
+            self.log(f"⚡ {os.path.basename(path)} → "
+                     f"{out['prediction']} (p={pmax:.2f})")
+        if added:
+            self._fill_prediction_table(self.pred_table)
+            ms = (_time.perf_counter() - t0) / added * 1000.0
+            self.predict_status.setText(
+                f"Live: {added} new spectrum{'a' if added > 1 else ''} "
+                f"classified · {ms:.0f} ms/spectrum")
+
+    def _conformal_q(self) -> float | None:
+        """Split-conformal LAC threshold from the winner's pooled OOF
+        (binary winners with enough calibration data only)."""
+        w = self.winner
+        if (w is None or getattr(w, "oof_proba", None) is None
+                or getattr(w, "y_true_encoded", None) is None
+                or len(w.classes) != 2):
+            return None
+        valid = ~np.isnan(w.oof_proba[:, 1])
+        if valid.sum() < 10:
+            return None
+        return clin.conformal_q(w.oof_proba[valid],
+                                np.asarray(w.y_true_encoded[valid]))
+
+    def report_uncertainty_stats(self):
+        """Conformal coverage + calibration quality (ECE, Platt vs
+        isotonic) from the winner's pooled OOF — logged after training."""
+        w = self.winner
+        if (w is None or getattr(w, "oof_proba", None) is None
+                or getattr(w, "y_true_encoded", None) is None
+                or len(w.classes) != 2):
+            return
+        valid = ~np.isnan(w.oof_proba[:, 1])
+        if valid.sum() < 10:
+            return
+        yv = np.asarray(w.y_true_encoded[valid])
+        pv = w.oof_proba[valid, 1]
+        q = clin.conformal_q(w.oof_proba[valid], yv)
+        m = clin.conformal_metrics(
+            clin.conformal_sets(w.oof_proba[valid], q), yv)
+        self.log(f"Conformal 90% sets (OOF): coverage {m['coverage']:.0%}"
+                 f" · mean size {m['mean_size']:.2f}"
+                 f" · abstain {m['abstain_rate']:.0%}")
+        cmp_ = clin.isotonic_compare(yv, pv)
+        if cmp_:
+            self.log(f"Calibration ECE — raw {cmp_['ece_raw']:.3f} · "
+                     f"Platt {cmp_['ece_platt']:.3f} · isotonic "
+                     f"{cmp_['ece_isotonic']:.3f} "
+                     "(Platt stays applied at n<500)")
+
+    def run_label_error_review(self):
+        """J1: flag probable label errors from winner OOF probabilities
+        and select them in the Data table for double-click correction."""
+        w = self.winner
+        if (w is None or getattr(w, "oof_proba", None) is None
+                or getattr(w, "y_true_encoded", None) is None):
+            self.log("Label errors: train first (needs winner OOF "
+                     "probabilities).")
+            return
+        given = np.asarray(w.classes)[np.asarray(w.y_true_encoded)]
+        if len(w.classes) > 2:
+            rows = modeling.label_error_report(w.oof_proba, list(given))
+        else:
+            # binary: rebuild both-class probabilities from the
+            # positive column
+            p_pos = w.oof_proba[:, 1]
+            full = np.column_stack([1 - p_pos, p_pos])
+            rows = modeling.label_error_report(full, list(given))
+        if not rows:
+            self.log("Label errors: none flagged — the labels look "
+                     "consistent with the model's out-of-fold view.")
+            return
+        self.log(f"Label errors: {len(rows)} flagged "
+                 f"({sum(1 for r in rows if r['tier'] == 'likely')} "
+                 "likely / "
+                 f"{sum(1 for r in rows if r['tier'] == 'review')} "
+                 "review):")
+        row_map = getattr(self, "_train_row_map", None)
+        for r in rows[:12]:
+            name = ""
+            if row_map is not None and 0 <= r["i"] < len(row_map):
+                oi = row_map[r["i"]]
+                if 0 <= oi < len(self.spectra):
+                    name = f"  {os.path.basename(self.spectra[oi].path)}"
+            self.log(f"  #{r['i']:3d}  {r['given']} (p={r['p_self']:.2f})"
+                     f" → looks like {r['other']} "
+                     f"(p={r['p_other']:.2f}) [{r['tier']}]{name}")
+        if len(rows) > 12:
+            self.log(f"  … and {len(rows) - 12} more")
+        # select flagged rows in the Data table (double-click Class to
+        # fix) — ONLY when the OOF row maps 1:1 to a table row.  The old
+        # code used matrix indices directly and selected the WRONG rows
+        # whenever spike exclusion / replicate averaging / paired mode
+        # had shifted them; selectRow() also cleared the previous
+        # selection each time so only the last row was ever selected.
+        if row_map is None:
+            self.log("Label errors: cannot auto-select rows in this "
+                     "training mode (replicate averaging / paired) — "
+                     "match the filenames above by hand in the Data "
+                     "table.")
+            return
+        self.stack.setCurrentIndex(TAB_DATA)
+        self.table.clearSelection()
+        sm = self.table.selectionModel()
+        flags = (qc.QtCore.QItemSelectionModel.Select
+                 | qc.QtCore.QItemSelectionModel.Rows)
+        for r in rows:
+            if 0 <= r["i"] < len(row_map):
+                oi = row_map[r["i"]]
+                if 0 <= oi < self.table.rowCount():
+                    sm.select(self.table.model().index(oi, 0), flags)
+
+    def run_covariate_fusion(self):
+        """Hanna 2024's open gap: spectra + clinical covariates in one
+        patient-grouped meta-model.  CSV keyed by patient ID."""
+        w = self.winner
+        if (w is None or getattr(w, "oof_proba", None) is None
+                or len(w.classes) != 2):
+            self.log("Covariate fusion needs a binary winner with OOF "
+                     "probabilities.")
+            return
+        if not self.groups:
+            self.log("Covariate fusion needs patient IDs on the data.")
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Clinical covariates CSV", "",
+            "CSV (*.csv);;All files (*)")
+        if not path:
+            return
+        import pandas as pd
+        try:
+            df = pd.read_csv(path)
+            key = next((c for c in ("patient", "Patient", "subject",
+                                    "id", "ID") if c in df.columns),
+                       df.columns[0])
+            num = df.select_dtypes("number").drop(
+                columns=[key], errors="ignore")
+            obj = pd.get_dummies(df.drop(columns=[key]).select_dtypes(
+                exclude="number"), dtype=float)
+            cov = pd.concat([num, obj], axis=1)
+            lut = {str(k): row.to_numpy(dtype=float)
+                   for k, row in zip(df[key], cov.itertuples(index=False))}
+        except Exception:
+            self.log("Covariate CSV failed to parse:\n"
+                     + traceback.format_exc())
+            return
+        rows = [lut.get(str(g)) for g in self.groups]
+        ok = [i for i, r in enumerate(rows) if r is not None]
+        if len(ok) < 30:
+            self.log(f"Covariate fusion: only {len(ok)} spectra matched "
+                     f"the CSV patient IDs — need ≥30.")
+            return
+        width = cov.shape[1]
+        C = np.vstack([rows[i] for i in ok])
+        valid = ~np.isnan(w.oof_proba[:, 1])
+        p = w.oof_proba[ok, 1] * np.where(valid[ok], 1.0, np.nan)
+        keep = np.isfinite(p)
+        yv = np.asarray(w.y_true_encoded)[ok][keep]
+        gg = list(np.array(self.groups)[ok][keep])
+        out = modeling.covariate_fusion_cv(p[keep], C[keep], yv, gg)
+        if not out:
+            self.log("Covariate fusion: internal failure.")
+            return
+        lift = out["delta"]
+        star = (" ✓ covariates help" if lift > 0.02 else
+                " — no meaningful lift")
+        self.log(f"Covariate fusion ({width} features, {len(ok)} "
+                 f"spectra): AUC {out['auc_base']:.3f} → "
+                 f"{out['auc_fused']:.3f} (Δ {lift:+.3f}){star}")
+
+    def run_permutation_auc(self):
+        """Empirical p-value for the winner's OOF AUC under patient-level
+        label shuffling (binary classical winners; deep ones are too
+        slow for 50 refits)."""
+        w = self.winner
+        if w is None:
+            return
+        if len(w.classes) != 2:
+            self.log("Permutation AUC test is binary-only.")
+            return
+        if "CNN" in w.name or w.name == "1D-CNN":
+            self.log("Permutation AUC: the 1D-CNN winner needs ~250 refits"
+                     " — run it on a classical winner (seconds each).")
+            return
+        X = self.get_processed_X()
+        y = np.array([l if l else "" for l in self.labels])
+        keep = y != ""
+        X, y = X[keep], y[keep]
+        g = np.array(self.groups)[keep] if self.groups else \
+            np.array([f"S{i}" for i in range(len(y))])
+        if len(y) != len(getattr(w, "y_true_encoded", [])):
+            self.log("Permutation AUC: data changed since training — "
+                     "retrain first.")
+            return
+        self.log("Permutation AUC running (50 permutations × 3-fold)…")
+        busy(True)
+        try:
+            out = modeling.permutation_auc_p(
+                w.pipeline, X, list(y), list(g), n_perm=50, k=3)
+        finally:
+            busy(False)
+        star = " ✓ signal is real" if out["p"] < 0.05 else \
+            (" — not significant" if out["p"] >= 0.05 else "")
+        self.log(f"Permutation AUC: observed {out['auc']:.3f} vs null mean "
+                 f"{out['null_mean']:.3f} → p = {out['p']:.4f} "
+                 f"({out['n_perm']} perms){star}")
+
+    def run_band_agreement(self):
+        """Does the winner's importance profile land on the known
+        biochemistry? (literature BANDS + the internship report's
+        significant wavenumbers)."""
+        w = self.winner
+        if w is None:
+            return
+        X = self.get_processed_X()
+        wn_full = np.asarray(self.grid, dtype=float)
+        wn = wn_full[preprocessing.crop_mask(wn_full,
+                                             self.read_params())]
+        if wn.shape[0] != X.shape[1]:
+            self.log("Band agreement: wavenumber axis mismatch — "
+                     "retrain first.")
+            return
+        y = np.array([l if l else "" for l in self.labels])
+        keep = y != ""
+        try:
+            imp = modeling.winner_importance(w.pipeline, X[keep], y[keep],
+                                             wn)
+        except Exception:
+            self.log("Band agreement failed:\n" + traceback.format_exc())
+            return
+        src = ("Grad-CAM" if "CNN" in w.name else
+               "VIP" if "PLS" in w.name else "SHAP/surrogate")
+        rep = bio.agreement_report(wn, imp)
+        self.log(f"Band agreement ({src} profile, top-20 wavenumbers): "
+                 f"{rep['lit_frac']:.0%} match the literature table · "
+                 f"{rep['report_frac']:.0%} match the internship "
+                 f"report's significant bands · literature-profile rank "
+                 f"correlation {rep['spearman']:+.2f}")
+        for s, source, mol, assign in rep["matches"][:8]:
+            self.log(f"  {s:7.1f} cm⁻¹ ← {source}: {mol} ({assign})")
 
     def _op_points_now(self) -> tuple[float | None, float | None]:
         """
@@ -2559,12 +3524,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---- verdict banner ------------------------------------------------
         pats = self._patient_rows
-        if self.winner is not None:
-            n_classes = len(self.winner.classes)
-        elif self.bundle is not None:
-            n_classes = len(self.bundle.get("classes") or [])
-        else:
-            n_classes = len(set(l for l in self.labels if l))
+        n_classes = self._n_classes()
         if pats:
             pos_cls = pos or ""
             pos_pat = [r for r in pats if r[4] == pos_cls] if pos_cls else []
@@ -2648,17 +3608,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ps = [x for x in ps if x is not None]
             if ps:
                 mean_p_all = float(np.mean(ps))
-        threshold = None
-        if (self.winner is not None
-                and getattr(self.winner, "threshold", None) is not None):
-            threshold = float(self.winner.threshold)
-        elif (self.bundle is not None
-                and self.bundle.get("threshold") is not None):
-            threshold = float(self.bundle["threshold"])
-        # show/use the threshold in the calibrated probability space
-        _cal = (self.bundle or {}).get("calibrator")
-        if (threshold is not None and _cal and n_classes == 2):
-            threshold = clin.apply_platt(threshold, _cal)
+        threshold = self._threshold_now()
         if mean_p_all is not None:
             self.result_meter.set_data(mean_p_all, lo, hi, pos)
         self.result_meter.setVisible(mean_p_all is not None)
@@ -2713,7 +3663,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.groups:
                 bits.append(f"grouped by {len(set(self.groups))} patients")
             if w.threshold is not None:
-                bits.append(f"decision threshold {threshold:.3f}"
+                _cal = bool((self.bundle or {}).get("calibrator"))
+                bits.append(f"decision threshold {w.threshold:.3f}"
                             + (" (calibrated)" if _cal else ""))
             if lo is not None and hi is not None:
                 bits.append(f"rule-out p≤{lo:.2f} (sens ≥90%) · "
@@ -2889,53 +3840,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.r_local_card.setVisible(bool(self._pred_spectra))
 
         # ---- prediction table + distribution -------------------------------
-        tri_color = {clin.TRIAGE_POSITIVE: "#b91c1c",
-                     clin.TRIAGE_INDETERMINATE: "#b45309",
-                     clin.TRIAGE_NEGATIVE: "#15803d"}
-        self.r_pred_table.setRowCount(len(rows))
-        for r, (fname, cls, p) in enumerate(rows):
-            it0 = QtWidgets.QTableWidgetItem(fname)
-            it1 = QtWidgets.QTableWidgetItem(cls)
-            it1.setTextAlignment(ALIGN_CENTER)
-            if pos and cls == pos:
-                it1.setForeground(qc.QtGui.QColor("#b91c1c"))
-                f = it1.font()
-                f.setBold(True)
-                it1.setFont(f)
-            # clinical triage tier from the full probability dict
-            tier = None
-            if (pos and n_classes == 2
-                    and len(self._pred_probs) == len(rows)):
-                tier = clin.triage(
-                    self._pred_probs[r].get(pos, float("nan")),
-                    lo, hi, fallback=threshold)
-            it2 = QtWidgets.QTableWidgetItem(tier or "–")
-            it2.setTextAlignment(ALIGN_CENTER)
-            it2.setToolTip(clin.TRIAGE_ACTIONS.get(tier, ""))
-            if tier in tri_color:
-                it2.setForeground(qc.QtGui.QColor(tri_color[tier]))
-                f2 = it2.font()
-                f2.setBold(True)
-                it2.setFont(f2)
-            self.r_pred_table.setItem(r, 0, it0)
-            self.r_pred_table.setItem(r, 1, it1)
-            self.r_pred_table.setItem(r, 2, it2)
-            # probability as a slim confidence bar for the predicted class
-            bar = QtWidgets.QProgressBar()
-            bar.setRange(0, 1000)
-            bar.setValue(int(round(max(0.0, min(1.0, p)) * 1000)))
-            bar.setFormat(f"{p:.0%}")
-            bar.setFixedHeight(14)
-            color = "#dc2626" if (pos and cls == pos) else "#6366f1"
-            bar.setStyleSheet(
-                f"QProgressBar::chunk {{ background: {color}; "
-                "border-radius: 5px; }}")
-            if len(self._pred_probs) == len(rows):
-                bar.setToolTip(" · ".join(
-                    f"{k} {v:.2f}" for k, v in sorted(
-                        self._pred_probs[r].items(),
-                        key=lambda kv: -kv[1])))
-            self.r_pred_table.setCellWidget(r, 3, bar)
+        tri_color = self.TRI_COLOR
+        self._fill_prediction_table(self.r_pred_table)
         # ---- patient verdict table -----------------------------------------
         pats = self._patient_rows
         self.r_pat_table.setVisible(bool(pats))
@@ -2993,20 +3899,8 @@ class MainWindow(QtWidgets.QMainWindow):
             classes_seen = sorted({c for _f, c, _p in rows})
             vals = [sum(1 for _f, c, _p in rows if c == k)
                     for k in classes_seen]
-            colors = [("#dc2626" if pos and k == pos
-                       else plotting.class_color(i))
-                      for i, k in enumerate(classes_seen)]
-            bars = ax1.bar(classes_seen, vals, color=colors,
-                           edgecolor="white", linewidth=0.8, width=0.62)
-            total = sum(vals) or 1
-            ax1.bar_label(bars, labels=[f"{v} ({v / total:.0%})"
-                                        for v in vals],
-                          fontsize=9, fontweight="bold", color="#334155",
-                          padding=3)
-            ax1.set_ylabel("spectra")
-            ax1.set_title("Class counts", fontsize=10)
-            ax1.set_ylim(0, max(vals) + max(1, int(max(vals) * 0.25)))
-            ax1.margins(y=0.1)
+            plotting.plot_count_bars(ax1, classes_seen, vals,
+                                     positive=pos)
         else:
             ax1.text(0.5, 0.5, "no predictions yet", ha="center", va="center",
                      transform=ax1.transAxes, color="#94a3b8")
@@ -3043,15 +3937,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.r_cm_canvas.draw_idle()
         if w is not None and getattr(w, "oof_proba", None) is not None:
             try:
-                axr = plotting.clear(self.r_roc_canvas)
                 ye = w.y_true_encoded
                 if len(w.classes) == 2:
+                    # binary: ROC + its imbalance-aware twin, the
+                    # precision-recall curve, side by side
+                    fig = self.r_roc_canvas.figure
+                    fig.clf()
+                    axr = fig.add_subplot(121)
+                    axp = fig.add_subplot(122)
                     valid = ~np.isnan(w.oof_proba[:, 1])
                     fpr, tpr, auc = modeling.roc_points(
                         ye[valid], w.oof_proba[valid, 1])
                     plotting.plot_roc(axr, fpr, tpr, auc)
-                    axr.set_title("ROC — out-of-fold", fontsize=10)
+                    prec, rec, ap = modeling.pr_points(
+                        ye[valid], w.oof_proba[valid, 1])
+                    plotting.plot_pr(axp, prec, rec, ap)
+                    self.log(f"AUPRC (out-of-fold): {ap:.3f}")
                 else:
+                    axr = plotting.clear(self.r_roc_canvas)
                     plotting.plot_perclass_metrics(
                         axr, w.classes, w.per_class,
                         title="Per-class metrics — out-of-fold")
@@ -3709,6 +4612,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def update_footer(self):
         idx = self.stack.currentIndex()
         self.b_back.setVisible(idx > TAB_START)
+        for i, dot in enumerate(getattr(self, "_step_dots", [])):
+            # current page: brand indigo; visited/other: subdued
+            dot.setStyleSheet(
+                f"color:{'#4338ca' if i == idx else '#cbd5e1'};"
+                "background:transparent;border:none;")
         if idx < TAB_RESULT:
             self.next_btn.setText(NEXT_LABELS[idx])
             self.next_btn.setVisible(True)
@@ -3731,41 +4639,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.go_to(TAB_DATA)
         self.browse_folder()
 
-    def act_demo(self):
-        self.go_to(TAB_DATA)
-        self.generate_demo(ask=True)
-
     def act_predict(self):
         self.go_to(TAB_PRED)
         if self.bundle is None:
             self.browse_model()
-
-    def quick_start(self):
-        """One-click: ensure demo data → train."""
-        if not self.spectra:
-            source = dataset.find_default_source_spectrum()
-            if not source:
-                QtWidgets.QMessageBox.information(
-                    self, "One-click demo",
-                    "I could not find a real spectrum to derive the demo "
-                    "from.\nPlace a .txt spectrum next to the app folder "
-                    "(e.g. D:\\BARC) or load your own folder instead.")
-                self.go_to(TAB_DATA)
-                return
-            try:
-                busy(True)
-                out = dataset.generate_demo_data(source, DEMO_DIR,
-                                                 n_per_class=15)
-            except Exception as exc:
-                busy(False)
-                self.friendly_error("Demo data generation failed", exc)
-                return
-            busy(False)
-            self.folder_edit.setText(out)
-            self.load_folder(out)
-            self.log("One-click demo: dataset generated.")
-        self.go_to(TAB_TRAIN)
-        self.start_training()
 
     # ================================================================ Data
     def browse_folder(self):
@@ -3782,33 +4659,83 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.go_to(TAB_DATA)
 
-    def generate_demo(self, ask: bool = True):
-        source = dataset.find_default_source_spectrum()
-        if not source:
-            source, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, "Select a REAL spectrum to derive demo classes from",
-                os.path.dirname(APP_DIR), "Text (*.txt *.dat *.csv)")
-            if not source:
-                return
-        n = 15
-        if ask:
-            n, ok = QtWidgets.QInputDialog.getInt(
-                self, "Demo dataset", "Spectra per class:", 15, 5, 100, 1)
-            if not ok:
-                return
-        try:
-            busy(True)
-            out = dataset.generate_demo_data(source, DEMO_DIR, n_per_class=n)
-        except Exception as exc:
-            busy(False)
-            self.friendly_error("Demo generation failed", exc)
+    def reset_session(self):
+        """Clear the Data/Preprocess/Predict/Result steps; everything the
+        Train step produced (winner, results, saved model, diagnostics)
+        is kept."""
+        running = [w for w in (self.worker, self._opt_worker,
+                               self._pred_worker, self._honest_worker,
+                               self._analysis_worker, self._seq_worker)
+                   if w is not None and w.isRunning()]
+        if running:
+            QtWidgets.QMessageBox.information(
+                self, "Work still running",
+                "A training / search / prediction is still running.\n"
+                "Stop or wait for it before resetting the session.")
             return
-        busy(False)
-        self.log(f"Demo dataset generated in {out} (3 classes C1/C5/C8, "
-                 f"{n} spectra each, derived from "
-                 f"{os.path.basename(source)}).")
-        self.folder_edit.setText(out)
-        self.load_folder(out)
+        ans = QtWidgets.QMessageBox.question(
+            self, "Reset session",
+            "Clear the loaded data, preprocessing settings and "
+            "predictions?\n\nThe trained model — results, saved model, "
+            "diagnostics — is kept.")
+        if ans != QtWidgets.QMessageBox.Yes:
+            return
+        self._diag_queue = []          # stale chain must not continue
+        # OOF-row -> table-row map references the CLEARED data (the
+        # label-error review must not auto-select rows against a new
+        # dataset's table)
+        self._train_row_map = None
+        # Data step
+        self.spectra, self.labels = [], []
+        self.groups = self.spike_flags = None
+        self.grid = self.X_raw = self._data_key = None
+        self._proc_cache = None
+        self._previewed_for = None
+        self._source_folder = None
+        self.settings.pop("folder", None)
+        self.folder_edit.clear()
+        self.folder_edit.setToolTip("")
+        self.count_label.setText("No spectra loaded — browse above.")
+        self._loading_table = True          # cellChanged guard (gotcha #20)
+        self.table.setRowCount(0)
+        self._loading_table = False
+        plotting.clear(self.data_canvas)
+        self.data_canvas.draw_idle()
+        # Preprocess step
+        self._apply_params(asdict(PreprocessParams()))
+        self._draw_prep_empty_state()
+        self._update_pipeline_strip()
+        self.optimize_status.setText(
+            "Optimize tries combinations on your data and applies the "
+            "winner (grouped CV, no leakage).")
+        # Predict + Result state (model card / bundle kept)
+        self._pred_rows = []
+        self._pred_probs = []
+        self._pred_spectra = []
+        self._pred_wn = None
+        self._pred_reference = None
+        self._patient_rows = []
+        self._local_bands = None
+        self.spec_path_edit.clear()
+        self.pred_table.setRowCount(0)
+        plotting.clear(self.pred_canvas)
+        self.pred_canvas.draw_idle()
+        for p in self.pred_pills:
+            p.setVisible(False)
+        self.predict_status.setText(
+            "Load a model and pick spectra — predictions appear here "
+            "live. Use the toolbar above the chart to zoom and pan.")
+        # train-page widgets that depend on data → initial state
+        self.b_train.setEnabled(False)
+        self.b_model_lab.setEnabled(False)
+        self.train_status.setText("Load data first (Start or Data page).")
+        self.chk_exclude_flagged.setEnabled(False)
+        self.chk_avg_replicates.setEnabled(False)
+        self.go_to(TAB_START)
+        self.update_welcome()
+        self.refresh_nav()
+        self.log("Session reset — trained model kept "
+                 f"({self.winner.name if self.winner else 'none'}).")
 
     def load_folder(self, folder: str, quiet: bool = False):
         import clinical_data
@@ -3870,6 +4797,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.chk_avg_replicates.setEnabled(self.groups is not None)
             self._source_folder = source_folder
             self.settings["folder"] = source_folder
+            if cdata.is_clinical_layout(source_folder):
+                cdata.remember_data_root(source_folder)
             shown = source_folder
             self.folder_edit.setText(shown)
             self.folder_edit.setToolTip(shown)
@@ -3891,6 +4820,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log(f"Loaded {len(spectra)} spectra from {shown}; "
                      f"classes: {sorted(set(l for l in self.labels if l))}")
             self.b_train.setEnabled(True)
+            self.b_model_lab.setEnabled(True)
             self.train_status.setText(
                 f"{len(spectra)} spectra ready with the current "
                 "preprocessing — press Start training.")
@@ -3945,11 +4875,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 it.setFlags(IS_SELECTABLE | IS_ENABLED)
                 self.table.setItem(i, col, it)
             bad = bool(self.spike_flags and self.spike_flags[i])
-            it_q = QtWidgets.QTableWidgetItem("spiked" if bad else "ok")
+            it_q = QtWidgets.QTableWidgetItem("⚠ spiked" if bad else "✓ ok")
             it_q.setFlags(IS_SELECTABLE | IS_ENABLED)
             it_q.setTextAlignment(ALIGN_CENTER)
-            if bad:
-                it_q.setForeground(QtGui_red())
+            # status-language colors: red = flagged, green = clean
+            it_q.setForeground(
+                qc.QtGui.QColor("#b91c1c" if bad else "#15803d"))
+            it_q.setFont(_bold_font())
             it_q.setToolTip(
                 "Spike score flags cosmic-ray artifacts (very sharp "
                 "jumps). Spiked spectra can be excluded from training on "
@@ -3999,6 +4931,76 @@ class MainWindow(QtWidgets.QMainWindow):
         plotting.plot_spectra(ax, to_plot, title="Class mean spectra (raw)")
         self.data_canvas.draw_idle()
 
+    def view_file_dialog(self):
+        """Browse the dataset one file at a time (raw + preprocessed)."""
+        if not self.spectra:
+            QtWidgets.QMessageBox.information(
+                self, "No data", "Load data first (Start page).")
+            return
+        params = self.read_params().validate()
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("View file")
+        dlg.resize(980, 520)
+        v = QtWidgets.QVBoxLayout(dlg)
+        body = QtWidgets.QHBoxLayout()
+        left = QtWidgets.QVBoxLayout()
+        b_prev = QtWidgets.QPushButton("\N{BLACK LEFT-POINTING TRIANGLE} Prev")
+        b_next = QtWidgets.QPushButton("Next \N{BLACK RIGHT-POINTING TRIANGLE}")
+        lst = QtWidgets.QListWidget()
+        lst.setToolTip("Scroll (or type a name) to find a file; click to view.")
+        for i, s in enumerate(self.spectra):
+            g = self.groups[i] if self.groups else ""
+            lst.addItem(f"{s.name}  [{self.labels[i] or '?'}]  {g}")
+        left.addWidget(b_prev)
+        left.addWidget(b_next)
+        left.addWidget(lst, 1)
+        body.addLayout(left)
+        holder, canvas = plotting.canvas_with_toolbar(width=7, height=4)
+        body.addWidget(holder, 1)
+        v.addLayout(body)
+        dlg.files, dlg.canvas = lst, canvas
+        fig = canvas.figure
+
+        def show(i):
+            m = preprocessing.crop_mask(self.grid, params)
+            wn = self.grid[m]
+            proc = preprocessing.preprocess_spectrum(self.X_raw[i][m],
+                                                     params)
+            flag = self.spike_flags is not None and self.spike_flags[i]
+            fig.clf()
+            ax1, ax2 = fig.subplots(1, 2)
+            plotting.plot_preprocess_preview(
+                ax1, ax2, self.grid, self.X_raw[i], proc,
+                title=(f"{self.spectra[i].name} "
+                       f"[{self.labels[i] or '?'}]"
+                       + ("  — SPIKE-FLAGGED" if flag else "")),
+                overlay=(wn, self.X_raw[i][m]))
+            # shade what the pipeline discards (padding/noise regions)
+            if params.crop_min or params.crop_max:
+                lo = params.crop_min or self.grid.min()
+                hi = params.crop_max or self.grid.max()
+                for a, b in ((self.grid.min(), lo), (hi, self.grid.max())):
+                    ax1.axvspan(a, b, color="0.5", alpha=0.18,
+                                label="outside crop — not used")
+            ax1.legend(loc="upper right", fontsize=8)
+            canvas.draw_idle()
+            canvas.setFocus()
+
+        def step(delta):
+            lst.setCurrentRow((lst.currentRow() + delta) % lst.count())
+        b_prev.clicked.connect(lambda: step(-1))
+        b_next.clicked.connect(lambda: step(1))
+        lst.currentRowChanged.connect(show)
+        QtWidgets.QShortcut(qc.QtGui.QKeySequence(qc.Qt.Key.Key_Left),
+                            dlg).activated.connect(lambda: step(-1))
+        QtWidgets.QShortcut(qc.QtGui.QKeySequence(qc.Qt.Key.Key_Right),
+                            dlg).activated.connect(lambda: step(1))
+        i0 = self._selected_indices()[0]
+        lst.setCurrentRow(i0)
+        if i0 == 0:
+            show(0)
+        dlg.exec()
+
     def _draw_distribution(self):
         ax = plotting.clear(self.data_canvas)
         plotting.plot_class_distribution(
@@ -4018,14 +5020,19 @@ class MainWindow(QtWidgets.QMainWindow):
             wavelet=self.chk_wavelet.isChecked(),
             wavelet_name=self.combo_wavelet.currentText(),
             wavelet_level=self.spin_level.value(),
+            wavelet_threshold=self.combo_wthresh.currentText(),
+            wavelet_mode=self.combo_wmode.currentText(),
+            wavelet_cycle=self.spin_wcycle.value(),
             sg_window=self.spin_sg_window.value(),
             sg_poly=self.spin_sg_poly.value(),
             sg_deriv=self.combo_deriv.currentIndex(),
+            detrend=self.chk_detrend.isChecked(),
             baseline_method=baseline,
             als_lambda=float(10 ** self.spin_lambda_exp.value()),
             als_p=self.spin_als_p.value(),
             als_niter=self.spin_als_iter.value(),
             norm=self.combo_norm.currentText(),
+            wn_calibrate=self.chk_wncal.isChecked(),
         )
 
     def _apply_params(self, p: dict | None):
@@ -4040,16 +5047,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_despike.setChecked(bool(pr.despike))
         self.spin_despike_z.setValue(float(pr.despike_z))
         self.combo_baseline.setCurrentText(
-            "arpls" if (pr.baseline_method == "arpls"
-                        and preprocessing.HAS_PYBASELINES) else "als")
+            pr.baseline_method
+            if (pr.baseline_method == "als"
+                or preprocessing.HAS_PYBASELINES) else "als")
         self.chk_wavelet.setChecked(pr.wavelet and HAS_PYWT)
         idx = self.combo_wavelet.findText(pr.wavelet_name)
-        if idx >= 0:
-            self.combo_wavelet.setCurrentIndex(idx)
+        if idx < 0:      # e.g. a saved "coif3" from before the removal
+            idx = self.combo_wavelet.findText("sym8")
+        self.combo_wavelet.setCurrentIndex(idx)
         self.spin_level.setValue(pr.wavelet_level)
+        self.combo_wthresh.setCurrentText(pr.wavelet_threshold)
+        self.combo_wmode.setCurrentText(pr.wavelet_mode)
+        self.spin_wcycle.setValue(pr.wavelet_cycle)
         self.spin_sg_window.setValue(pr.sg_window)
         self.spin_sg_poly.setValue(pr.sg_poly)
         self.combo_deriv.setCurrentIndex(int(pr.sg_deriv))
+        self.chk_detrend.setChecked(bool(pr.detrend))
+        self.chk_wncal.setChecked(bool(pr.wn_calibrate))
         try:
             self.spin_lambda_exp.setValue(
                 int(max(2, min(9, round(log10(max(pr.als_lambda, 1e-2)))))))
@@ -4073,34 +5087,62 @@ class MainWindow(QtWidgets.QMainWindow):
         self._proc_cache = (key, X)
         return X
 
+    def _schedule_preview(self, *_args):
+        """
+        Debounced live preview: any parameter tweak restarts a 350 ms
+        timer; when the tweaks stop, the preview redraws itself (no
+        Preview click needed).  Bursts — e.g. Optimize applying 14
+        params at once — collapse into exactly one redraw.
+        """
+        self._update_pipeline_strip()       # chips always stay live
+        self._previewed_for = None          # page re-entry refreshes too
+        if self.spectra:
+            self._preview_timer.start()
+
     def preview_preprocess(self):
         if not self.spectra:
             self.log("Load data first (Start page).")
             self.statusBar().showMessage("Load data first — nothing to "
                                          "preview yet.")
             return
-        i = self._selected_indices()[0]
+        # one representative spectrum per class: a Data-page selection wins
+        # for its class, remaining classes fall back to their first spectrum
+        picks: dict[str, int] = {}
+        for i in self._selected_indices():
+            picks.setdefault(self.labels[i] or "?", i)
+        for i, lab in enumerate(self.labels):
+            picks.setdefault(lab or "?", i)
+        # the graph grows with the class count — every raw/processed row
+        # stays readable and the page scrolls as needed
+        self.prep_canvas.setMinimumHeight(
+            int(100 * max(5.0, 2.3 * len(picks) + 0.8)))
         params = self.read_params().validate()
         busy(True)
         try:
             m = preprocessing.crop_mask(self.grid, params)
             wn = self.grid[m]
-            raw = self.X_raw[i][m]
-            proc = preprocessing.preprocess_spectrum(raw, params)
+            proc = {c: preprocessing.preprocess_spectrum(self.X_raw[i][m],
+                                                         params)
+                    for c, i in picks.items()}
         finally:
             busy(False)
         fig = self.prep_canvas.figure
         fig.clf()
-        ax1 = fig.add_subplot(121)
-        ax2 = fig.add_subplot(122)
-        plotting.plot_preprocess_preview(
-            ax1, ax2, wn, raw, proc,
-            title=f"{self.spectra[i].name} [{self.labels[i] or '?'}]")
+        for r, c in enumerate(sorted(picks)):
+            i = picks[c]
+            raw = self.X_raw[i][m]
+            ax1 = fig.add_subplot(len(picks), 2, 2 * r + 1)
+            ax2 = fig.add_subplot(len(picks), 2, 2 * r + 2)
+            plotting.plot_preprocess_preview(ax1, ax2, wn, raw, proc[c])
+            # basename only — the full relpath overflows the panel title
+            short = self.spectra[i].name.rsplit("/", 1)[-1]
+            ax1.set_title(f"Raw · {c} — {short}", fontsize=9)
+            ax2.set_title(f"Preprocessed · {c}", fontsize=9)
         self.prep_canvas.draw_idle()
         self._previewed_for = self._data_key
         self.statusBar().showMessage(
-            f"Preview of {self.spectra[i].name} — adjust settings or "
-            "continue to Train.")
+            f"Preview of {'/'.join(sorted(picks))} spectra — adjust "
+            "settings or continue to Train.")
 
     # ================================================== preprocessing auto-tune
     def run_optimize(self):
@@ -4163,6 +5205,335 @@ class MainWindow(QtWidgets.QMainWindow):
             self._opt_btn.setEnabled(True)
 
     # ========================================================= learning curve
+    def _reveal(self, frame):
+        """Scroll a freshly filled diagnostics panel into view (results
+        find the user, not the other way round)."""
+        self.stack.widget(TAB_TRAIN).ensureWidgetVisible(frame)
+
+    def _diag_panel(self, key: str, title: str, chart: bool = True,
+                    size: tuple = (9.0, 3.6), container=None):
+        """
+        Lazily create (or re-show) one inline result panel at the bottom
+        of the Train Diagnostics tab: its OWN bordered sub-card with a
+        COLLAPSIBLE bold title (click to fold the chart away — the
+        caption verdict stays readable), plot canvas (figsize `size`
+        inches — square charts like the confusion matrix want a taller
+        ratio) and a caption line (hidden until text is set).  Every
+        training / diagnostic result keeps its OWN panel — nothing is
+        overwritten and nothing lives on another page.  `container`
+        overrides the target layout (used to place panels side by side).
+        Returns (frame, canvas|None, caption).
+        """
+        if key in self._diag_panels:
+            frame = self._diag_panels[key][0]
+            frame.show()
+            self._reveal(frame)
+            return self._diag_panels[key]
+        frame = QtWidgets.QFrame()
+        frame.setObjectName("DiagPanel")     # bordered sub-card look
+        v = QtWidgets.QVBoxLayout(frame)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(4)
+        head = QtWidgets.QToolButton()
+        head.setText("▾  " + title)
+        head.setCheckable(True)
+        head.setChecked(True)
+        head.setStyleSheet("border:none; font-weight:700; "
+                           "color:#1e3a8a; font-size:10pt;")
+        head.setCursor(qc.POINTING_HAND)
+        head.setToolTip("Click to collapse / expand this chart.")
+        v.addWidget(head)
+        canvas = None
+        if chart:
+            holder, canvas = plotting.canvas_with_toolbar(width=size[0],
+                                                          height=size[1])
+            v.addWidget(holder)
+            head.toggled.connect(
+                lambda on, h=holder, b=head, t=title: (
+                    h.setVisible(on),
+                    b.setText(("▾  " if on else "▸  ") + t)))
+        cap = QtWidgets.QLabel("")
+        cap.setObjectName("CardHint")
+        cap.setWordWrap(True)
+        cap.hide()                     # shown when a caption is set
+        v.addWidget(cap)
+        (container if container is not None
+         else self.diag_stack).addWidget(frame)
+        self._diag_panels[key] = (frame, canvas, cap)
+        self._reveal(frame)
+        return self._diag_panels[key]
+
+    @staticmethod
+    def _diag_caption(panel, text: str):
+        cap = panel[2]
+        cap.setText(text)
+        cap.show()
+
+    def _diag_running(self, key: str, title: str, chart: bool = True,
+                      size: tuple = (9.0, 3.6)):
+        """Show a panel immediately with a computing placeholder so the
+        user sees WHERE the result will land while it calculates."""
+        panel = self._diag_panel(key, title, chart=chart, size=size)
+        self._diag_caption(panel, "computing…")
+        self._reveal(panel[0])
+        return panel
+
+    # ==================================================== Model Lab (C1)
+    def run_model_lab(self):
+        """
+        One-click optimization program (2026-09-05): paired preprocessing
+        sweep → fast 3SSE beam search → per-layer tuned, seed-averaged
+        deployable winner.  Runs on the analysis worker (serial chain
+        guard like every other long job).
+        """
+        # cancel semantics (2026-09-05): clicking ⚡ while a Lab run is
+        # active cancels it cooperatively instead of being disabled for
+        # the whole (possibly hours-long) run
+        if getattr(self, "_lab_cancel", None) is not None:
+            self.log("Model Lab: cancel requested — finishing the "
+                     "current stage…")
+            self._lab_cancel.set()
+            return
+        if not self.spectra or self.X_raw is None:
+            QtWidgets.QMessageBox.information(
+                self, "No data", "Load data first.")
+            return
+        if self.groups is None:
+            QtWidgets.QMessageBox.information(
+                self, "Clinical data needed",
+                "Model Lab needs patient groups (clinical folder "
+                "layout) for the paired sweep.")
+            return
+        if (self._analysis_worker is not None
+                and self._analysis_worker.isRunning()) or self._diag_queue:
+            QtWidgets.QMessageBox.information(
+                self, "Busy",
+                "Another analysis is still running — wait for it.")
+            return
+        self.b_model_lab.setText("⏹ Cancel Model Lab")
+        self.train_status.setText("Model Lab running — sweep, search, "
+                                  "tune…")
+        self.log("Model Lab: paired preprocessing sweep → 3SSE beam "
+                 "search → chain tuning → seed-averaged bundle")
+        import optimize as opt
+        import sequential as seqmod
+
+        X_raw = np.asarray(self.X_raw)
+        labels = list(self.labels)
+        groups_l = list(self.groups)
+        grid_full = np.asarray(self.grid)
+        keep = [i for i, lab in enumerate(labels) if lab.strip()]
+        if not self.read_params().validate().despike \
+                and self.spike_flags is not None:
+            keep = [i for i in keep if not self.spike_flags[i]]
+        Xk = X_raw[keep]
+        yk = [labels[i] for i in keep]
+        gk = [groups_l[i] for i in keep]
+        names = [n for n, cb in self.model_checks.items() if cb.isChecked()]
+        names = [n for n in names if n != "Ensemble (top-3)"] or None
+        seed = self.spin_seed.value()
+        emit = {"p": lambda m: None}     # wired to the worker below
+        cancel = threading.Event()
+        self._lab_cancel = cancel
+
+        def _check_cancel():
+            if cancel.is_set():
+                raise RuntimeError("Model Lab cancelled by user")
+
+        def fn():
+            prog = emit["p"]
+            out_sweep = opt.optimize_paired(
+                Xk, yk, gk, grid_full, k=5, progress=prog)
+            _check_cancel()
+            best_params = out_sweep["best"]["params"]
+            # PQN must travel with the winner (2026-09-05): the sweep
+            # tracks it separately from the PreprocessParams and the
+            # whole downstream (features, search, bundle) must be built
+            # with the SAME setting that won — otherwise the Lab reports
+            # a pipeline it did not run.
+            use_pqn = bool(out_sweep["best"].get("use_pqn"))
+            prog(f"best preprocessing: {out_sweep['best']['label']}")
+            pd_ = __import__("paired").paired_features(
+                Xk, yk, gk, grid_full, best_params, use_pqn=use_pqn)
+            Xp = np.asarray(pd_.X, dtype=np.float32)
+            yp = list(pd_.y)
+            board = seqmod.search(
+                Xp, yp, groups=pd_.groups, wavenumbers=pd_.wn, k=5,
+                seed=seed, top=10, model_names=names,
+                cancel_check=cancel.is_set,
+                progress_cb=lambda d, tot, b, f1, eta: prog(
+                    f"search {d}/{tot} · best {b} (F1 {f1:.3f}) · "
+                    f"ETA {eta / 60:.0f} min"))
+            _check_cancel()
+            try:                # graceful degradation: a chain that fails
+                validated = seqmod.validate_top(   # to validate/tune must
+                    board, Xp, yp,                 # not lose the whole run
+                    pd_.groups, pd_.wn, top=10, seed=seed,
+                    model_names=names, progress=prog)
+                fin = seqmod.finalize_winner(
+                    validated, Xp, yp, pd_.groups, pd_.wn, board=board,
+                    k=5, seed=seed, tune=True, progress=prog)
+            except Exception as exc:
+                prog(f"chain validation/tuning failed "
+                     f"({type(exc).__name__}: {exc}) — falling back to "
+                     "the best SINGLE model")
+                board = {**board, "pairs": [], "triples": []}
+                validated = seqmod.validate_top(
+                    board, Xp, yp, pd_.groups, pd_.wn, top=1, seed=seed,
+                    model_names=names, progress=prog)
+                fin = seqmod.finalize_winner(
+                    validated, Xp, yp, pd_.groups, pd_.wn, board=board,
+                    k=5, seed=seed, tune=False, progress=prog)
+                if fin is None:
+                    raise RuntimeError(
+                        "no architecture survived validation") from exc
+            return {"sweep_best": out_sweep["best"],
+                    "params": best_params, "use_pqn": use_pqn,
+                    "board": board, "validated": validated,
+                    "final": fin, "paired_X": pd_}
+
+        def done(payload):
+            self._lab_cancel = None
+            self.b_model_lab.setText("⚡ Model Lab (one click)")
+            self._on_model_lab_done(payload)
+
+        def fail(tb):
+            self._lab_cancel = None
+            self.b_model_lab.setText("⚡ Model Lab (one click)")
+            if "cancelled by user" in tb:
+                self.train_status.setText("Model Lab cancelled.")
+                self.log("Model Lab cancelled by user.")
+                return
+            self.train_status.setText("Model Lab failed — see log.")
+            self.log(f"Model Lab failed:\n{tb}")
+            QtWidgets.QMessageBox.warning(
+                self, "Model Lab failed",
+                "The optimization run failed.\n\nTechnical details are "
+                "in session.log next to the app.")
+
+        worker = FuncWorker(fn)
+        emit["p"] = lambda m: worker.progress.emit(str(m))
+        worker.progress.connect(
+            lambda m: (self.train_status.setText(f"Model Lab: {m}"),
+                       self.statusBar().showMessage(m)))
+        worker.done.connect(done)
+        worker.failed.connect(fail)
+        self._analysis_worker = worker
+        worker.start()
+
+    def _on_model_lab_done(self, payload):
+        """Apply the Lab's findings: best preprocessing, a DiagPanel
+        report, and the deployable seed-averaged bundle."""
+        from dataclasses import asdict as _asdict
+        import sequential as seqmod
+        sweep = payload["sweep_best"]
+        fin = payload["final"]
+        self._apply_params(_asdict(payload["params"]))
+        if payload.get("use_pqn"):
+            # the winning config used PQN — switch the Train mode so the
+            # next manual run reproduces the Lab's features
+            self.set_mode_kind("paired-pqn")
+            self.log("Model Lab: winning config uses PQN — mode "
+                     "switched to Margin+PQN.")
+        panel = self._diag_panel("model_lab", "Model Lab — one click",
+                                 chart=False)
+        cap = [f"Best preprocessing: {sweep['label']} "
+               f"(screening F1 {sweep['mean_f1']:.3f}, "
+               f"{sweep['model']}) — applied"
+               + (" (mode → Margin+PQN)." if payload.get("use_pqn")
+                  else ".")]
+        if fin:
+            m = fin["metrics"]
+            cap.append(f"Winner chain: {' → '.join(fin['arch'])}")
+            cap.append(f"Nested F1 {m['f1']:.3f} · sens {m['sens']:.3f} · "
+                       f"spec {m['spec']:.3f} · AUC "
+                       f"{m.get('auc', float('nan')):.3f}")
+            if fin["tuned_metrics"]:
+                verdict = "adopted" if fin["tuned"] else "kept defaults"
+                cap.append(f"Per-layer tuning: {verdict} "
+                           f"(tuned F1 {fin['tuned_metrics']['f1']:.3f} "
+                           f"vs {m['f1']:.3f})")
+            cap.append("Deployable bundle: 3-seed averaged chain.")
+        self._diag_caption(panel, "\n".join(cap))
+        self._reveal(panel[0])
+        self.train_status.setText("Model Lab done — best configuration "
+                                  "applied; see the Model Lab panel.")
+        self.log("Model Lab finished: " + " | ".join(cap[:2]))
+        # persist the deployable winner like a 3SSE run
+        if fin:
+            try:
+                from types import SimpleNamespace
+                m = fin["metrics"]
+                winner_ns = SimpleNamespace(
+                    name="ModelLab: " + " → ".join(fin["arch"]),
+                    pipeline=fin["chain"], classes=fin["classes"],
+                    threshold=fin["threshold"],
+                    macro={"f1": (m["f1"], 0.0),
+                           "sens": (m["sens"], 0.0),
+                           "spec": (m["spec"], 0.0)})
+                # own output dir (2026-09-05): overwriting study_run_3sse/
+                # winner.joblib corrupted the 3SSE run's provenance — the
+                # startup restore then loaded the Lab chain as "the last
+                # 3SSE winner" with mismatched artifacts.
+                out_dir = os.path.join(APP_DIR, "study_run_lab")
+                os.makedirs(out_dir, exist_ok=True)
+                modeling.save_bundle(
+                    os.path.join(out_dir, "winner.joblib"), winner_ns,
+                    self.grid, payload["params"], dataset_name="model-lab",
+                    paired=True,
+                    **({"calibrator": fin["calibrator"]}
+                       if fin["calibrator"] else {}))
+                self.log(f"Model Lab bundle: {out_dir}/winner.joblib")
+            except Exception as exc:
+                self.log(f"Model Lab bundle not saved: {exc}")
+
+    def run_all_diagnostics(self):
+        """
+        Queue EVERY diagnostic to run serially — each result lands in
+        its own panel below, no clicking needed.  Serial on purpose:
+        concurrent worker pools from several QThreads are a native-
+        crash race on Windows (gotcha #16).  Fast jobs first so cards
+        appear quickly; the heaviest (LOPO, honest) run last.
+        """
+        if (self._diag_queue
+                or (self._analysis_worker is not None
+                    and self._analysis_worker.isRunning())
+                or (self._honest_worker is not None
+                    and self._honest_worker.isRunning())):
+            QtWidgets.QMessageBox.information(
+                self, "Already running",
+                "Diagnostics are still running — they continue one by "
+                "one below.")
+            return
+        self._diag_queue = [self.run_region_importance,
+                            self.run_band_agreement,
+                            self.run_learning_curve,
+                            self.run_seed_stability,
+                            self.run_noise_check,
+                            lambda: self.run_locked_eval(auto=True),
+                            self.run_lopo,
+                            self.run_honest_check]        # heaviest last
+        self.log("Auto-running all diagnostics (regions, learning "
+                 "curve, seeds, noise, locked, LOPO, honest) — results "
+                 "appear one by one below.")
+        self.train_status.setText("Running all diagnostics — results "
+                                  "appear one by one below…")
+        self._pop_diag_queue()
+
+    def _pop_diag_queue(self):
+        """Start the next queued diagnostic once the previous finished
+        (and step past runners that only showed a guard dialog)."""
+        if (self._analysis_worker is not None
+                and self._analysis_worker.isRunning()):
+            return                    # _run_async calls us when done
+        if not self._diag_queue:
+            return
+        self._diag_queue.pop(0)()
+        if (self._diag_queue
+                and (self._analysis_worker is None
+                     or not self._analysis_worker.isRunning())):
+            self._pop_diag_queue()    # guard-dialog runner: next!
+
     def _run_async(self, label: str, fn, on_done):
         """
         Run fn() on a worker thread; on_done(result) back on the UI
@@ -4185,12 +5556,22 @@ class MainWindow(QtWidgets.QMainWindow):
         worker = FuncWorker(fn)
 
         def finish(result):
-            self._analysis_worker = None
+            worker.wait(10000)   # thread fully done before the chain
+            self._analysis_worker = None   # reuses / GCs this worker
             if has_btn:
                 btn.setEnabled(True)
-            on_done(result)
+            try:
+                on_done(result)
+            except Exception:
+                # a plotting/stats error in ONE result must never stall
+                # the serial chain (2026-09-05): the queue always drains
+                self.log(f"{label}: displaying the result failed:\n"
+                         + traceback.format_exc())
+            finally:
+                self._pop_diag_queue()          # serial chain continues
 
         def fail(tb: str):
+            worker.wait(10000)   # thread fully done before the chain
             self._analysis_worker = None
             if has_btn:
                 btn.setEnabled(True)
@@ -4200,6 +5581,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, f"{label} failed",
                 f"{label} failed.\n\nTechnical details are in "
                 "session.log next to the app.")
+            self._pop_diag_queue()          # serial chain continues
 
         worker.done.connect(finish)
         worker.failed.connect(fail)
@@ -4233,7 +5615,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def done(res):
             sizes, means, stds = res
-            ax = plotting.clear(self.roc_canvas)
+            panel = self._diag_panel("lc", "Learning curve")
+            ax = plotting.clear(panel[1])
             ax.errorbar(sizes, means, yerr=stds, marker="o", ms=5, lw=1.6,
                         capsize=4, color=plotting.COL_MAIN,
                         ecolor=plotting.COL_RAW)
@@ -4242,16 +5625,20 @@ class MainWindow(QtWidgets.QMainWindow):
             ax.set_title("Learning curve — the slope says what more "
                          "data is worth")
             ax.set_ylim(0, 1)
-            self.roc_canvas.draw_idle()
+            panel[1].draw()       # sync: no idle timer outliving the panel
             verdict = ("still rising — more patients should help"
                        if means[-1] > means[0] + 0.02 else
                        "flat — more of the same patients adds little")
+            self._diag_caption(
+                panel, f"F1 {means[0]:.3f} → {means[-1]:.3f} from "
+                       f"{sizes[0]} to {sizes[-1]} patients — {verdict}.")
             self.log(f"Learning curve: {len(sizes)} points from "
                      f"{sizes[0]} to {sizes[-1]} patients, "
                      f"F1 {means[0]:.3f} -> "
                      f"{means[-1]:.3f} ({verdict})")
             self.train_status.setText(f"Learning curve done — {verdict}.")
 
+        self._diag_running("lc", "Learning curve")
         self._run_async("Computing learning curve", fn, done)
 
     def run_region_importance(self):
@@ -4305,19 +5692,21 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self._region_bands = [(float(c), float(sh), "", 0)
                                       for c, _w, sh in bands]
-            ax = plotting.clear(self.roc_canvas)
+            panel = self._diag_panel("regions", "Spectral regions that "
+                                     "matter")
+            ax = plotting.clear(panel[1])
             if use_shap_w:
                 # signed SHAP: red pushes toward the positive class,
                 # blue away
                 mag = np.abs(signed) / (np.abs(signed).max() or 1.0)
                 sgn = np.sign(signed)
                 ax.fill_between(wn, 0, mag * sgn, where=sgn >= 0,
-                                color="#dc2626", alpha=0.45,
+                                color=COL_SIGN_POS, alpha=0.45,
                                 label=f"toward {sorted(set(yy))[1]}")
                 ax.fill_between(wn, 0, mag * sgn, where=sgn < 0,
-                                color="#2563eb", alpha=0.45,
+                                color=COL_SIGN_NEG, alpha=0.45,
                                 label=f"toward {sorted(set(yy))[0]}")
-                ax.axhline(0, color="#64748b", lw=0.8)
+                ax.axhline(0, color=COL_ZERO, lw=0.8)
                 top_share = max(b[1] for b in bands) or 1.0
                 for center, share, name, s in bands[:3]:
                     ax.axvline(center, color="#b45309", lw=1.0, ls="--",
@@ -4345,9 +5734,9 @@ class MainWindow(QtWidgets.QMainWindow):
                             color=plotting.class_color(i),
                             label=f"mean {cls}")
                 hi_s = signed / (signed.max() or 1)
-                ax.fill_between(wn, 0, hi_s * 0.9, color="#4f46e5",
+                ax.fill_between(wn, 0, hi_s * 0.9, color="#7c3aed",
                                 alpha=0.30, label="importance")
-                ax.plot(wn, hi_s * 0.9, lw=1.2, color="#4f46e5")
+                ax.plot(wn, hi_s * 0.9, lw=1.2, color="#7c3aed")
                 top_share = max(s for _c, _w, s in bands) or 1.0
                 for center, _width, share in bands[:3]:
                     ax.axvline(center, color="#b45309", lw=1.0, ls="--",
@@ -4360,7 +5749,7 @@ class MainWindow(QtWidgets.QMainWindow):
                              "classification")
             ax.set_xlabel("Raman shift (cm$^{-1}$)")
             ax.legend(loc="upper right", fontsize=8)
-            self.roc_canvas.draw_idle()
+            panel[1].draw()       # sync: no idle timer outliving the panel
             if use_shap_w:
                 tops = ", ".join(f"{c:.0f} cm⁻¹{name} "
                                  f"({'+' if s >= 0 else '-'})"
@@ -4373,6 +5762,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.train_status.setText(
                 f"Region importance done — top: {tops}.")
 
+        self._diag_running("regions", "Spectral regions that "
+                                      "matter")
         self._run_async("Computing region importance", fn, done)
 
     def run_biochemistry(self):
@@ -4463,7 +5854,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         for k, _n, _d in paired_rows]
                 vals = [d for _k, _n, d in paired_rows]
                 bars = ax.bar(keys, vals,
-                              color=["#dc2626" if v >= 0 else "#2563eb"
+                              color=[COL_SIGN_POS if v >= 0 else COL_SIGN_NEG
                                      for v in vals],
                               edgecolor="white", linewidth=0.6, width=0.6)
                 ax.bar_label(bars, fmt="%+.2f", fontsize=9,
@@ -4488,7 +5879,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ax.legend(fontsize=8)
                 ax.set_title("Marker values per class (no pairing)",
                              fontsize=10)
-            ax.axhline(0, color="#64748b", lw=0.8)
+            ax.axhline(0, color=COL_ZERO, lw=0.8)
             ax.set_ylabel("Δ marker (paired)")
             ax.margins(y=0.18)
             ax.tick_params(axis="x", labelsize=9)
@@ -4498,14 +5889,14 @@ class MainWindow(QtWidgets.QMainWindow):
             comp_vals = [d for _c, _n, d in deltas]
             x2 = np.arange(len(labels))
             bars2 = ax2.bar(x2, comp_vals,
-                            color=["#dc2626" if v >= 0 else "#2563eb"
+                            color=[COL_SIGN_POS if v >= 0 else COL_SIGN_NEG
                                    for v in comp_vals],
                             edgecolor="white", linewidth=0.6, width=0.6)
             ax2.bar_label(bars2, fmt="%+.3f", fontsize=9,
                           fontweight="bold",
                           color="#334155", padding=4)
             ax2.set_xticks(x2, labels, rotation=25, ha="right",
-                           fontsize=8.5)
+                           fontsize=8)
             ax2.axhline(0, color="#64748b", lw=0.8)
             ax2.set_title("Biochemical components (NMF)\n"
                           "paired deltas, tumor − own normal", fontsize=10)
@@ -4581,12 +5972,24 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self, "No data", "Load data first.")
             return
-        if self._honest_worker is not None and self._honest_worker.isRunning():
+        if ((self._honest_worker is not None
+                and self._honest_worker.isRunning())
+                or (self._analysis_worker is not None
+                    and self._analysis_worker.isRunning())):
+            # 2026-09-05: also refuse while the auto-diag chain runs —
+            # two pool-spawning QThreads was the native-crash race
+            QtWidgets.QMessageBox.information(
+                self, "Busy",
+                "Another analysis is still running — wait for it.")
             return
         exclude = (self.spike_flags
                    if (self.spike_flags is not None
                        and self.chk_exclude_flagged.isChecked()) else None)
-        self.b_honest_btn = self.sender()      # None when called w/o a button
+        # only a real button counts — sender() inside the auto-chain is
+        # the emitting worker object, not None (would crash on setEnabled)
+        btn = self.sender()
+        self.b_honest_btn = (btn if isinstance(
+            btn, QtWidgets.QAbstractButton) else None)
         if self.b_honest_btn is not None:
             self.b_honest_btn.setEnabled(False)
         self.train_status.setText("Honest (nested) evaluation running — "
@@ -4606,35 +6009,57 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_honest_done(self, out: dict):
         if self.b_honest_btn is not None:
             self.b_honest_btn.setEnabled(True)
-        optimistic = self.winner.macro_f1() if self.winner else float("nan")
-        choices = "; ".join(
-            f"fold{c['fold']}: {c['preprocess']}+{c['model']} "
-            f"F1 {c['f1']:.2f}" for c in out["fold_choices"])
-        self.log(f"Honest (nested) evaluation: macro-F1 "
-                 f"{out['mean_f1']:.3f} ± {out['std_f1']:.3f} "
-                 f"(optimistic single-choice number: {optimistic:.3f})")
-        self.log(f"  per-fold choices: {choices}")
-        self._honest_result = out
-        self.train_status.setText(
-            f"Honest macro-F1 {out['mean_f1']:.3f} ± {out['std_f1']:.3f} "
-            f"(vs optimistic {optimistic:.3f}) — see log.")
+        if self._honest_worker is not None:
+            self._honest_worker.wait(10000)  # done before chain reuses it
+        try:
+            optimistic = (self.winner.macro_f1() if self.winner
+                          else float("nan"))
+            choices = "; ".join(
+                f"fold{c['fold']}: {c['preprocess']}+{c['model']} "
+                f"F1 {c['f1']:.2f}" for c in out["fold_choices"])
+            self.log(f"Honest (nested) evaluation: macro-F1 "
+                     f"{out['mean_f1']:.3f} ± {out['std_f1']:.3f} "
+                     f"(optimistic single-choice number: {optimistic:.3f})")
+            self.log(f"  per-fold choices: {choices}")
+            self._honest_result = out
+            self.train_status.setText(
+                f"Honest macro-F1 {out['mean_f1']:.3f} ± "
+                f"{out['std_f1']:.3f} (vs optimistic {optimistic:.3f}) — "
+                "see log.")
+            panel = self._diag_panel("honest", "Honest (nested) evaluation",
+                                     chart=False)
+            self._diag_caption(
+                panel, f"Honest macro-F1 {out['mean_f1']:.3f} ± "
+                       f"{out['std_f1']:.3f} (optimistic single-choice "
+                       f"number: {optimistic:.3f}).\n"
+                       f"Per-fold choices: {choices}")
+        except Exception:
+            # one broken result panel must never stall the serial chain
+            self.log("Honest evaluation: displaying the result failed:\n"
+                     + traceback.format_exc())
+        finally:
+            self._pop_diag_queue()          # serial chain ALWAYS continues
 
     def on_honest_failed(self, tb: str):
         if self.b_honest_btn is not None:
             self.b_honest_btn.setEnabled(True)
+        if self._honest_worker is not None:
+            self._honest_worker.wait(10000)  # done before chain reuses it
         self.log(f"Honest evaluation failed:\n{tb}")
         self.train_status.setText("Honest evaluation failed — see log.")
         QtWidgets.QMessageBox.warning(
             self, "Honest evaluation failed",
             "Nested honest evaluation failed.\n\nTechnical details are "
             "in session.log next to the app.")
+        self._pop_diag_queue()          # serial chain continues
 
-    def run_locked_eval(self):
+    def run_locked_eval(self, auto: bool = False):
         """
         TRIPOD-style final exam: split PATIENTS 70/15/15, refit the
         winner on the training patients only, evaluate ONE-SHOT on the
         untouched test patients.  Honest but noisy — guard against
-        re-running until the numbers look good.
+        re-running until the numbers look good.  auto=True (diagnostic
+        auto-chain after training) skips the confirmation dialog.
         """
         if self.winner is None or self.winner.pipeline is None:
             QtWidgets.QMessageBox.information(
@@ -4653,16 +6078,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "Train first",
                 "Train first so the feature matrix matches the winner.")
             return
-        ans = QtWidgets.QMessageBox.question(
-            self, "Run the locked final exam?",
-            "This splits the patients 70/15/15, refits the winner on the "
-            "training patients and evaluates ONE-SHOT on the untouched "
-            "test patients.\n\nIt is meant to be run ONCE per "
-            "configuration — re-running until the numbers look good "
-            "defeats its purpose. Continue?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
-        if ans != QtWidgets.QMessageBox.Yes:
+        # dataset-consistency guard (2026-09-05): the locked exam splits
+        # patients from self.groups but evaluates rows of the CACHED
+        # training matrix — after a reset + different folder that mixes
+        # two datasets and silently evaluates the wrong rows
+        if (self.groups is None or self.labels is None
+                or self._data_key != self._lc_data_key):
+            QtWidgets.QMessageBox.information(
+                self, "Data changed since training",
+                "The locked evaluation must run on the SAME dataset the "
+                "winner was trained on. Reload that dataset (or retrain)"
+                " first — mixing datasets would evaluate the wrong rows.")
             return
+        if not auto:
+            ans = QtWidgets.QMessageBox.question(
+                self, "Run the locked final exam?",
+                "This splits the patients 70/15/15, refits the winner on "
+                "the training patients and evaluates ONE-SHOT on the "
+                "untouched test patients.\n\nIt is meant to be run ONCE "
+                "per configuration — re-running until the numbers look "
+                "good defeats its purpose. Continue?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+            if ans != QtWidgets.QMessageBox.Yes:
+                return
         X, yy, gg = self._lc_data
         groups_l, labels_l = list(self.groups), list(self.labels)
         winner_pl, winner_classes, seed = (self.winner.pipeline,
@@ -4718,17 +6156,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.train_status.setText(
                 f"Locked FINAL: macro-F1 {out['f1']:.3f} on "
                 f"{out['n_test_patients']} unseen patients")
+            panel = self._diag_panel("locked",
+                                     "Locked test-set evaluation (FINAL)",
+                                     chart=False)
+            self._diag_caption(panel, self._locked_text(out))
             self.render_locked_result()
 
+        self._diag_running("locked", "Locked test-set evaluation "
+                                      "(FINAL)", chart=False)
         self._run_async("Locked evaluation", fn, done)
 
-    def render_locked_result(self):
-        """Fill the FINAL card on the Result page from _locked_result."""
-        out = getattr(self, "_locked_result", None)
-        if not out:
-            self.r_locked_card.setVisible(False)
-            return
-        self.r_locked_card.setVisible(True)
+    @staticmethod
+    def _locked_text(out: dict) -> str:
+        """FINAL-summary text shared by the Train inline panel and the
+        Result-page card."""
         txt = (f"FINAL — one-shot on {out['n_test_spectra']} spectra / "
                f"{out['n_test_patients']} UNSEEN patients "
                f"({out['when']}): macro-F1 {out['f1']:.3f}")
@@ -4739,7 +6180,16 @@ class MainWindow(QtWidgets.QMainWindow):
         txt += (". Model refit on the training patients only; no "
                 "threshold or preprocessing tuning touched the test "
                 "patients.")
-        self.r_locked_label.setText(txt)
+        return txt
+
+    def render_locked_result(self):
+        """Fill the FINAL card on the Result page from _locked_result."""
+        out = getattr(self, "_locked_result", None)
+        if not out:
+            self.r_locked_card.setVisible(False)
+            return
+        self.r_locked_card.setVisible(True)
+        self.r_locked_label.setText(self._locked_text(out))
 
     # ==================================================== deep diagnostics
     def _deep_guard(self, need_groups: bool = True) -> bool:
@@ -4792,15 +6242,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.train_status.setText(
                 f"LOPO: macro-F1 {out['f1']:.3f} over "
                 f"{out['n_patients']} unseen patients")
-            ax = plotting.clear(self.roc_canvas)
+            panel = self._diag_panel("lopo", "Leave-one-patient-out")
+            self._diag_caption(
+                panel, f"macro-F1 {out['f1']:.3f}"
+                + (f", AUC {out['auc']:.3f}" if np.isfinite(out["auc"])
+                   else "")
+                + f", mean per-patient accuracy "
+                  f"{np.mean(out['accs']):.3f}")
+            ax = plotting.clear(panel[1])
             pp = sorted(out["per_patient"], key=lambda r: r[2])
             names = [r[0] for r in pp]
             accs = [r[2] for r in pp]
             ax.bar(names, accs,
-                   color=["#dc2626" if a < 0.5 else "#2563eb"
+                   color=[COL_RESULT if a < 0.5 else COL_SIGN_NEG
                           for a in accs],
                    edgecolor="white", linewidth=0.6)
-            ax.axhline(np.mean(accs), color="#64748b", lw=1.0, ls="--",
+            ax.axhline(np.mean(accs), color=COL_ZERO, lw=1.0, ls="--",
                        label=f"mean {np.mean(accs):.2f}")
             ax.set_ylabel("per-patient accuracy")
             ax.set_title(f"Leave-one-patient-out ({len(pp)} patients, "
@@ -4808,8 +6265,9 @@ class MainWindow(QtWidgets.QMainWindow):
             ax.set_ylim(0, 1.05)
             ax.tick_params(axis="x", rotation=60, labelsize=7)
             ax.legend(loc="lower right", fontsize=8)
-            self.roc_canvas.draw_idle()
+            panel[1].draw()       # sync: no idle timer outliving the panel
 
+        self._diag_running("lopo", "Leave-one-patient-out")
         self._run_async("Leave-one-patient-out", fn, done)
 
     def run_seed_stability(self):
@@ -4834,16 +6292,31 @@ class MainWindow(QtWidgets.QMainWindow):
                      f"(min {min(f1s):.3f}, max {max(f1s):.3f})")
             self.train_status.setText(
                 f"Seed stability: {np.mean(f1s):.3f} ± {np.std(f1s):.3f}")
-            ax = plotting.clear(self.roc_canvas)
+            panel = self._diag_panel("seeds", "Seed stability")
+            self._diag_caption(
+                panel, f"macro-F1 {np.mean(f1s):.3f} ± {np.std(f1s):.3f} "
+                       f"over 5 seeds (min {min(f1s):.3f}, "
+                       f"max {max(f1s):.3f})")
+            ax = plotting.clear(panel[1])
             ax.boxplot([f1s], tick_labels=["winner"], showmeans=True,
-                       widths=0.35)
-            ax.scatter([1] * len(f1s), f1s, color="#2563eb", zorder=3,
+                       widths=0.35, patch_artist=True,
+                       boxprops=dict(facecolor="#dbeafe",
+                                     edgecolor=COL_MAIN, lw=1.2),
+                       medianprops=dict(color=COL_RESULT, lw=1.6),
+                       whiskerprops=dict(color=COL_ZERO, lw=1.0),
+                       capprops=dict(color=COL_ZERO, lw=1.0),
+                       meanprops=dict(marker="D",
+                                      markerfacecolor=COL_ANNOT,
+                                      markeredgecolor="white",
+                                      markersize=5))
+            ax.scatter([1] * len(f1s), f1s, color=COL_MAIN, zorder=3,
                        s=18)
             ax.set_ylabel("macro-F1 (grouped CV)")
             ax.set_title(f"Seed stability — {np.mean(f1s):.3f} ± "
                          f"{np.std(f1s):.3f} (5 seeds)", fontsize=10)
-            self.roc_canvas.draw_idle()
+            panel[1].draw()       # sync: no idle timer outliving the panel
 
+        self._diag_running("seeds", "Seed stability")
         self._run_async("Seed stability check", fn, done)
 
     def run_noise_check(self):
@@ -4870,21 +6343,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.train_status.setText(
                 f"Noise check: F1 {curve[0][1]:.3f} -> {curve[-1][1]:.3f} "
                 "at 5% noise")
-            ax = plotting.clear(self.roc_canvas)
+            panel = self._diag_panel("noise", "Noise robustness")
+            self._diag_caption(
+                panel, " → ".join(f"{int(lv * 100)}%: {f:.3f}"
+                                  for lv, f in curve)
+                + f" (drop {drop:.3f} at 5% noise)")
+            ax = plotting.clear(panel[1])
             lv = [f"{int(l * 100)}%" for l, _f in curve]
             fv = [f for _l, f in curve]
-            ax.plot(lv, fv, "o-", color="#dc2626", lw=1.8, ms=6)
+            ax.plot(lv, fv, "o-", color=COL_RESULT, lw=1.8, ms=6)
             for x, y in zip(lv, fv, strict=True):
                 ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points",
-                            xytext=(0, 8), ha="center", fontsize=8.5,
+                            xytext=(0, 8), ha="center", fontsize=8,
                             color="#334155")
             ax.set_xlabel("added noise (fraction of signal scale)")
             ax.set_ylabel("macro-F1")
             ax.set_ylim(min(fv) - 0.05, max(fv) + 0.05)
             ax.set_title(f"Noise robustness — drop {drop:.3f} at 5% "
                          "noise", fontsize=10)
-            self.roc_canvas.draw_idle()
+            panel[1].draw()       # sync: no idle timer outliving the panel
 
+        self._diag_running("noise", "Noise robustness")
         self._run_async("Noise robustness check", fn, done)
 
     def run_local_explain(self):
@@ -4959,7 +6438,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def done(rows):
             self._local_bands = rows
             ax = plotting.clear(self.r_local_canvas)
-            colors = {1: "#dc2626", -1: "#2563eb"}
+            colors = {1: COL_SIGN_POS, -1: COL_SIGN_NEG}
             ybase = 0.0
             yticks, yticklabs = [], []
             for cls, contribs in rows:
@@ -4976,7 +6455,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ybase += len(contribs) + 1.2
             ax.set_yticks(yticks, yticklabs, fontsize=9,
                           fontweight="bold")
-            ax.axvline(0, color="#64748b", lw=0.8)
+            ax.axvline(0, color=COL_ZERO, lw=0.8)
             ax.invert_yaxis()
             ax.set_xlabel("signed SHAP contribution (surrogate)")
             ax.set_title("Why this call — band contributions per "
@@ -4999,9 +6478,32 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.spectra:
             QtWidgets.QMessageBox.information(
                 self, "No data yet",
-                "Load a spectra folder (or generate the demo dataset) "
-                "first — use the Start page.")
+                "Load a spectra folder first — use the Start page.")
             self.go_to(TAB_START)
+            return
+        # never overlap training with another worker pool — the auto
+        # diagnostics chain, Optimize, Predict, a 3SSE search or the
+        # Model Lab (2026-09-05: the old guard missed Optimize/Predict/
+        # 3SSE/Model-Lab, exactly the loky-pools-in-two-QThreads native
+        # crash gotcha #16 warns about)
+        if ((self._analysis_worker is not None
+                and self._analysis_worker.isRunning())
+                or (self._honest_worker is not None
+                    and self._honest_worker.isRunning())
+                or (self._opt_worker is not None
+                    and self._opt_worker.isRunning())
+                or (self._pred_worker is not None
+                    and self._pred_worker.isRunning())
+                or (self._seq_worker is not None
+                    and self._seq_worker.isRunning())
+                or getattr(self, "_lab_cancel", None) is not None
+                or self._diag_queue):
+            QtWidgets.QMessageBox.information(
+                self, "Another job is running",
+                "Optimize / predict / diagnostics / a 3SSE search / the "
+                "Model Lab is still running — wait for it (or cancel "
+                "it) before training, so two worker pools never run at "
+                "the same time.")
             return
         unlabeled = sum(1 for l in self.labels if not l.strip())
         if unlabeled:
@@ -5034,6 +6536,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                           "Select at least one model.")
             return
         self.b_train.setEnabled(False)
+        self.b_model_lab.setEnabled(False)
         for b in getattr(self, "_diag_buttons", []):
             b.setEnabled(False)      # winner is going stale
         self.progress.setValue(0)
@@ -5043,6 +6546,7 @@ class MainWindow(QtWidgets.QMainWindow):
         paired_mode = mode_kind in ("paired", "paired-pqn", "seq-paired")
         if paired_mode and self.groups is None:
             self.b_train.setEnabled(True)
+            self.b_model_lab.setEnabled(True)
             QtWidgets.QMessageBox.warning(
                 self, "Paired mode needs patient groups",
                 "Paired-reference classification needs clinical data "
@@ -5077,6 +6581,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._paired_mode = False
         except Exception as exc:
             self.b_train.setEnabled(True)
+            self.b_model_lab.setEnabled(True)
             self.friendly_error("Preprocessing failed", exc)
             return
         if not paired_mode:
@@ -5098,6 +6603,16 @@ class MainWindow(QtWidgets.QMainWindow):
             gg = [pat for (pat, _lab) in agg.keys()]
             self.log(f"Averaged replicates: {len(agg)} (patient, class) "
                      f"rows from {n_before} spectra")
+        # OOF-row -> Data-table-row map for the label-error review: only
+        # defined when training rows map 1:1 to original spectra (no
+        # replicate averaging, no paired deviation rows).  WITHOUT this
+        # map the old code applied matrix indices to the table and the
+        # user "fixed" the WRONG spectra (spike exclusion is ON by
+        # default, so the indices were almost always shifted).
+        averaged = (not paired_mode and gg is not None
+                    and self.chk_avg_replicates.isChecked())
+        self._train_row_map = (None if (paired_mode or averaged)
+                               else list(keep))
         repeats = 3 if self.chk_repeat.isChecked() else 1
         self.log(f"Training {len(names)} models, "
                  f"{self.spin_folds.value()}-fold CV"
@@ -5106,6 +6621,7 @@ class MainWindow(QtWidgets.QMainWindow):
                  f"features={X.shape[1]}, classes={sorted(set(yy))}"
                  + (f", grouped by {len(set(gg))} patients" if gg else ""))
         self._lc_data = (X, yy, gg)
+        self._lc_data_key = self._data_key   # dataset-consistency tag
         self._region_bands = None      # stale after any retrain
         # the wavenumber axis for the peak-band model must match the
         # (cropped) feature columns of X — also reused by the
@@ -5153,9 +6669,18 @@ class MainWindow(QtWidgets.QMainWindow):
                                   repeats=repeats,
                                   wavenumbers=wn_for_models)
         self.worker.progress.connect(self.on_train_progress)
-        self.worker.done.connect(self.on_train_done)
+        self.worker.done.connect(self._on_train_done_then_diags)
         self.worker.failed.connect(self.on_train_failed)
+        self.log(modeling.device_report())
         self.worker.start()
+
+    def _on_train_done_then_diags(self, results, winner):
+        """Training finished → normal completion handling, then the
+        whole diagnostics battery runs automatically (each result in
+        its own panel — no clicking)."""
+        self.on_train_done(results, winner)
+        self.report_uncertainty_stats()
+        self.run_all_diagnostics()
 
     def on_train_progress(self, pct: int, msg: str):
         self.progress.setValue(pct)
@@ -5164,6 +6689,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_train_done(self, results, winner):
         self.results, self.winner = results, winner
+        # charts from a previous winner must not linger next to a new one
+        for key, (frame, _cv, _cap) in list(self._diag_panels.items()):
+            if key not in ("cm", "roc"):
+                self.diag_stack.removeWidget(frame)
+                frame.deleteLater()
+                del self._diag_panels[key]
         self.chain_flow.hide()          # 3SSE path re-shows with arch
         for b in getattr(self, "_diag_buttons", []):
             b.setEnabled(True)
@@ -5184,8 +6715,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.banner_plain.setText(
             f"Detects {sens:.0%} of true positive cases · correctly rules "
             f"out {spec:.0%} of negatives · {self.spin_folds.value()}-fold "
-            f"cross-validated. Save the model to start predicting."
+            "cross-validated. Save the model to start predicting."
             f"{extra}")
+        # B6: the patient-level (mean-probability) reading next to the
+        # spectrum-level numbers — the operating level the field reports
+        if (winner.groups is not None and winner.oof_proba is not None
+                and winner.y_true_encoded is not None):
+            try:
+                pm = sstats.patient_level_metrics(
+                    winner.y_true_encoded, winner.groups,
+                    winner.oof_proba)
+                if pm is not None:
+                    self.banner_plain.setText(
+                        self.banner_plain.text()
+                        + f"  ·  Patient-level (mean P, n={pm['n_patients']}):"
+                        f" F1 {pm['f1']:.3f}"
+                        + (f", AUC {pm['auc']:.3f}"
+                           if "auc" in pm else ""))
+            except Exception:
+                self.log("Patient-level metrics failed:\n"
+                         + traceback.format_exc())
         self.train_status.setText(
             f"Done — best: {winner.name} (macro-F1 {f1:.3f}). Save it, "
             "then go to Predict.")
@@ -5224,12 +6773,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_nav()
 
     def on_train_failed(self, err: str):
+        # re-enable EVERYTHING disabled at training start (2026-09-05):
+        # the old version left Model Lab + all diagnostics dead until a
+        # SUCCESSFUL retrain or an app restart
         self.b_train.setEnabled(bool(self.spectra))
+        self.b_model_lab.setText("⚡ Model Lab (one click)")
+        self.b_model_lab.setEnabled(bool(self.spectra)
+                                    and self.groups is not None)
+        for b in getattr(self, "_diag_buttons", []):
+            b.setEnabled(self.winner is not None)
         self.log("Training FAILED:\n" + err)
         QtWidgets.QMessageBox.critical(
             self, "Training failed",
             "Training ran into an error:\n\n" + err.splitlines()[-1] +
-            "\n\nFull details are printed to the console.")
+            "\n\nFull details are in session.log next to the app.")
 
     # ================================================== 3SSE handlers
     def mode_kind(self) -> str:
@@ -5333,8 +6890,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.spectra:
             QtWidgets.QMessageBox.information(
                 self, "No data yet",
-                "Load a spectra folder (or generate the demo dataset) "
-                "first — use the Start page.")
+                "Load a spectra folder first — use the Start page.")
             self.go_to(TAB_START)
             return
         if (self._seq_worker is not None
@@ -5462,6 +7018,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_seq_done(self, payload: dict):
         self.b_train.setEnabled(True)
+        self.b_model_lab.setEnabled(True)
         self.b_3sse_run.show()
         self.b_3sse_cancel.hide()
         self.progress.setValue(100)
@@ -5530,6 +7087,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_seq_cancelled(self):
         self.b_train.setEnabled(True)
+        self.b_model_lab.setEnabled(True)
         self.b_3sse_run.show()
         self.b_3sse_cancel.hide()
         self.progress.setValue(0)
@@ -5540,6 +7098,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_seq_failed(self, tb: str):
         self.b_train.setEnabled(True)
+        self.b_model_lab.setEnabled(True)
         self.b_3sse_run.show()
         self.b_3sse_cancel.hide()
         self.log(f"3SSE search failed:\n{tb}")
@@ -5631,27 +7190,50 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _draw_winner_plots(self):
         w = self.winner
-        ax = plotting.clear(self.cm_canvas)
+        # cm + roc share ONE side-by-side row at the top of the stack —
+        # the two key winner charts are visible in a single glance
+        if self._winner_row is None:
+            self._winner_row = QtWidgets.QWidget()
+            r = QtWidgets.QHBoxLayout(self._winner_row)
+            r.setContentsMargins(0, 0, 0, 0)
+            r.setSpacing(10)
+            self.diag_stack.insertWidget(0, self._winner_row)
+        row_lay = self._winner_row.layout()
+        cm_panel = self._diag_panel("cm", "Confusion matrix",
+                                    size=(4.6, 3.6),   # square chart
+                                    container=row_lay)
+        ax = plotting.clear(cm_panel[1])
         plotting.plot_confusion_matrix(
             ax, w.cm, w.classes,
             title="Confusion matrix (pooled CV folds)")
-        self.cm_canvas.draw_idle()
+        cm_panel[1].draw()   # sync: no idle timer outliving the panel
 
-        ax = plotting.clear(self.roc_canvas)
+        roc_panel = self._diag_panel("roc", "ROC · PR / per-class metrics",
+                                     size=(7.2, 3.6), container=row_lay)
+        row_lay.setStretchFactor(cm_panel[0], 40)
+        row_lay.setStretchFactor(roc_panel[0], 60)
+        ax = plotting.clear(roc_panel[1])
         try:
             if w.oof_proba is not None and len(w.classes) == 2:
                 ye = w.y_true_encoded
                 valid = ~np.isnan(w.oof_proba[:, 1])
                 fpr, tpr, auc = modeling.roc_points(
                     ye[valid], w.oof_proba[valid, 1])
-                plotting.plot_roc(ax, fpr, tpr, auc, label=w.name)
+                prec, rec, ap = modeling.pr_points(
+                    ye[valid], w.oof_proba[valid, 1])
+                fig = roc_panel[1].figure
+                fig.clf()
+                axr = fig.add_subplot(121)
+                axp = fig.add_subplot(122)
+                plotting.plot_roc(axr, fpr, tpr, auc, label=w.name)
+                plotting.plot_pr(axp, prec, rec, ap, label=w.name)
             elif w.oof_proba is not None:
                 plotting.plot_perclass_metrics(
                     ax, w.classes, w.per_class,
                     title=f"{w.name} — per-class metrics")
         except Exception:
             self.log("ROC/metrics plot failed:\n" + traceback.format_exc())
-        self.roc_canvas.draw_idle()
+        roc_panel[1].draw()  # sync: no idle timer outliving the panel
 
     def save_model(self):
         if self.winner is None:
@@ -5701,6 +7283,16 @@ class MainWindow(QtWidgets.QMainWindow):
                                  region_bands=self._region_bands,
                                  op_points=op_extra,
                                  calibrator=calibrator)
+            card = os.path.splitext(path)[0] + "_card.md"
+            try:
+                modeling.export_model_card(card, self.winner,
+                                           self.read_params().validate(),
+                                           dataset_name=self.folder_edit
+                                           .text())
+                self.log(f"Model card: {card}")
+            except Exception:
+                self.log("Model card export failed:\n"
+                         + traceback.format_exc())
             self.log(f"Model saved: {path}")
             self.settings["last_model"] = path
             uh.save_settings(self.settings)
@@ -5797,35 +7389,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         if os.path.isdir(target):
             files, skipped = [], []
-
-            def _spectra_in(d: str) -> list[str]:
-                return [os.path.join(d, s) for s in sorted(os.listdir(d))
-                        if s.lower().endswith((".txt", ".dat", ".csv"))]
-
-            for fn in sorted(os.listdir(target)):
-                path = os.path.join(target, fn)
-                if not os.path.isdir(path):
-                    entries = [(fn, path)]
-                else:
-                    own = _spectra_in(path)
-                    if own:
-                        # <root>/<patient>/ tree
-                        entries = [(os.path.basename(p), p) for p in own]
-                    else:
-                        # clinical <root>/<class>/<patient>/ tree — walk
-                        # one more level
-                        entries = []
-                        for sub in sorted(os.listdir(path)):
-                            subpath = os.path.join(path, sub)
-                            if os.path.isdir(subpath):
-                                entries += [(os.path.basename(p), p)
-                                            for p in _spectra_in(subpath)]
-                for sfn, spath in entries:
-                    if (any(m in sfn.lower() for m in REFERENCE_MARKERS)
-                            or sfn.lower() == "split_log.txt"):
-                        skipped.append(sfn)
+            # fully recursive: any nesting depth (<root>/<class>/<patient>/
+            # <anything>/*.csv all collected)
+            for dirpath, _dirnames, filenames in os.walk(target):
+                for fn in sorted(filenames):
+                    if not fn.lower().endswith((".txt", ".dat", ".csv")):
                         continue
-                    files.append(spath)
+                    if (any(m in fn.lower() for m in REFERENCE_MARKERS)
+                            or fn.lower() == "split_log.txt"):
+                        skipped.append(fn)
+                        continue
+                    files.append(os.path.join(dirpath, fn))
+            files.sort()
             if skipped:
                 self.log(f"Prediction folder: skipped {len(skipped)} "
                          f"non-sample file(s): {', '.join(skipped[:5])}"
@@ -5868,11 +7443,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 manual_ref = None
             if not manual_ref:
                 # no manual folder: auto per-patient references need a
-                # clinical <root>/<class>/<patient> tree — check quickly
+                # clinical tree somewhere at/above the selected folder —
+                # walk up from the input root looking for a Normal* side
                 has_tree = False
-                if os.path.isdir(root):
-                    for cls_dir in os.listdir(root):
-                        cp = os.path.join(root, cls_dir)
+                base = os.path.abspath(root) if os.path.isdir(root) else None
+                for _ in range(3):
+                    if not base or not os.path.isdir(base):
+                        break
+                    for cls_dir in os.listdir(base):
+                        cp = os.path.join(base, cls_dir)
                         if (os.path.isdir(cp)
                                 and cls_dir.lower().startswith(
                                     PredictWorker.NORMAL_SYNONYMS)
@@ -5881,6 +7460,12 @@ class MainWindow(QtWidgets.QMainWindow):
                                     for d in os.listdir(cp))):
                             has_tree = True
                             break
+                    if has_tree:
+                        break
+                    nxt = os.path.dirname(base)
+                    if nxt == base:
+                        break
+                    base = nxt
                 if not has_tree:
                     QtWidgets.QMessageBox.warning(
                         self, "Reference required",
@@ -5893,11 +7478,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     return
         self.b_predict.setEnabled(False)
         self.statusBar().showMessage("Predicting…")
+        self.predict_status.setText("Predicting…")
         self._pred_worker = PredictWorker(self.bundle, files, root,
                                           manual_ref_dir=manual_ref)
         self._pred_worker.progress.connect(
             lambda pct, msg: self.statusBar().showMessage(
                 f"{pct}% — {msg}"))
+        self._pred_worker.progress.connect(
+            lambda pct, msg: self.predict_status.setText(
+                f"Predicting… {pct}% — {msg}"))
         self._pred_worker.first_plot.connect(self.on_predict_first)
         self._pred_worker.done.connect(self.on_predict_done)
         self._pred_worker.failed.connect(self.on_predict_failed)
@@ -5909,6 +7498,51 @@ class MainWindow(QtWidgets.QMainWindow):
             info["proc"], info["pred"], info["probs"],
             title=info["title"])
         self.pred_canvas.draw_idle()
+
+    def _draw_prediction_overview(self):
+        """Predict-page chart after prediction: every classified trace
+        with the bold mean (+ paired reference) and the class counts."""
+        if not self._pred_spectra:
+            return
+        fig = self.pred_canvas.figure
+        fig.clf()
+        gs = fig.add_gridspec(1, 2, width_ratios=[3, 2])
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax2 = fig.add_subplot(gs[0, 1])
+        mean_trace = np.mean(np.vstack(self._pred_spectra), axis=0)
+        plotting.plot_prediction_spectra(
+            ax1, self._pred_wn, self._pred_spectra,
+            mean_trace=mean_trace, reference=self._pred_reference)
+        pos = self._positive_class()
+        classes_seen = sorted({c for _f, c, _p in self._pred_rows})
+        vals = [sum(1 for _f, c, _p in self._pred_rows if c == k)
+                for k in classes_seen]
+        plotting.plot_count_bars(ax2, classes_seen, vals,
+                                 title="Predicted classes", positive=pos)
+        self.pred_canvas.draw_idle()
+
+    def _set_predict_summary(self, rows):
+        """Pills + status line summarising a finished prediction."""
+        counts: dict[str, int] = {}
+        for _f, cls, _p in rows:
+            counts[cls] = counts.get(cls, 0) + 1
+        parts = [f"{v} {k}" for k, v in sorted(counts.items())]
+        pos = self._positive_class()
+        self.pred_pills[0].setText(f"{len(rows)} spectra")
+        self.pred_pills[0].setVisible(True)
+        for i, p in enumerate(self.pred_pills[1:], 1):
+            if i - 1 < len(parts):
+                p.setText(parts[i - 1])
+                p.setProperty("tone", "red"
+                              if pos and parts[i - 1].endswith(pos)
+                              else "green")
+                uh.repolish(p)
+                p.setVisible(True)
+            else:
+                p.setVisible(False)
+        self.predict_status.setText(
+            "Prediction done — full report on the Result page (Next). "
+            + " · ".join(parts))
 
     def on_predict_done(self, payload: dict):
         self.b_predict.setEnabled(True)
@@ -5926,18 +7560,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pred_reference = payload["reference"]
         self._patient_rows = self._aggregate_patients(
             payload["ok_paths"], rows)
-        self.pred_table.setRowCount(len(rows))
-        for r, (f, p, pv) in enumerate(rows):
-            for c, v in enumerate((f, p, f"{pv:.3f}")):
-                it = QtWidgets.QTableWidgetItem(v)
-                if c:
-                    it.setTextAlignment(ALIGN_CENTER)
-                self.pred_table.setItem(r, c, it)
+        self._fill_prediction_table(self.pred_table)
         if not rows:
             QtWidgets.QMessageBox.warning(
                 self, "Nothing predicted",
                 "None of the selected files could be read as spectra.")
             return
+        self._set_predict_summary(rows)
+        self._draw_prediction_overview()
         self.refresh_nav()
         self.render_result_page()
         self.go_to(TAB_RESULT)
@@ -5966,9 +7596,9 @@ class MainWindow(QtWidgets.QMainWindow):
         target = self.spec_path_edit.text().strip()
         root = target if os.path.isdir(target) else os.path.dirname(
             files[0])
-        groups: dict[str, list[tuple]] = {}
+        groups: dict[str, list[int]] = {}
         multi = False
-        for path, row in zip(files, rows, strict=True):
+        for i, path in enumerate(files):
             rel = os.path.relpath(os.path.abspath(path),
                                   os.path.abspath(root))
             parts = rel.replace("\\", "/").split("/")
@@ -5976,24 +7606,41 @@ class MainWindow(QtWidgets.QMainWindow):
             # (<root>/<patient>/f  and  <root>/<class>/<patient>/f)
             patient = parts[-2] if len(parts) > 1 else "(single)"
             multi = multi or len(parts) > 1
-            groups.setdefault(patient, []).append(row)
+            groups.setdefault(patient, []).append(i)
         if not multi:
             return []                     # flat folder: nothing to group
         pos = self._positive_class() or ""
+        pred_probs = self._pred_probs if len(self._pred_probs) == len(rows) \
+            else None
         out_rows = []
-        for patient, rs in sorted(groups.items()):
+        for patient, idxs in sorted(groups.items()):
             votes: dict[str, int] = {}
-            probs = []
-            for _f, cls, p in rs:
-                votes[cls] = votes.get(cls, 0) + 1
-                probs.append((cls, p))
-            mean_p = (np.mean([p for c, p in probs if c == pos])
-                      if any(c == pos for c, _p in probs) else 0.0)
-            verdict = max(votes.items(), key=lambda kv: kv[1])[0]
+            for i in idxs:
+                votes[rows[i][1]] = votes.get(rows[i][1], 0) + 1
+            # probability-mean verdict (Jeng 2019: patient-wise
+            # aggregation beats point-wise): mean P(positive) over ALL
+            # of the patient's spectra; majority vote stays visible as
+            # the vote counts
+            mean_p = float("nan")
+            if pos and pred_probs is not None:
+                p_list = [pred_probs[i].get(pos, float("nan"))
+                          for i in idxs]
+                finite = [p for p in p_list if np.isfinite(p)]
+                mean_p = float(np.mean(finite)) if finite else float("nan")
+            if not np.isfinite(mean_p) and pos:
+                called = [rows[i][2] for i in idxs
+                          if rows[i][1] == pos]
+                mean_p = float(np.mean(called)) if called else 0.0
+            if pos:
+                verdict = pos if mean_p >= 0.5 else next(
+                    (c for c in votes if c != pos), pos)
+            else:
+                verdict = max(votes.items(), key=lambda kv: kv[1])[0]
             votes_str = " / ".join(f"{c}:{n}" for c, n in
                                    sorted(votes.items()))
-            out_rows.append((patient, len(rs), votes_str,
-                             float(mean_p), verdict))
+            out_rows.append((patient, len(idxs), votes_str,
+                             float(mean_p) if np.isfinite(mean_p) else 0.0,
+                             verdict))
         return out_rows
 
     # ======================================================= status / help
@@ -6006,7 +7653,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.w_lbl_data.setText(line(
             bool(self.spectra),
             f"Data loaded — {len(self.spectra)} spectra, {n_classes} classes",
-            "Load your spectra folder (or generate demo data)"))
+            "Load your spectra folder"))
         self.w_lbl_model.setText(line(
             self.winner is not None,
             (f"Model trained — best: {self.winner.name} "
@@ -6025,6 +7672,34 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         for p, txt in zip(self.hero_pills, pills_txt, strict=True):
             p.setText(txt)
+        # dataset QC + biochemical-shift narrative, once per data state
+        key = f"{len(self.spectra)}|{getattr(self, '_data_key', '')}"
+        if self.spectra and getattr(self, "_qc_key", None) != key:
+            self._qc_key = key
+            try:
+                wn_full = np.asarray(self.grid, dtype=float)
+                q = bio.dataset_qc(self.X_raw, wn_full)
+                self.log(f"Dataset QC: median SNR {q['snr_median']:.0f} "
+                         f"(p10 {q['snr_p10']:.0f}) · spike-proxy max "
+                         f"{q['spike_proxy_max']:.0f}"
+                         + (" · thiocyanate band in range (saliva "
+                            "preset usable)" if q["thiocyanate_band"]
+                            else ""))
+                labels = np.array([l if l else "" for l in self.labels])
+                if len(set(labels[labels != ""])) == 2:
+                    m = preprocessing.crop_mask(wn_full,
+                                                self.read_params())
+                    rows = bio.biochemical_shift(self.X_raw[:, m],
+                                                 wn_full[m], labels)
+                    top = sorted(rows, key=lambda r: -abs(r[3]))[:3]
+                    txt = " · ".join(
+                        f"{r[1]} {r[3]:+.2f}" +
+                        (" (p<.05)" if r[4] < 0.05 else "")
+                        for r in top if r[0])
+                    self.log(f"Biochemical shift (top bands, {sorted(set(labels[labels != '']))[-1]} vs "
+                             f"{sorted(set(labels[labels != '']))[0]}): {txt}")
+            except Exception:
+                pass                     # QC never blocks the workflow
 
     def refresh_nav(self):
         done = [False,
@@ -6069,6 +7744,45 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.about(self, "About", uh.about_text(BINDING))
 
     # ================================================================ misc
+    def _install_excepthook(self):
+        """
+        Last-resort net for ANY unhandled exception (Qt slots qFatal-
+        abort SILENTLY on PyQt >= 5.5 otherwise — gotcha #19): log the
+        full traceback, flag it in the status bar, and keep running.
+        The dialog fires once per session so an error storm cannot
+        spam dialogs; later errors stay in session.log.
+        """
+        self._excepthook_shown = False
+
+        def hook(exc_type, exc, tb):
+            from datetime import datetime
+            stamp = datetime.now().strftime("%H:%M:%S")
+            print(f"[{stamp}] UNHANDLED {exc_type.__name__}: {exc}",
+                  flush=True)
+            try:
+                import traceback as _tb
+                self.log(f"UNHANDLED exception (app continues):\n"
+                         f"{_tb.format_exception(exc_type, exc, tb)}")
+            except Exception:
+                pass
+            try:
+                self.statusBar().showMessage(
+                    f"Unexpected error ({exc_type.__name__}) — details "
+                    "in session.log; the app keeps running.", 15000)
+                if not self._excepthook_shown:
+                    self._excepthook_shown = True
+                    QtWidgets.QMessageBox.warning(
+                        self, "Unexpected error",
+                        f"An unexpected error occurred "
+                        f"({exc_type.__name__}: {exc}).\n\nThe app keeps "
+                        "running — full technical details are in "
+                        "session.log next to the app.")
+            except Exception:
+                pass                     # UI not ready/closing: log only
+
+        self._sys_hook_prev = sys.excepthook
+        sys.excepthook = hook
+
     def log(self, msg: str):
         """Log to the console, the in-app Activity-log dock and the
         rotating session.log on disk."""
@@ -6087,7 +7801,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_settings(self):
         s = self.settings
-        self._apply_params(s.get("params"))
+        if s.get("params_version") == PARAMS_VERSION:
+            self._apply_params(s.get("params"))
         if isinstance(s.get("folds"), int):
             self.spin_folds.setValue(int(s["folds"]))
         if isinstance(s.get("seed"), int):
@@ -6102,6 +7817,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.restoreGeometry(bytes.fromhex(geo))
             except Exception:
                 pass
+        if s.get("maximized") is True:
+            self.showMaximized()
 
     def closeEvent(self, event):
         # stop background threads before the widgets they signal die —
@@ -6131,14 +7848,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.pop("files", None)          # legacy setting
         self.settings.update({
             "params": asdict(self.read_params()),
+            "params_version": PARAMS_VERSION,
             "folds": self.spin_folds.value(),
             "seed": self.spin_seed.value(),
             "models": [n for n, cb in self.model_checks.items()
                        if cb.isChecked()],
             "suite_version": SUITE_VERSION,
             "geometry": self.saveGeometry().toHex().data().decode(),
+            "maximized": self.isMaximized(),
         })
         uh.save_settings(self.settings)
+        sys.excepthook = getattr(self, "_sys_hook_prev", sys.excepthook)
         super().closeEvent(event)
 
 
@@ -6152,6 +7872,12 @@ def QtGui_black():
 
 
 def run_app() -> int:
+    # crisp charts + icons on Windows display scaling >100% (Qt5
+    # attributes; Qt6 handles HiDPI natively so the guards just skip)
+    for attr in ("AA_EnableHighDpiScaling", "AA_UseHighDpiPixmaps"):
+        if hasattr(qc.Qt, attr):
+            QtWidgets.QApplication.setAttribute(getattr(qc.Qt, attr),
+                                                True)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     app.setApplicationName("Raman Spectra Classifier")
     app.setStyle("Fusion")               # consistent base under the QSS
