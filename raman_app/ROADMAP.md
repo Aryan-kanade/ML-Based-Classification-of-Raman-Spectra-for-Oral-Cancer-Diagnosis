@@ -1,6 +1,12 @@
 # ROADMAP.md — the complete improvement program (v3, 2026-09-05)
 
-Everything in RESEARCH.md stages 0–4 is DONE (52/52 tests + GUI PASS).
+Everything in RESEARCH.md stages 0–4 is DONE (56 unit tests + GUI walk
++ adversarial suite PASS — see §17 of Brain.md for the live counts;
+this file's counts supersede any older "N/N" claims). B1/B2/B3 below
+are DONE as of the 2026-09-05 audit wave (tests write to a temp dir,
+CI workflow exists, LICENSE/CITATION committed) — except the known
+leftovers: gui_test/deep_test still assert two in-tree artifacts, and
+.github/workflows/ci.yml still needs its first green run.
 This file tracks the next program. Effort: S ≤ hours · M ≤ 2 days ·
 L > 2 days. Discipline per item: code → targeted test → both suites
 green → Brain.md entry.

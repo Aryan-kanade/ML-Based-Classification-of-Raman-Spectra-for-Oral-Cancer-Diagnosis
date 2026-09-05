@@ -53,8 +53,9 @@ Loading is automatic (GUI *Folder…* button or `python vit_train.py` with no
   `vit_outputs/data_report.txt`) listing everything excluded and why.
 
 On the current dataset: 341 files scanned → 317 spectra / 72 subjects
-kept (4 references excluded, 18 duplicate copies dropped, 2 cross-class
-identical files dropped).
+kept (4 references excluded, 18 duplicate copies dropped, 2
+site-token-mislabeled acquisitions dropped — tumor-site files that sat
+inside the `Normal/` folder).
 
 ## Quick start
 
@@ -104,12 +105,16 @@ high-resolution PNG of the figure.
 * Per-class **sensitivity, specificity, precision and F1** are reported
   with mean ± std across folds, plus the pooled confusion matrix.
 
-## Models compared (12 + XGBoost if installed)
+## Models compared (24-entry registry; optional deps degrade gracefully)
 
-PCA+SVM (RBF) · PCA+LDA · PCA+Logistic Regression · PCA+KNN ·
-PCA+Gaussian Naive Bayes · Random Forest · Extra Trees ·
-Hist Gradient Boosting · PLS-DA · PCA+MLP (neural net) ·
-Isolation Forest (one-vs-rest) · XGBoost (if installed)
+PCA+SVM (RBF, grouped-sigmoid calibrated) · PCA+LDA · PCA+Logistic
+Regression · PCA+KNN · PCA+Gaussian Naive Bayes · Random Forest ·
+Extra Trees · Hist Gradient Boosting · PLS-DA · Sparse PLS-DA ·
+PCA+MLP · Isolation Forest (one-vs-rest) · Peak bands + RF ·
+Spectral + band features · PLS + XGBoost · PCA + XGBoost ·
+t-test filter + XGBoost · XGBoost/LightGBM/CatBoost (if installed) ·
+1D-CNN and its 5-seed ensemble (torch) · TabPFN foundation model ·
+Ensemble (top-3) · Stacked (top-3)
 
 The **Isolation Forest** entry uses one anomaly detector per class — a
 spectrum is assigned to the class whose detector finds it least
@@ -117,7 +122,7 @@ anomalous.
 
 ## Squeezing the best out of the data
 
-* **Region cropping** (`Keep range`, default 400–1800 cm⁻¹) — the
+* **Region cropping** (`Keep range`, default 500–2000 cm⁻¹) — the
   fingerprint region carries the signal; outside it is mostly noise
   (measured: +0.06–0.12 macro-F1 on the clinical set).
 * **Optimize preprocessing** (Preprocess page, or `python optimize.py`) —
@@ -171,17 +176,26 @@ are stored in the checkpoint).
 | `clinical.py` | medical evaluation: operating points, triage tiers, PPV/NPV at prevalence, calibration (Platt), decision-curve, Wilson/DeLong CIs |
 | `biochemistry.py` | literature band table, band-ratio markers, paired deltas, SHAP plausibility check, NMF unmixing, keratin guard |
 | `reproduce_study.py` | one-shot headless reproduction of the full study (bundle + summary + figures) |
+| `reproduce_report.py` | head-to-head replication of the internship report's protocol vs patient-grouped CV |
+| `sequential.py` | 3SSE sequential architecture search (singles/pairs/triples chains) |
+| `paired.py` | within-patient deviation features (paired mode) |
+| `study_stats.py` | Friedman/Nemenyi, LOPO, seed/noise stability, FDR band stats |
+| `bench.py` | speed & accuracy scorecard (writes bench/latest.json) |
+| `validate_external.py` | external-cohort CLI for any saved bundle |
 | `plotting.py` | matplotlib helpers (spectra, confusion matrix, ROC, calibration, DCA) |
+| `ui_helpers.py` | QSS design system, pills/tooltips, settings I/O |
+| `qt_compat.py` | PyQt5/PyQt6/PySide6 binding auto-detection |
 | `vit_model.py` | spectral Vision Transformer model + checkpoint I/O |
 | `vit_train.py` | train the ViT on a spectra folder (curves + confusion matrix) |
 | `vit_test.py` | re-evaluate a trained ViT checkpoint on its test set |
+| `test_all.py` / `gui_test.py` / `deep_test.py` | 56 unit tests · GUI walk · 19 adversarial scenarios |
 
 ## Testing
 
 ```bat
-python test_all.py    :: fast unit/regression tests (synthetic data, ~30s)
-python gui_test.py    :: headless end-to-end GUI flow (offscreen)
-python deep_test.py   :: adversarial sweep: error paths, workers, CLI
+python test_all.py    :: 56 unit/regression tests (synthetic data, ~2 min)
+python gui_test.py    :: headless end-to-end GUI flow (offscreen, ~20 s)
+python deep_test.py   :: adversarial sweep: error paths, workers, CLI (~60 s)
 ```
 
 ## Reproducing the study
@@ -196,9 +210,13 @@ python reproduce_study.py --mode paired-pqn    :: margin mode + PQN
 
 ### Real clinical dataset results (317 spectra / 72 subjects, 2026-08-30)
 
+> **STALE — re-run before citing.** These numbers predate the
+> 2026-09-04 loader change (padded edges kept, crop 500/2000) and the
+> 2026-09-05 hygiene change (site-token drops). Full tables:
+> `study_run_standard_v2/summary.txt`, `study_run_paired_v2/summary.txt`.
+
 5-fold patient-grouped CV ×3, seed 42, 18 quality-flagged spectra
-excluded; CIs are patient-level. Full tables in
-`study_run_standard/summary.txt` and `study_run_paired/summary.txt`.
+excluded; CIs are patient-level.
 
 | Mode | Winner | macro-F1 (95% CI) | AUC (DeLong 95% CI) | LOPO |
 |---|---|---|---|---|
@@ -271,7 +289,7 @@ Each core method follows the primary literature:
 
 ## Notes
 
-* Python 3.9+ recommended (the source avoids 3.12-only f-string syntax,
-  so a project copy runs on older Pythons too). On very new Python
-  versions PyQt5 wheels may be missing — the app falls back to
-  PyQt6/PySide6 automatically.
+* Python 3.11–3.14 (the pinned dependency set needs ≥3.11; the source
+  avoids 3.12-only f-string syntax, enforced by a source-scanning
+  test). On the newest Python versions PyQt5 wheels may be missing —
+  the app falls back to PyQt6/PySide6 automatically.
