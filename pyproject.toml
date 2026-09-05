@@ -1,0 +1,13 @@
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # long lines: docstrings and plot strings run long on purpose
+    "E741",  # single-letter math names (l, I) used in formulas
+    "E731",  # lambda assignments used deliberately for local helpers
+    "E702",  # legacy semicolon style in older test files
+    "E703",  # statement-ending semicolons, same
+]

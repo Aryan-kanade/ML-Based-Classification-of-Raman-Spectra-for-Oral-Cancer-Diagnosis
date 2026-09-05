@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: >-
+  If this software or its study results helped your research, please
+  cite it using the metadata below.
+title: Raman Oral-Cancer Classifier
+type: software
+authors:
+  - family-names: Kanade
+    given-names: Aryan
+keywords:
+  - Raman spectroscopy
+  - SERS
+  - oral cancer
+  - OSCC
+  - machine learning
+  - patient-grouped cross-validation
+  - triage
+license: MIT
+repository-code: "https://github.com/your-org/BARC"
+abstract: >-
+  Desktop application for classifying SERS Raman spectra of oral-cancer
+  patients with maximum sensitivity, specificity and F1 score: 21-model
+  registry under nested patient-grouped cross-validation, conformal
+  triage sets, Grad-CAM/VIP/SHAP explainability checked against
+  literature biochemistry, and a clinical reporting layer.
