@@ -24,7 +24,21 @@ try:
     from torch.utils.data import Dataset
     HAS_TORCH = True
 except ImportError:
-    HAS_TORCH = False
+    torch = nn = Dataset = None          # class bodies below must still
+    HAS_TORCH = False                    # IMPORT on a torch-less box
+
+
+class _TorchRequired:
+    """Placeholder base so the module imports without torch; touching
+    the model classes then gives the actionable message instead of a
+    NameError at import time (fixed 2026-09-05)."""
+
+    def __init__(self, *args, **kwargs):
+        require_torch()                  # raises SystemExit with instructions
+
+
+_MODULE_BASE = nn.Module if HAS_TORCH else _TorchRequired
+_DATASET_BASE = Dataset if HAS_TORCH else _TorchRequired
 
 
 def require_torch():
@@ -32,7 +46,7 @@ def require_torch():
         raise SystemExit(
             "PyTorch is not installed.  Install it with:\n"
             "    pip install torch\n"
-            "(the CPU build is sufficient for these small spectrum models)"
+            "(add a CUDA build from download.pytorch.org to train on GPU)"
         )
 
 
@@ -70,7 +84,7 @@ class ViTConfig:
 # --------------------------------------------------------------------------
 # Model
 # --------------------------------------------------------------------------
-class PatchEmbed1D(nn.Module):
+class PatchEmbed1D(_MODULE_BASE):
     """Linear projection of contiguous spectrum patches (via Conv1d)."""
 
     def __init__(self, cfg: ViTConfig):
@@ -82,7 +96,7 @@ class PatchEmbed1D(nn.Module):
         return self.proj(x.unsqueeze(1))   # -> (B, dim, n_patches)
 
 
-class EncoderBlock(nn.Module):
+class EncoderBlock(_MODULE_BASE):
     """Pre-norm transformer encoder block (MHSA + MLP, both residual)."""
 
     def __init__(self, cfg: ViTConfig):
@@ -105,7 +119,7 @@ class EncoderBlock(nn.Module):
         return x
 
 
-class SpectralViT(nn.Module):
+class SpectralViT(_MODULE_BASE):
     """Vision Transformer over 1D Raman spectra (see module docstring)."""
 
     def __init__(self, cfg: ViTConfig):
@@ -141,7 +155,7 @@ class SpectralViT(nn.Module):
 # --------------------------------------------------------------------------
 # Data helpers
 # --------------------------------------------------------------------------
-class SpectraDataset(Dataset):
+class SpectraDataset(_DATASET_BASE):
     """(X, y) tensors of preprocessed, resampled spectra."""
 
     def __init__(self, X: np.ndarray, y: np.ndarray):

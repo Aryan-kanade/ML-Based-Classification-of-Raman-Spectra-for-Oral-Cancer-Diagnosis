@@ -1,27 +1,20 @@
 @echo off
-REM install.bat — set up the environment for the Raman Classifier app
-REM (run from the raman_app folder, or double-click this file)
+REM install.bat — set up the environment from the PINNED requirements
+REM (2026-09-05: this used to install an unpinned subset that silently
+REM diverged from the validated environment — no pybaselines meant a
+REM different baseline method, no torch meant no CNN/ViT/TabPFN).
+REM GPU users: see the torch cu130 note inside requirements.txt.
 
-echo === Installing core scientific packages ===
-pip install numpy scipy scikit-learn pandas matplotlib PyWavelets joblib
+cd /d "%~dp0"
+
+python -m pip install --upgrade pip
 if errorlevel 1 goto :err
 
-echo === Installing XGBoost (optional, model suite is fine without it) ===
-pip install xgboost
-
-echo === Installing Qt binding (PyQt5, else PyQt6, else PySide6) ===
-pip install PyQt5
-if errorlevel 1 (
-    echo PyQt5 not available, trying PyQt6 ...
-    pip install PyQt6
-    if errorlevel 1 (
-        echo PyQt6 not available, trying PySide6 ...
-        pip install PySide6
-    )
-)
+python -m pip install -r requirements.txt
+if errorlevel 1 goto :err
 
 echo.
-echo Done. Start the app with:   python main.py
+echo Done. Start the app with:   python main.py   (or run_app.bat)
 pause
 exit /b 0
 

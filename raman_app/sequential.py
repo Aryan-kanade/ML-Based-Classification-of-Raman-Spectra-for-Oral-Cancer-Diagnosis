@@ -715,10 +715,7 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
                        if "metrics" in p), reverse=True)
     cutoff = (min(pair_f1s[:top]) - 0.10) if len(pair_f1s) >= top else -1.0
     # beam-skipped triples count as done so progress reaches 100%
-    kept_pairs = len(pairs_sorted)
     n_names = len(names)
-    expected_triples = sum(
-        max(0, n_names - 2) for _ in range(kept_pairs))
     done[0] += beam_applied * max(0, n_names - 2)
     chunk = max(1, abs(jobs))
     for i in range(0, len(pairs_sorted), chunk):

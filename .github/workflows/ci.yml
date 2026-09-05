@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 90        # 2-core runner: CNN fits + first TabPFN
+                               # weight download are the long poles
+    defaults:
+      run:
+        working-directory: raman_app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"   # matches the validated dev env
+          cache: pip
+          cache-dependency-path: raman_app/requirements.txt
+
+      # TabPFN auto-downloads its HF weights on first fit — cache them
+      # so the suite does not depend on the network on every run.
+      - name: Cache HuggingFace weights (TabPFN)
+        uses: actions/cache@v4
+        with:
+          path: .hf
+          key: hf-tabpfn-${{ runner.os }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff==0.16.5
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Unit + integration tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_QPA_FONTDIR: C:\Windows\Fonts   # windows-latest only —
+          # replace with a repo-bundled font dir before adding a Linux job
+          MPLBACKEND: QtAgg
+          HF_HOME: ${{ github.workspace }}/.hf
+        run: python test_all.py
+
+      - name: GUI offscreen test
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_QPA_FONTDIR: C:\Windows\Fonts
+          MPLBACKEND: QtAgg
+          HF_HOME: ${{ github.workspace }}/.hf
+        run: python gui_test.py
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: raman_app/*.log
+          if-no-files-found: ignore

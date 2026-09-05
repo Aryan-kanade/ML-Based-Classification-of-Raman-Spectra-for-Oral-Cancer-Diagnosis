@@ -43,6 +43,16 @@ def check(name: str, fn):
                  if tb else "")
         RESULTS.append((False, f"{name}: {exc}"))
         print(f"  FAIL  {name}: {exc}{where}")
+    finally:
+        # flush the loop between scenarios: pending draw_idle timers of
+        # the closed window must fire NOW, not on a later scenario's
+        # dead canvas (RuntimeError "wrapped C/C++ object ... deleted"
+        # and the native abort that followed)
+        from qt_compat import QtWidgets
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            for _ in range(20):
+                app.processEvents()
 
 
 DIALOG_LOG: list[tuple[str, str]] = []
@@ -86,13 +96,25 @@ def make_gui():
         make_gui._patched = True
     # isolate from the developer's settings.json: a restored last-session
     # folder would silently give "no data" scenarios data (and launch
-    # real worker pools) — every scenario loads its own data explicitly
+    # real worker pools) — every scenario loads its own data explicitly.
+    # The startup find_data_root() fallback is neutralized for the same
+    # reason (it would auto-load the real dataset from a known spot).
+    import clinical_data as _cd
     _saved = uh.load_settings
+    _saved_root = _cd.find_data_root
+    _saved_remember = _cd.remember_data_root
     uh.load_settings = lambda: {}
+    _cd.find_data_root = lambda: None
+    # loading a temp clinical tree through the GUI would otherwise write
+    # it into ~/.raman_app_data_dir + settings.json — later real sessions
+    # silently restored the leftover TOY dataset (hit 2026-09-05).
+    _cd.remember_data_root = lambda path: None
     try:
         win = gui.MainWindow()
     finally:
         uh.load_settings = _saved
+        _cd.find_data_root = _saved_root
+        _cd.remember_data_root = _saved_remember
     win._dialog_log = DIALOG_LOG
     return win
 
@@ -107,7 +129,35 @@ def wait_analysis(win, timeout_ms: int = 120000):
         QtWidgets.QApplication.processEvents()
 
 
+def _flat_folder(root: str, n_per_class: int = 10) -> str:
+    """Synthetic flat labeled folder (classes parsed from the C-number
+    filename token) for the GUI-path scenarios."""
+    rng = np.random.default_rng(0)
+    wn = np.linspace(400, 1800, 400)
+    os.makedirs(root, exist_ok=True)
+    for cls, gain in (("C1", 0.4), ("C5", 1.0), ("C8", 1.6)):
+        for i in range(n_per_class):
+            peaks = (np.exp(-((wn - 1003) / 15) ** 2)
+                     + gain * np.exp(-((wn - 1450) / 15) ** 2))
+            it = 0.1 + peaks + rng.normal(0, 0.02, len(wn))
+            with open(os.path.join(root, f"SYN_785_{cls}_{i + 1}.txt"),
+                      "w", encoding="utf-8") as fh:
+                for w, v in zip(wn, it, strict=True):
+                    fh.write(f"{w:.2f},{v:.4f}\n")
+    return root
+
+
 def main() -> int:
+    # process-wide isolation: scenarios load TEMP clinical trees through
+    # the real GUI path — without this, load_folder writes them into
+    # ~/.raman_app_data_dir and closeEvent into settings.json, so later
+    # REAL sessions silently restore a leftover toy dataset (2026-09-05).
+    # No restore needed: deep_test is a short-lived process.
+    import clinical_data as _cd
+    import ui_helpers as _uh
+    _cd.remember_data_root = lambda path: None
+    _uh.save_settings = lambda s: None
+
     # ---------------------------------------------------------------- GUI
     def s_blank_gui():
         win = make_gui()
@@ -149,10 +199,8 @@ def main() -> int:
 
     def s_one_class_train():
         win = make_gui()
-        src = dataset.find_default_source_spectrum()
-        demo = dataset.generate_demo_data(
-            src, os.path.join(tempfile.mkdtemp(), "d"))
-        win.load_folder(demo, quiet=True)
+        folder = _flat_folder(tempfile.mkdtemp())
+        win.load_folder(folder, quiet=True)
         for name, cb in win.model_checks.items():
             cb.setChecked(name == "PCA + LDA")
         # relabel everything to one class -> cannot-train path
@@ -165,12 +213,53 @@ def main() -> int:
 
     check("training with a single class: clean error path", s_one_class_train)
 
+    def s_train_cards():
+        # Train right column: NO tabs — every result card (diagnostics,
+        # comparison, per-class, biochemistry) stacked in one page scroll;
+        # cm+roc side by side; panels collapse; _reveal scrolls the page
+        from qt_compat import QtWidgets as QW
+        win = make_gui()
+        win.load_folder(_flat_folder(tempfile.mkdtemp()), quiet=True)
+        X = win.get_processed_X()
+        _res, w = modeling.evaluate_models(
+            X, win.labels, model_names=["PCA + LDA"], k_folds=3,
+            groups=win.groups, wavenumbers=win.grid)
+        win.on_train_done(_res, w)
+        assert not hasattr(win, "train_tabs")            # tabs are gone
+        assert not win.findChildren(QW.QTabWidget)       # nothing tabbed
+        cm = win._diag_panels["cm"][0]
+        roc = win._diag_panels["roc"][0]
+        assert cm.parent() is win._winner_row and roc.parent() is win._winner_row
+        assert win.diag_stack.indexOf(win._winner_row) == 0
+        win.stack.setCurrentIndex(3)                   # TAB_TRAIN: layouts
+        win.show()
+        for _ in range(5):                              # let layouts settle
+            QW.QApplication.processEvents()
+        assert roc.x() > cm.x() + 0.8 * cm.width()     # side by side
+        assert win.compare_table.rowCount() >= 1        # card visible w/o
+        assert win.compare_table.isVisibleTo(win)       # clicking a tab
+        assert win.bio_table.isVisibleTo(win)
+        head = [b for b in cm.findChildren(QW.QToolButton)
+                if b.parent() is cm][0]
+        head.setChecked(False)                         # collapse the chart
+        QW.QApplication.processEvents()
+        assert not win._diag_panels["cm"][1].parentWidget().isVisible()
+        head.setChecked(True)
+        QW.QApplication.processEvents()
+        assert win._diag_panels["cm"][1].parentWidget().isVisible()
+        win._reveal(roc)                               # scrolls the page
+        QW.QApplication.processEvents()
+        win.hide()                                     # drain pending
+        QW.QApplication.processEvents()                # canvas repaints
+        win.close()                                    # BEFORE deletion
+
+    check("train cards: no tabs, cm/roc row, collapse, reveal",
+          s_train_cards)
+
     def s_predict_edge_folders():
         win = make_gui()
-        src = dataset.find_default_source_spectrum()
-        demo = dataset.generate_demo_data(
-            src, os.path.join(tempfile.mkdtemp(), "d2"))
-        win.load_folder(demo, quiet=True)
+        folder = _flat_folder(tempfile.mkdtemp())
+        win.load_folder(folder, quiet=True)
         X = win.get_processed_X()
         res, w = modeling.evaluate_models(
             X, win.labels, model_names=["PCA + LDA"], k_folds=3,
@@ -196,7 +285,7 @@ def main() -> int:
         modeling.save_bundle(path, w, win.grid,
                              win.read_params().validate(), paired=True)
         win._set_bundle(modeling.load_bundle(path), path)
-        win.spec_path_edit.setText(demo)
+        win.spec_path_edit.setText(folder)
         win.run_prediction()
         assert any("Reference required" in ti for _k, ti, _t in win._dialog_log)
         win.close()
@@ -208,10 +297,8 @@ def main() -> int:
         # regression for the QtGui crash: a POSITIVE prediction row must
         # render through the red-highlight branch on the Result page
         win = make_gui()
-        src = dataset.find_default_source_spectrum()
-        demo = dataset.generate_demo_data(
-            src, os.path.join(tempfile.mkdtemp(), "d3"))
-        win.load_folder(demo, quiet=True)
+        folder = _flat_folder(tempfile.mkdtemp())
+        win.load_folder(folder, quiet=True)
         X = win.get_processed_X()
         res, w = modeling.evaluate_models(
             X, win.labels, model_names=["PCA + LDA"], k_folds=3,
@@ -220,8 +307,8 @@ def main() -> int:
         modeling.save_bundle(path, w, win.grid,
                              win.read_params().validate())
         win._set_bundle(modeling.load_bundle(path), path)
-        win.spec_path_edit.setText(demo)
-        win.run_prediction()                      # demo -> C1/C5/C8 preds
+        win.spec_path_edit.setText(folder)
+        win.run_prediction()                      # synthetic -> C1/C5/C8 preds
         if win._pred_worker is not None:          # prediction is async
             from qt_compat import QtWidgets
             win._pred_worker.wait(120000)
@@ -231,7 +318,7 @@ def main() -> int:
         for _ in range(6):
             win._result_app_process() if hasattr(win, "_result_app_process") \
                 else None
-        # force a positive-class hit: relabel one row to the demo 'pos'
+        # force a positive-class hit: relabel one row to the positive 'pos'
         pos = win._positive_class() or sorted(
             {c for _f, c, _p in win._pred_rows})[0]
         win._pred_rows = [(win._pred_rows[0][0], pos, 0.9)] \
@@ -340,10 +427,7 @@ def main() -> int:
         # QThreads are a native-crash race on Windows (access
         # violation inside joblib retrieval) — see Brain.md gotchas.
         win = make_gui()
-        src = dataset.find_default_source_spectrum()
-        demo = dataset.generate_demo_data(
-            src, os.path.join(tempfile.mkdtemp(), "d4"))
-        win.load_folder(demo, quiet=True)
+        win.load_folder(_flat_folder(tempfile.mkdtemp()), quiet=True)
         win.run_optimize()                        # sender() is None here
         win._opt_worker.wait(120000)
         assert win._opt_worker.isFinished()
@@ -360,9 +444,8 @@ def main() -> int:
         td = tempfile.mkdtemp()
         ok1 = os.path.join(td, "patA"); ok2 = os.path.join(td, "patB")
         os.makedirs(ok1); os.makedirs(ok2)
-        src = dataset.find_default_source_spectrum()
-        wn, it = dataset.load_spectrum(win.spectra[0].path) if win.spectra \
-            else dataset.load_spectrum(src)
+        wn = np.linspace(400.0, 1800.0, 300)
+        it = np.abs(np.sin(np.linspace(0, 9, 300)))
         for d, tag in ((ok1, "A"), (ok2, "B")):
             with open(os.path.join(d, f"good_{tag}.txt"), "w") as fh:
                 for a, b in zip(wn, it, strict=True):
@@ -387,19 +470,21 @@ def main() -> int:
     def s_cli_flat_mode():
         import subprocess
         env = dict(os.environ)
-        src = dataset.find_default_source_spectrum()
-        demo = dataset.generate_demo_data(
-            src, os.path.join(tempfile.mkdtemp(), "d5"))
+        here = os.path.dirname(os.path.abspath(__file__))  # cwd-safe:
+        # relative script paths only resolve when run from raman_app
+        folder = _flat_folder(tempfile.mkdtemp(), n_per_class=6)
         out = os.path.join(tempfile.mkdtemp(), "o")
         r = subprocess.run(
-            [sys.executable, "vit_train.py", "--data", demo,
+            [sys.executable, "vit_train.py", "--data", folder,
              "--epochs", "2", "--out", out, "--preset", "default"],
-            capture_output=True, text=True, timeout=600, env=env)
+            cwd=here, capture_output=True, text=True, timeout=600,
+            env=env)
         assert r.returncode == 0, r.stderr[-400:]
         r2 = subprocess.run(
-            [sys.executable, "vit_test.py", "--data", demo,
+            [sys.executable, "vit_test.py", "--data", folder,
              "--model", os.path.join(out, "vit_model.pt")],
-            capture_output=True, text=True, timeout=600, env=env)
+            cwd=here, capture_output=True, text=True, timeout=600,
+            env=env)
         assert r2.returncode == 0, r2.stderr[-400:]
 
     check("CLI legacy FLAT mode: vit_train + vit_test round-trip",
@@ -407,15 +492,16 @@ def main() -> int:
 
     def s_cli_bad_inputs():
         import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
         r = subprocess.run(
             [sys.executable, "vit_train.py", "--data",
              os.path.join(tempfile.mkdtemp(), "nope")],
-            capture_output=True, text=True, timeout=120)
+            cwd=here, capture_output=True, text=True, timeout=120)
         assert r.returncode != 0 and "not found" in (r.stdout + r.stderr)
         r2 = subprocess.run(
             [sys.executable, "vit_test.py", "--model",
              os.path.join(tempfile.mkdtemp(), "missing.pt")],
-            capture_output=True, text=True, timeout=120)
+            cwd=here, capture_output=True, text=True, timeout=120)
         assert r2.returncode != 0
 
     check("CLI bad inputs fail cleanly", s_cli_bad_inputs)
@@ -423,10 +509,8 @@ def main() -> int:
     def s_old_bundle_compat():
         # a bundle saved BEFORE crop existed (params without crop keys)
         # must still predict via the uncropped fallback
-        src = dataset.find_default_source_spectrum()
-        demo = dataset.generate_demo_data(
-            src, os.path.join(tempfile.mkdtemp(), "d6"))
-        spectra = dataset.load_folder(demo)
+        folder = _flat_folder(tempfile.mkdtemp(), n_per_class=4)
+        spectra = dataset.load_folder(folder)
         grid = dataset.common_grid(spectra)
         X, y = dataset.to_matrix(spectra, grid)
         from sklearn.discriminant_analysis import \
@@ -646,12 +730,53 @@ def main() -> int:
     check("deep diagnostics: LOPO, seeds, noise, local SHAP, file log",
           s_deep_diagnostics)
 
+    def s_reset_session():
+        win = make_gui()
+        # dirty state: loaded data, tuned params, predictions, training
+        win.spectra = [object()] * 3
+        win.labels = ["Tumor", "Normal", "Tumor"]
+        win._source_folder = "X"
+        win.settings["folder"] = "X"
+        win.spin_crop_min.setValue(500)
+        win._pred_rows = [("f.csv", "Tumor", 0.9)]
+        win._patient_rows = [("P1",)]
+        win._local_bands = [1]
+
+        class _W:                              # minimal winner stub
+            name = "stub"
+            classes = ["Normal", "Tumor"]
+            macro = {"sens": (0.9, 0), "spec": (0.9, 0), "f1": (0.9, 0)}
+            threshold = None
+            cm = None
+            oof_proba = None
+            per_class = {}
+
+            def macro_f1(self):
+                return 0.9
+        win.winner = _W()
+        win.bundle = {"classes": ["Normal", "Tumor"]}
+        win.reset_session()                    # recorder answers Yes
+        assert not win.spectra and win._pred_rows == []
+        assert win.winner is not None and win.bundle is not None
+        assert win._patient_rows == [] and win._local_bands is None
+        assert win._source_folder is None and "folder" not in win.settings
+        assert win.folder_edit.text() == "" and win.table.rowCount() == 0
+        assert win.spin_crop_min.value() == 500   # params back to defaults
+        assert not win.b_train.isEnabled()
+        win.render_result_page()               # renders from kept training
+        win.close()
+
+    check("reset session: clears data/prep/predict, keeps training",
+          s_reset_session)
+
     def s_reproduce_cli():
-        # headless one-shot reproduction on demo data
+        # headless one-shot reproduction on a synthetic clinical tree
         import subprocess
-        out = os.path.join(tempfile.mkdtemp(), "repro")
+        tmp = tempfile.mkdtemp()
+        out = os.path.join(tmp, "repro")
         r = subprocess.run(
-            [sys.executable, "reproduce_study.py", "--demo", "--mini",
+            [sys.executable, "reproduce_study.py", "--data",
+             _clinical_tree(tmp), "--mini",
              "--folds", "3", "--repeats", "1", "--out", out],
             cwd=os.path.dirname(os.path.abspath(__file__)),
             capture_output=True, text=True, timeout=600)
@@ -659,7 +784,7 @@ def main() -> int:
         assert os.path.isfile(os.path.join(out, "summary.txt"))
         assert os.path.isfile(os.path.join(out, "winner.joblib"))
 
-    check("reproduce_study.py CLI (demo, mini)", s_reproduce_cli)
+    check("reproduce_study.py CLI (clinical tree, mini)", s_reproduce_cli)
 
     # ---------------------------------------------------------------- done
     failed = [msg for ok, msg in RESULTS if not ok]

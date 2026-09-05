@@ -1519,6 +1519,19 @@ def test_search_survives_broken_model():
         "Boom" not in p["arch"] for p in board["pairs"])
 
 
+def _optional_report():
+    """Honesty line: which optional deps were absent, i.e. how much of
+    the suite silently covered less than it looks (guarded test bodies
+    report PASS either way — 2026-09-05)."""
+    import importlib.util
+    mods = ("torch", "shap", "pybaselines", "lightgbm", "catboost",
+            "xgboost", "tabpfn")
+    missing = [m for m in mods if importlib.util.find_spec(m) is None]
+    if missing:
+        print(f"NOTE: optional deps not installed (tests that use them "
+              f"covered less): {', '.join(missing)}")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
@@ -1530,6 +1543,7 @@ def main():
         except Exception as exc:             # noqa: BLE001
             failed += 1
             print(f"  FAIL  {t.__name__}: {exc}")
+    _optional_report()
     print(f"\n{len(tests) - failed}/{len(tests)} tests passed")
     return 1 if failed else 0
 

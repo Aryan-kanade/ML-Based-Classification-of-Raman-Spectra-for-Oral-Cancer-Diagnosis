@@ -66,12 +66,19 @@ import logging.handlers                           # noqa: E402
 
 FILE_LOG = logging.getLogger("raman_app.session")
 if not FILE_LOG.handlers:
-    _fh = logging.handlers.RotatingFileHandler(
-        os.path.join(APP_DIR, "session.log"), maxBytes=1_000_000,
-        backupCount=2, encoding="utf-8")
-    _fh.setFormatter(logging.Formatter("%(asctime)s %(message)s",
-                                       "%Y-%m-%d %H:%M:%S"))
-    FILE_LOG.addHandler(_fh)
+    # guarded (2026-09-05): an unwritable app dir (Program Files, locked
+    # log from a second instance) used to raise PermissionError AT
+    # IMPORT TIME — under pythonw the app then died with no log, no
+    # dialog, no trace.  Degrade to no-persist logging instead.
+    try:
+        _fh = logging.handlers.RotatingFileHandler(
+            os.path.join(APP_DIR, "session.log"), maxBytes=1_000_000,
+            backupCount=2, encoding="utf-8")
+        _fh.setFormatter(logging.Formatter("%(asctime)s %(message)s",
+                                           "%Y-%m-%d %H:%M:%S"))
+        FILE_LOG.addHandler(_fh)
+    except OSError:
+        FILE_LOG.addHandler(logging.NullHandler())
     FILE_LOG.setLevel(logging.INFO)
     FILE_LOG.propagate = False
 
@@ -5463,7 +5470,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """Apply the Lab's findings: best preprocessing, a DiagPanel
         report, and the deployable seed-averaged bundle."""
         from dataclasses import asdict as _asdict
-        import sequential as seqmod
         sweep = payload["sweep_best"]
         fin = payload["final"]
         self._apply_params(_asdict(payload["params"]))
@@ -7460,7 +7466,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"No .txt/.dat/.csv spectra were found in:\n{target}")
                 return None
             return files
-        files = [p.strip() for p in target.split(";") if p.strip()]
+        # strip surrounding quotes: Windows Explorer's "Copy as path"
+        # pastes quoted paths, which isfile() rejects (2026-09-05)
+        files = [p.strip().strip('"') for p in target.split(";")
+                 if p.strip()]
         files = [p for p in files if os.path.isfile(p)]
         if not files:
             QtWidgets.QMessageBox.warning(
