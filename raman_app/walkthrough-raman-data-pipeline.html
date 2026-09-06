@@ -135,9 +135,9 @@ self.stack.addWidget(self._build_train_page())`,
   },
   flatFolder: {
     title: "Flat Folder — class in filename",
-    description: "The simplest way to give data: one folder of .txt/.dat/.csv files, each holding ONE spectrum (two columns: wavenumber, intensity). The class label is auto-parsed from the C<number> token in the filename — e.g. P01_cAg_785_C8_3.txt → class C8.",
+    description: "The simplest way to give data: one folder of .txt/.dat/.csv files, each holding ONE spectrum (two columns: wavenumber, intensity). The class label is auto-parsed from the C<number> token in the filename — e.g. S07_tissue_C8.txt → class C8.",
     files: ["raman_app/dataset.py:18"],
-    code: `# P01_cAg_785_C8_3.txt  ->  class "C8"
+    code: `# S07_tissue_C8.txt  ->  class "C8"
 CLASS_TOKEN_RE = re.compile(r"(?:^|[_.\\-])(C\\d+)(?=[_.\\-]|$)")`,
     lang: "python",
   },

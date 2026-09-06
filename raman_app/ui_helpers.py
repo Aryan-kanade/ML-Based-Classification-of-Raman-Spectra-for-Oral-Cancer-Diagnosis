@@ -324,7 +324,7 @@ TIPS = {
     "folder": "Pick the folder that contains your spectra files "
               "(2 columns: wavenumber + intensity).",
     "class_col": "Class of this spectrum, read from the C-number in the "
-                 "filename (e.g. P01_cAg_785_C8_3.txt -> C8). "
+                 "filename (e.g. S07_tissue_C8.txt -> C8). "
                  "Double-click to correct it.",
     "wavelet": "Wavelet denoising removes instrument noise while keeping "
                "sharp Raman peaks.",
@@ -389,7 +389,7 @@ HOW_TO = """<h3>How to use this app</h3>
 <ol>
 <li><b>Data</b> — load the folder with your spectra (.txt, 2 columns).
 Classes are read from the C-number in each filename
-(P01_cAg_785_C8_3.txt → class C8) and can be fixed by double-clicking
+(S07_tissue_C8.txt → class C8) and can be fixed by double-clicking
 the Class column.</li>
 <li><b>Preprocess</b> — wavelet denoising, Savitzky–Golay smoothing,
 ALS baseline correction and normalization. The defaults suit most Raman

@@ -4879,7 +4879,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         self, "Only one class",
                         "All spectra have the same class label. Training "
                         "needs at least 2 classes.\n\nCheck the Class "
-                        "column — filenames like P01_cAg_785_C8_3.txt "
+                        "column — filenames like S07_tissue_C8.txt "
                         "give class C8 automatically.")
             else:
                 self.statusBar().showMessage(

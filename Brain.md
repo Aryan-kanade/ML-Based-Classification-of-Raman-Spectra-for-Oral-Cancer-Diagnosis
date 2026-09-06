@@ -169,7 +169,7 @@ GUI `PredictWorker._auto_reference` (`<root>/Normal/<patient>/`).
 - `Spectrum` dataclass: `name` (filename sans ext), `path`,
   `wavenumbers` (ascending), `intensities`, `label=""`.
 - Class token: `re r"(?:^|[_.\-])(C\d+)(?=[_.\-]|$)"` → e.g.
-  `P01_cAg_785_C8_3.txt` → `"C8"`; absent → `""`.
+  `S07_tissue_C8.txt` → `"C8"`; absent → `""`.
 - `load_spectrum`: comma→space, whitespace split, skips bad lines,
   **ValueError if <10 points**, sorts ascending.
 - `load_folder`: non-recursive, `.txt/.dat/.csv` sorted.
@@ -909,7 +909,7 @@ with default hyperparameters (identical for all 4,369 — fair).
     hook instead of aborting; gui_test [8] probes it with a raising
     timer callback. Debug offscreen with `faulthandler.enable()` +
     marker prints remains valid for NATIVE crashes.
-20. Tuned session preprocessing (2026-09-01, tuned on TDOC15NH0,
+20. Tuned session preprocessing (2026-09-01, tuned on a representative normal spectrum,
     metric = residual-hump 500–900 / %<-0.02): crop 500/2000,
     despike ON z=7, **arPLS λ=1e5** (hump 0.054 vs ALS 0.116 — ALS
     leaves a big baseline hump on these steep SERS decays), rest
@@ -1157,9 +1157,10 @@ Repo `D:\BARC`, branch `main`, init 2026-08-30; per-commit history:
 `git log --oneline`. Patient data & artifacts gitignored (§3).
 
 **Open (prioritized):**
-0. **git history still contains `P01_cAg_785_C8_3.txt` (initial
-   commit) — purge with `git filter-repo` BEFORE any push** (user
-   decision pending 2026-09-06).
+0. **History PURGED 2026-09-06** (`git filter-repo` removed the
+   initially-committed patient spectrum; pre-rewrite backup bundle at
+   `D:\BARC-pre-purge.bundle`; residual ID STRINGS may remain in old
+   history blobs — run the broad text filter before publishing).
 1. ~~`--locked` one-shot holdout for reproduce_study~~ DONE (A1).
 2. ViT vs classical comparison in one harness; ViT predict not in GUI.
 3. gui.py 7.7k monolith (split per page); txt/HTML report duplication.
@@ -1367,9 +1368,8 @@ Three-agent adversarial audit + line verification: **~190 findings**
 
 ### Data hygiene
 `site_token_dropped` (§5) — TDOC067 TH-in-Normal mislabel was live in
-training. `Patient data in git history` (P01_cAg_785_C8_3.txt, initial
-commit) — history rewrite PENDING USER DECISION; IDs scrubbed from
-README/docstring.
+training. Patient-spectrum history PURGED 2026-09-06 (filter-repo); ID
+strings scrubbed from README/docstrings/tooltips/tests.
 
 ### GUI fixes
 on_train_failed re-enables ALL buttons; `_pop_diag_queue` in

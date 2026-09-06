@@ -87,7 +87,7 @@ def _synthetic_ml(n=40, groups_n=10, seed=0):
 def test_subject_key():
     assert cdata.subject_key("Patient_15") == "S15"
     assert cdata.subject_key("TDOC015") == "S15"
-    assert cdata.subject_key("TDOC058 Spectra pro") == "S58"
+    assert cdata.subject_key("Subject058 Spectra pro") == "S58"
     assert cdata.subject_key("no number") == "NO NUMBER"
 
 

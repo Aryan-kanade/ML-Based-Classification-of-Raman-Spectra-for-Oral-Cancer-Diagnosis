@@ -4,7 +4,7 @@ building a common wavenumber grid.
 
 File format: 2 columns (wavenumber, intensity) separated by any whitespace,
 one spectrum per file.  Class label is auto-detected from the filename via
-a `C<number>` token, e.g.  P01_cAg_785_C8_3.txt  ->  class "C8".
+a `C<number>` token, e.g.  S07_tissue_C8.txt  ->  class "C8".
 """
 
 from __future__ import annotations
