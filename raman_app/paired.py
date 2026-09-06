@@ -14,6 +14,7 @@ measured alongside the suspect tissue (e.g. margin assessment).
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -102,8 +103,17 @@ def reference_vector(bundle: dict, paths: list[str]) -> np.ndarray:
               else pp.PreprocessParams(**raw_params))
     m = pp.crop_mask(grid, params)
     accs = []
+    skipped: list[str] = []
     for p in paths:
-        wn, it = ds.load_spectrum(p)
+        try:
+            wn, it = ds.load_spectrum(p)
+        except (ValueError, OSError) as exc:
+            # junk files (split_log.txt etc.) must not kill the whole
+            # prediction — skip them, report when nothing loads at all
+            # (2026-09-06: one stray .txt in the reference folder
+            # failed the entire run)
+            skipped.append(f"{os.path.basename(p)} ({exc})")
+            continue
         # align_to_grid (2026-09-06): apply the Phe-1003 calibration the
         # model was trained with — training averages CALIBRATED normals
         # (preprocess_matrix), so the deploy reference must match or every
@@ -111,7 +121,10 @@ def reference_vector(bundle: dict, paths: list[str]) -> np.ndarray:
         y = pp.align_to_grid(wn, it, grid, params)
         accs.append(pp.preprocess_spectrum(y[m], params))
     if not accs:
-        raise ValueError("No reference spectra could be loaded.")
+        detail = ("; skipped: " + "; ".join(skipped)) if skipped else ""
+        raise ValueError(
+            "No reference spectra could be loaded from the folder."
+            f"{detail}")
     return np.mean(accs, axis=0)
 
 

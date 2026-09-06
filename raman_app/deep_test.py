@@ -281,13 +281,14 @@ def main() -> int:
                 fh.write(f"{a}\t{b}\n")
         win.spec_path_edit.setText(refonly)
         assert win._prediction_files() is None
-        # (c) paired bundle without a reference folder set
+        # (c) paired bundle without a clinical tree (no Normal side)
         modeling.save_bundle(path, w, win.grid,
                              win.read_params().validate(), paired=True)
         win._set_bundle(modeling.load_bundle(path), path)
         win.spec_path_edit.setText(folder)
         win.run_prediction()
-        assert any("Reference required" in ti for _k, ti, _t in win._dialog_log)
+        assert any("Clinical tree required" in ti
+                   for _k, ti, _t in win._dialog_log)
         win.close()
 
     check("predict: empty folder / refs-only / paired-no-ref paths",
@@ -598,7 +599,6 @@ def main() -> int:
         path2 = os.path.join(tmp, "paired.joblib")
         modeling.save_bundle(path2, w2, win.grid, params, paired=True)
         win._set_bundle(modeling.load_bundle(path2), path2)
-        win.ref_path_edit.setText("")             # forces auto mode
         win.spec_path_edit.setText(root)
         win.run_prediction()
         if win._pred_worker is not None:

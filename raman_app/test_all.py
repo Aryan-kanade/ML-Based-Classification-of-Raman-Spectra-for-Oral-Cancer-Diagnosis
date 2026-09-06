@@ -1418,17 +1418,17 @@ def test_auto_reference_real_layout():
             assert len(t_rows) == 4
             assert all(r[1] == "Tumor" for r in t_rows), payload["rows"]
 
-            # 2) empty-string manual reference behaves like None
-            payload2, failed2 = _run(gui.PredictWorker(
-                bundle, files, td, manual_ref_dir=""))
-            assert not failed2
-            assert len(payload2["rows"]) == 8, payload2["logs"]
-            assert payload2["n_auto_refs"] == 2
-
-            # 3) tree ROOT as the manual reference -> actionable error
-            _p3, failed3 = _run(gui.PredictWorker(
-                bundle, files, td, manual_ref_dir=td))
-            assert failed3 and "tree root" in failed3[0], failed3
+            # 2) junk in a patient's Normal folder is skipped: the auto
+            # reference still builds (manual reference input removed
+            # 2026-09-06 — junk tolerance now matters for the auto path)
+            junk_path = os.path.join(td, "Normal", "PA", "notes.txt")
+            with open(junk_path, "w", encoding="utf-8") as fh:
+                fh.write("not a spectrum\n")
+            payload_j, failed_j = _run(gui.PredictWorker(
+                bundle, [f for f in files if "PA" in f], td))
+            assert not failed_j, failed_j[0] if failed_j else ""
+            assert len(payload_j["rows"]) == 4, payload_j["logs"]
+            os.remove(junk_path)
     finally:
         uh.load_settings = _saved_ls
         _cd.find_data_root = _saved_fdr
@@ -1587,6 +1587,45 @@ def test_3sse_persist_and_latest_dir():
         gui.APP_DIR = _saved_appdir
         uh.load_settings = _saved_ls
         _cd.find_data_root = _saved_fdr
+
+
+def test_reference_vector_junk_tolerance():
+    """One junk file (split_log.txt etc.) in the reference folder must
+    not kill the whole prediction run (2026-09-06: a stray .txt failed
+    the entire run); junk-only folders raise with the filename."""
+    import paired as paired_mod
+    wn = np.linspace(500.0, 2000.0, 200)
+    params = pp.PreprocessParams(crop_min=600.0, crop_max=1800.0,
+                                 wavelet=False)
+    bundle = {"wavenumbers": wn, "prep_params": params,
+              "classes": ["Normal", "Tumor"], "paired": True}
+    with tempfile.TemporaryDirectory() as td:
+        def good(rel):
+            f = os.path.join(td, rel)
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            with open(f, "w", encoding="utf-8") as fh:
+                for a in wn:
+                    fh.write(f"{a:.6f},{float(np.sin(a)):.6f}\n")
+            return f
+
+        junk = os.path.join(td, "split_log.txt")
+        with open(junk, "w", encoding="utf-8") as fh:
+            fh.write("hello world\nnot a spectrum\n")
+        g1, g2 = good("ref/a.csv"), good("ref/b.csv")
+        # junk among real spectra: skipped, reference still built
+        v = paired_mod.reference_vector(bundle, [junk, g1, g2])
+        m = pp.crop_mask(wn, params)
+        assert v.shape == (int(m.sum()),)
+        # junk only: informative raise naming the file
+        try:
+            paired_mod.reference_vector(bundle, [junk])
+        except ValueError as exc:
+            assert "split_log.txt" in str(exc), exc
+        else:
+            raise AssertionError("junk-only reference did not raise")
+        # worker-level junk tolerance with AUTO references is pinned
+        # in test_auto_reference_real_layout (the manual reference
+        # input was removed 2026-09-06)
 
 
 def test_is_chain_winner_guard():

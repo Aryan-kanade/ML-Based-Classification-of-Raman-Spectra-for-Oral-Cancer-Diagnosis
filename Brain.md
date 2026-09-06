@@ -1710,3 +1710,42 @@ _run_async start, hidden in finish/fail; sets _diag_cancel). (3)
 `_confirm_heavy_diag`: manual clicks of LC/seeds/noise/LOPO on a
 chain winner get a cost heads-up (Yes/No; auto-chain behavior
 unchanged). 72/72, ruff clean.
+
+## 28. 2026-09-06 (wave 8) — junk file in the manual reference folder killed the run
+
+session.log 21:21:27: reference folder = Data\Normal (class folder) →
+ref_files=[split_log.txt] (matches .txt, unparseable) →
+paired.reference_vector raised on the FIRST bad file → whole run died
+as generic "Prediction failed". The wave-3 tree-root guard only fired
+when the folder had ZERO matching files.
+
+Fixes: (1) reference_vector is junk-tolerant — per-file
+ValueError/OSError skip; raises only when NOTHING loads, naming the
+skipped files + reasons (also hardens _auto_reference against stray
+junk in patient folders); (2) the worker's manual-ref branch wraps the
+call and raises an actionable message ("CLEAR the reference field to
+auto-find per-patient references… or pick the folder that DIRECTLY
+contains one patient's NORMAL spectra"); (3) on_predict_failed now
+surfaces the exception line in the dialog instead of pointing at
+session.log blindly. `test_reference_vector_junk_tolerance` pins all
+three. 73/73, ruff clean.
+
+## 29. 2026-09-06 (wave 9) — manual normal-reference input REMOVED
+
+User decision (after being shown that paired mode itself is what makes
+the models work): remove ONLY the manual reference-folder input; per-
+patient AUTO references from the clinical tree are the one path.
+Rationale: the manual field only ever produced mis-picked folders
+(tree roots, class folders, junk .txt) that failed runs — three
+separate user-facing errors in one day.
+
+Removed: Predict-page reference row (label/edit/Browse +
+_set_bundle visibility), browse_reference, start_predict manual_ref
+logic, PredictWorker.manual_ref_dir + the whole manual branch (tree-
+root trap, junk guidance). Live mode now honestly says it is not
+available for margin models (the manual input was its only reference
+source). KEPT: paired.py, _auto_reference, reference_vector (junk-
+tolerant), bundle["paired"], Model Lab, sequential paired modes —
+all trained models unchanged. deep_test updated (new "Clinical tree
+required" dialog title); junk-in-patient-folder tolerance pinned in
+test_auto_reference_real_layout. 73/73 + 19/19 deep checks + ruff.

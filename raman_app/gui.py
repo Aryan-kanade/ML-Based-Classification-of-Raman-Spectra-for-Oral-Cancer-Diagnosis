@@ -336,11 +336,9 @@ class PredictWorker(QtCore.QThread):
 
     NORMAL_SYNONYMS = ("normal", "norm", "benign", "negative")
 
-    def __init__(self, bundle, files, root, manual_ref_dir=None,
-                 parent=None):
+    def __init__(self, bundle, files, root, parent=None):
         super().__init__(parent)
         self.bundle, self.files, self.root = bundle, files, root
-        self.manual_ref_dir = manual_ref_dir
 
     def _auto_reference(self, path: str, cache: dict,
                         errors: dict | None = None):
@@ -426,34 +424,13 @@ class PredictWorker(QtCore.QThread):
 
     def run(self):
         try:
-            import paired as paired_mod
-            reference = None
+            reference = None          # per-patient refs are per-file now
             ref_map: dict[str, object] = {}
             ref_errors: dict[str, str] = {}
-            if self.bundle.get("paired"):
-                if self.manual_ref_dir and os.path.isdir(
-                        self.manual_ref_dir):
-                    ref_files = [
-                        os.path.join(self.manual_ref_dir, fn)
-                        for fn in sorted(os.listdir(self.manual_ref_dir))
-                        if fn.lower().endswith((".txt", ".dat", ".csv"))]
-                    if not ref_files and any(
-                            os.path.isdir(os.path.join(self.manual_ref_dir,
-                                                       e))
-                            for e in os.listdir(self.manual_ref_dir)):
-                        # UX trap (2026-09-06): picking the tree ROOT as
-                        # the reference folder died on a generic "No
-                        # reference spectra could be loaded"
-                        raise ValueError(
-                            "The reference folder contains no spectrum "
-                            "FILES directly — it looks like a clinical "
-                            "tree root. Pick the folder that directly "
-                            "holds the patient's NORMAL spectra, or "
-                            "clear it to auto-find per-patient "
-                            "references.")
-                    reference = paired_mod.reference_vector(self.bundle,
-                                                            ref_files)
-                # else: per-patient auto references resolved per file
+            # per-patient AUTO references only (2026-09-06): the manual
+            # reference-folder input was removed — it only ever produced
+            # mis-picked folders (tree roots, class folders, junk .txt
+            # files) that failed runs
             rows, prob_list, spec_list, logs = [], [], [], []
             spec_wn = None
             ok_paths = []
@@ -464,12 +441,8 @@ class PredictWorker(QtCore.QThread):
                 self.progress.emit(
                     int(50 * i / n),
                     f"Reading {i}/{n}: {os.path.basename(path)}")
-                ref = reference
-                if (ref is None and self.bundle.get("paired")
-                        and not self.manual_ref_dir):
-                    # falsy (None or "") — an empty-string manual ref
-                    # used to disable BOTH paths: no auto references, so
-                    # EVERY file was skipped (2026-09-06)
+                ref = None
+                if self.bundle.get("paired"):
                     ref = self._auto_reference(path, ref_map, ref_errors)
                 if ref is None and self.bundle.get("paired"):
                     # margin model + no resolvable normal reference:
@@ -480,9 +453,10 @@ class PredictWorker(QtCore.QThread):
                     logs.append(
                         f"SKIPPED {os.path.basename(path)}: no normal "
                         "reference found for this patient — margin-mode "
-                        "models need the patient's own Normal spectra "
-                        "(select the whole clinical tree or set the "
-                        "reference folder)")
+                        "models predict each patient's deviation from "
+                        "their OWN normal spectra (put the patient's "
+                        "Normal folder in the clinical tree next to "
+                        "their Tumor folder)")
                     continue
                 try:
                     wn, it = dataset.load_spectrum(path)
@@ -2721,21 +2695,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.model_info.setWordWrap(True)
         self.model_info.setTextFormat(TEXT_RICH)
         gv.addWidget(self.model_info)
-        # paired-reference row (visible only for paired-trained models)
-        self.ref_row_widget = QtWidgets.QWidget()
-        rr = QtWidgets.QHBoxLayout(self.ref_row_widget)
-        rr.setContentsMargins(0, 6, 0, 0)
-        rr.addWidget(QtWidgets.QLabel("Normal reference:"))
-        self.ref_path_edit = QtWidgets.QLineEdit()
-        self.ref_path_edit.setReadOnly(True)
-        self.ref_path_edit.setPlaceholderText(
-            "folder with the SAME patient's normal spectra …")
-        rr.addWidget(self.ref_path_edit, 1)
-        b_ref = QtWidgets.QPushButton("Browse…")
-        b_ref.clicked.connect(self.browse_reference)
-        rr.addWidget(b_ref)
-        self.ref_row_widget.setVisible(False)
-        gv.addWidget(self.ref_row_widget)
+        # NOTE (2026-09-06): the manual "Normal reference" folder row was
+        # REMOVED — per-patient references are always auto-found from the
+        # clinical tree (<root>/<class>/<patient>); the manual input only
+        # ever produced mis-picked folders (tree roots, class folders,
+        # junk .txt files) that failed runs.
         left.addWidget(g)
 
         g2, g2v = self.card("2 — Spectra to classify",
@@ -3485,13 +3449,18 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 # paired (margin) bundles are meaningless without the
                 # patient's normal reference — refuse instead of silently
-                # predicting absolute spectra (2026-09-05)
+                # predicting absolute spectra (2026-09-05). The manual
+                # reference input was removed 2026-09-06, so live mode
+                # simply is not available for margin models: use the
+                # Predict page on the clinical tree, where per-patient
+                # references are resolved automatically.
                 if (self.bundle or {}).get("paired") \
                         and self._pred_reference is None:
                     raise ValueError(
-                        "paired (margin) bundle: pick the patient's "
-                        "normal reference on the Predict page before "
-                        "enabling live mode")
+                        "live mode is not available for margin (paired) "
+                        "models — predict on the clinical tree from the "
+                        "Predict page (per-patient normal references "
+                        "are resolved automatically there)")
                 wn, it = dataset.load_spectrum(path)
                 out = modeling.predict_with_bundle(
                     self.bundle, wn, it,
@@ -7889,15 +7858,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.friendly_error("Saving the model failed", exc)
 
     # ============================================================ Predict
-    def browse_reference(self):
-        start = self.settings.get("predict_folder",
-                                  os.path.dirname(APP_DIR))
-        folder = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Select folder with the patient's NORMAL reference "
-                  "spectra", start)
-        if folder:
-            self.ref_path_edit.setText(folder)
-
     def _set_bundle(self, bundle: dict, path: str):
         self.bundle = bundle
         self.model_path_edit.setText(path)
@@ -7906,7 +7866,6 @@ class MainWindow(QtWidgets.QMainWindow):
         op = bundle.get("op_points")
         self._op_points = (tuple(op) if isinstance(op, (list, tuple))
                            and len(op) == 2 else None)
-        self.ref_row_widget.setVisible(bool(bundle.get("paired")))
         self.model_info.setText(
             f"<b>{bundle['model_name']}</b> — classes: "
             f"{', '.join(bundle['classes'])} | macro sensitivity "
@@ -8022,54 +7981,46 @@ class MainWindow(QtWidgets.QMainWindow):
         target = self.spec_path_edit.text().strip()
         root = target if os.path.isdir(target) else os.path.dirname(
             files[0])
-        manual_ref = None
         if self.bundle.get("paired"):
-            # empty edit must become None: the worker enables per-patient
-            # AUTO references only when manual_ref_dir is falsy — an ""
-            # used to disable BOTH paths and skip every file (2026-09-06)
-            manual_ref = self.ref_path_edit.text().strip() or None
-            if manual_ref and not os.path.isdir(manual_ref):
-                manual_ref = None
-            if not manual_ref:
-                # no manual folder: auto per-patient references need a
-                # clinical tree somewhere at/above the selected folder —
-                # walk up from the input root looking for a Normal* side
-                has_tree = False
-                base = os.path.abspath(root) if os.path.isdir(root) else None
-                for _ in range(3):
-                    if not base or not os.path.isdir(base):
+            # per-patient AUTO references need a clinical tree somewhere
+            # at/above the selected folder — walk up from the input root
+            # looking for a Normal* side (the manual reference input was
+            # removed 2026-09-06: it only ever produced mis-picked
+            # folders that failed runs)
+            has_tree = False
+            base = os.path.abspath(root) if os.path.isdir(root) else None
+            for _ in range(3):
+                if not base or not os.path.isdir(base):
+                    break
+                for cls_dir in os.listdir(base):
+                    cp = os.path.join(base, cls_dir)
+                    if (os.path.isdir(cp)
+                            and cls_dir.lower().startswith(
+                                PredictWorker.NORMAL_SYNONYMS)
+                            and any(os.path.isdir(
+                                os.path.join(cp, d))
+                                for d in os.listdir(cp))):
+                        has_tree = True
                         break
-                    for cls_dir in os.listdir(base):
-                        cp = os.path.join(base, cls_dir)
-                        if (os.path.isdir(cp)
-                                and cls_dir.lower().startswith(
-                                    PredictWorker.NORMAL_SYNONYMS)
-                                and any(os.path.isdir(
-                                    os.path.join(cp, d))
-                                    for d in os.listdir(cp))):
-                            has_tree = True
-                            break
-                    if has_tree:
-                        break
-                    nxt = os.path.dirname(base)
-                    if nxt == base:
-                        break
-                    base = nxt
-                if not has_tree:
-                    QtWidgets.QMessageBox.warning(
-                        self, "Reference required",
-                        "This model was trained in MARGIN mode. Either "
-                        "pick the folder with the patient's NORMAL "
-                        "reference spectra, or select the whole "
-                        "clinical tree (<root>/<class>/<patient>) so "
-                        "each patient's own normal can be found "
-                        "automatically.")
-                    return
+                if has_tree:
+                    break
+                nxt = os.path.dirname(base)
+                if nxt == base:
+                    break
+                base = nxt
+            if not has_tree:
+                QtWidgets.QMessageBox.warning(
+                    self, "Clinical tree required",
+                    "This model was trained in MARGIN mode: every "
+                    "prediction is the patient's DEVIATION from their "
+                    "own normal tissue. Select the whole clinical tree "
+                    "(<root>/<class>/<patient>) so each patient's own "
+                    "normal spectra can be found automatically.")
+                return
         self.b_predict.setEnabled(False)
         self.statusBar().showMessage("Predicting…")
         self.predict_status.setText("Predicting…")
-        self._pred_worker = PredictWorker(self.bundle, files, root,
-                                          manual_ref_dir=manual_ref)
+        self._pred_worker = PredictWorker(self.bundle, files, root)
         self._pred_worker.progress.connect(
             lambda pct, msg: self.statusBar().showMessage(
                 f"{pct}% — {msg}"))
@@ -8185,10 +8136,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_predict.setEnabled(True)
         self.statusBar().showMessage("Prediction failed — see log")
         self.log(f"Prediction failed:\n{tb}")
+        # surface the exception line itself (2026-09-06: actionable
+        # messages like the reference-folder guidance were buried in
+        # session.log behind a generic box)
+        last = next((ln for ln in reversed(tb.strip().splitlines())
+                     if ln.strip() and not ln.lstrip().startswith(
+                         ("File ", "~", "^^", "raise"))), "")
         QtWidgets.QMessageBox.warning(
             self, "Prediction failed",
-            "Prediction failed.\n\nTechnical details are in session.log "
-            "next to the app.")
+            f"Prediction failed:\n\n{last or 'Unknown error.'}\n\n"
+            "Full technical details are in session.log next to the app.")
 
     def _aggregate_patients(self, files: list[str], rows: list[tuple]):
         """
