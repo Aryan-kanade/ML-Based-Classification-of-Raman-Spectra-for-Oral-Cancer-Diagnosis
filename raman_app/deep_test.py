@@ -79,7 +79,11 @@ def _install_dialog_recorder():
         def make_fd(_n):
             def _fd(*a, **k):
                 DIALOG_LOG.append(("filedialog", _n, str(a[1:2])))
-                return ("", "")
+                # getExistingDirectory returns ONE string, not a tuple —
+                # returning ("", "") here made it truthy, so callers
+                # treated a tuple as a folder and every figure export
+                # failed with "expected str ... not tuple" (2026-09-06)
+                return "" if _n == "getExistingDirectory" else ("", "")
             return staticmethod(_fd)
         setattr(QtWidgets.QFileDialog, n, make_fd(n))
 

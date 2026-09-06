@@ -1749,3 +1749,43 @@ tolerant), bundle["paired"], Model Lab, sequential paired modes —
 all trained models unchanged. deep_test updated (new "Clinical tree
 required" dialog title); junk-in-patient-folder tolerance pinned in
 test_auto_reference_real_layout. 73/73 + 19/19 deep checks + ruff.
+
+## 30. 2026-09-06 (wave 10) — full-project automated test pass
+
+User-requested complete test audit. Inventory (2 Explore agents): 73
+unit + 19 deep + 9 gui checks existed; gaps = 6 modeling/preprocessing
+helpers, settings persistence (always stubbed), report writers,
+plotting helpers, ui_helpers widgets, live mode, 3SSE GUI completion,
+diag queue/cancel flow, failure callbacks, freeze/figures real paths,
+TrainWorker success path. Added 13 tests (test_all 73→86) +
+`_qt_app_styled`/`_isolated_main_window`/`_stub_native_dialogs_once`
+harness helpers + `_flat_folder_td`.
+
+Bugs found & fixed:
+1. plotting.plot_sign_bars: %-style fmt inside f-string
+   {v:{fmt}} → ValueError on EVERY call (dead code, never run before)
+   — both orientations; now `fmt % v`.
+2. gui._draw_winner_plots crashed on cm=None (metrics-only winners,
+   reachable via restore) → guard + log-skip.
+3. gui.on_seq_done left oof_proba as a raw list → downstream plot
+   crash → np.asarray (restore already converted; parity restored).
+4. deep_test dialog stub returned ("", "") for getExistingDirectory
+   (single-string API) → truthy tuple → EVERY figure export in deep
+   scenarios silently failed ("expected str... not tuple") — stub
+   returns "" now.
+5. Harness lesson (not product): an UNREFERENCED QApplication gets
+   GC'd → later widget construction goes qFatal (exit 127/139) —
+   _qt_app_styled result must be HELD; native modal dialogs in
+   offscreen runs corrupt subsequent window construction → stubbed
+   once per process (deep_test pattern).
+
+Remaining (documented, not fixed): TrainWorker's QThread success path
+natively crashes deterministically in test processes (gotcha #16/#22
+family — even fresh subprocesses; guard/error paths ARE covered by
+deep_test) → the real compute chain is tested synchronously instead;
+sequential.py CLI main() has no end-to-end test (runtime); no line-
+coverage tool installed (functional coverage 136/151 public functions
+= 90%); chain_factory remains dead code (now pinned by nothing —
+candidate for deletion).
+
+Final: 86/86 unit + gui_test PASSED + 19/19 deep + ruff clean.

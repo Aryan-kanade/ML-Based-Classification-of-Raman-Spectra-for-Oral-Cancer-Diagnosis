@@ -514,7 +514,10 @@ def plot_sign_bars(ax, labels, values, ylabel="", title="",
                        linewidth=0.6)
         ax.axvline(0, color=COL_ZERO, lw=0.8)
         for b, v in zip(bars, vals, strict=True):
-            ax.text(v, b.get_y() + b.get_height() / 2, f" {v:{fmt}}",
+            # fmt is %-STYLE ("%+.2f") — f-string {v:{fmt}} rejects it
+            # (Invalid format specifier); this dead-code path had never
+            # run until the 2026-09-06 audit test pinned it
+            ax.text(v, b.get_y() + b.get_height() / 2, " " + fmt % v,
                     va="center", ha="left" if v >= 0 else "right",
                     fontsize=8, color=COL_TEXT)
         ax.invert_yaxis()
@@ -526,7 +529,7 @@ def plot_sign_bars(ax, labels, values, ylabel="", title="",
                       linewidth=0.6)
         ax.axhline(0, color=COL_ZERO, lw=0.8)
         for b, v in zip(bars, vals, strict=True):
-            ax.text(b.get_x() + b.get_width() / 2, v, f"{v:{fmt}}",
+            ax.text(b.get_x() + b.get_width() / 2, v, fmt % v,
                     ha="center", va="bottom" if v >= 0 else "top",
                     fontsize=8, color=COL_TEXT)
     if ylabel:

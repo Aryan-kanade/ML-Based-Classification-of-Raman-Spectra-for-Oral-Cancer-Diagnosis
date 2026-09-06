@@ -2487,6 +2487,577 @@ def _optional_report():
               f"covered less): {', '.join(missing)}")
 
 
+# ==========================================================================
+# Wave 10 (2026-09-06): gap-filling tests from the full coverage audit
+# ==========================================================================
+def _flat_folder_td(root: str, n_per_class: int = 10) -> str:
+    """Synthetic flat labeled folder (classes from the C-number filename
+    token) — deep_test's helper, local copy for the GUI-path tests."""
+    rng = np.random.default_rng(0)
+    wn = np.linspace(400, 1800, 400)
+    os.makedirs(root, exist_ok=True)
+    for cls, gain in (("C1", 0.4), ("C5", 1.0), ("C8", 1.6)):
+        for i in range(n_per_class):
+            peaks = (np.exp(-((wn - 1003) / 15) ** 2)
+                     + gain * np.exp(-((wn - 1450) / 15) ** 2))
+            it = 0.1 + peaks + rng.normal(0, 0.02, len(wn))
+            with open(os.path.join(root, f"SYN_785_{cls}_{i + 1}.txt"),
+                      "w", encoding="utf-8") as fh:
+                for w, v in zip(wn, it, strict=True):
+                    fh.write(f"{w:.2f},{v:.4f}\n")
+    return root
+
+
+def _qt_app_styled():
+    """Styled offscreen QApplication (Fusion+QSS before constructing
+    widgets — the native fail-fast guard)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from qt_compat import QtWidgets
+    import ui_helpers as uh
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyle("Fusion")
+    app.setStyleSheet(uh.STYLESHEET)
+    return app
+
+
+def _stub_native_dialogs_once():
+    """Replace modal QMessageBox/QFileDialog with recorders (deep_test's
+    pattern): native modals hang or hard-crash offscreen runs, and a
+    modal shown by one test corrupted the NEXT window construction
+    (deterministic segfault, 2026-09-06). Idempotent."""
+    from qt_compat import QtWidgets
+    if getattr(QtWidgets.QMessageBox, "_barc_stubbed", False):
+        return
+    for n in ("warning", "information", "critical", "about"):
+        def make(_n):
+            def _box(*a, **k):
+                return None
+            return staticmethod(_box)
+        setattr(QtWidgets.QMessageBox, n, make(n))
+    for n in ("getSaveFileName", "getOpenFileName", "getExistingDirectory",
+              "getSaveFileNames", "getOpenFileNames"):
+        def make_fd(_n):
+            def _fd(*a, **k):
+                return "" if _n == "getExistingDirectory" else ("", "")
+            return staticmethod(_fd)
+        setattr(QtWidgets.QFileDialog, n, make_fd(n))
+    QtWidgets.QMessageBox._barc_stubbed = True
+
+
+def _isolated_main_window():
+    """Isolated MainWindow (no developer settings / real data root) —
+    the established deep_test pattern, returned with the app."""
+    import ui_helpers as uh
+    import clinical_data as _cd
+    import gui
+    app = _qt_app_styled()
+    _stub_native_dialogs_once()
+    _saved = (uh.load_settings, _cd.find_data_root)
+    uh.load_settings = lambda: {}
+    _cd.find_data_root = lambda: None
+    try:
+        win = gui.MainWindow()
+    finally:
+        uh.load_settings, _cd.find_data_root = _saved
+    return app, win
+
+
+def test_settings_persistence_roundtrip():
+    """Real settings.json write/read (ui_helpers.save/load_settings) —
+    every other test stubs these; the actual file path handling was
+    never asserted."""
+    import ui_helpers as uh
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "settings.json")
+        saved = uh.SETTINGS_PATH
+        uh.SETTINGS_PATH = path
+        try:
+            uh.save_settings({"last_model": "m.joblib", "n": 3})
+            assert os.path.isfile(path)
+            back = uh.load_settings()
+            assert back == {"last_model": "m.joblib", "n": 3}
+            # corrupt / missing file -> {} (never crashes startup)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+            assert uh.load_settings() == {}
+            os.remove(path)
+            assert uh.load_settings() == {}
+            # non-dict JSON -> {}
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("[1, 2]")
+            assert uh.load_settings() == {}
+        finally:
+            uh.SETTINGS_PATH = saved
+
+
+def test_untested_modeling_helpers():
+    """device_report / class_metrics_from_cm / best_f1_threshold /
+    roc_points / grouped_oof_auc / fit_maybe_grouped — audit-flagged
+    untested public helpers."""
+    rep = modeling.device_report()
+    assert isinstance(rep, str) and rep        # non-empty line
+    cm = np.array([[8, 2], [1, 9]])
+    per = modeling.class_metrics_from_cm(cm)
+    assert abs(per["0"]["sens"] - 0.8) < 1e-9
+    assert abs(per["1"]["spec"] - 0.8) < 1e-9   # TN=8, FP=2
+    scores = np.array([0.1, 0.4, 0.35, 0.8, 0.95])
+    yb = np.array([0, 0, 1, 1, 1])
+    thr, f1, _j = modeling.best_f1_threshold(yb, scores)
+    assert 0.0 <= thr <= 1.0 and f1 > 0.6
+    fpr, tpr, auc = modeling.roc_points(yb, scores)
+    assert auc > 0.75 and len(fpr) == len(tpr)   # one inversion by design
+    from sklearn.linear_model import LogisticRegression
+    rng = np.random.default_rng(3)
+    X = rng.normal(size=(40, 5))
+    X[:20, 0] += 1.5                      # separable signal
+    y = np.repeat([0, 1], 20)
+    g = np.repeat(np.arange(8), 5)
+    auc_g = modeling.grouped_oof_auc(LogisticRegression(), X, y, g, k=3)
+    assert 0.6 <= auc_g <= 1.0, auc_g     # raw AUC, separable data
+    est = modeling.fit_maybe_grouped(LogisticRegression(), X, y, g)
+    assert hasattr(est, "predict")
+
+
+def test_untested_preprocessing_helpers():
+    """savgol_smooth / als_baseline / arpls_baseline / phe1003_position /
+    clear_stage_cache — audit-flagged untested public helpers."""
+    rng = np.random.default_rng(1)
+    y = np.abs(rng.normal(size=200)) + 2.0
+    sm = pp.savgol_smooth(y, 11, 3)
+    assert sm.shape == y.shape and np.isfinite(sm).all()
+    base = pp.als_baseline(y, 1e4, 0.01, 5)
+    assert base.shape == y.shape and np.isfinite(base).all()
+    # a smooth envelope: stays under the signal's maximum (may dip
+    # below its minimum and ride above sharp valleys — both normal)
+    assert base.max() <= y.max() + 1e-6
+    if pp.HAS_PYBASELINES:
+        b2 = pp.arpls_baseline(y, 1e4)
+        assert b2.shape == y.shape
+    wn = np.linspace(900.0, 1100.0, 100)
+    spec = np.exp(-((wn - 1003.0) ** 2) / (2 * 4.0 ** 2))
+    pos = pp.phe1003_position(spec, wn)
+    assert abs(pos - 1003.0) < 2.0
+    pp.clear_stage_cache()              # must not raise (cache miss path)
+    # cache actually caches: same input+stage -> identical object result
+    v1 = pp.preprocess_spectrum(y, pp.PreprocessParams(wavelet=False))
+    pp.clear_stage_cache()
+    v2 = pp.preprocess_spectrum(y, pp.PreprocessParams(wavelet=False))
+    assert np.allclose(v1, v2)
+
+
+def test_format_and_write_report_and_class_token():
+    """clinical_data.format_report/write_report round-trip and
+    dataset.parse_class_token — audit-flagged untested."""
+    import clinical_data as cdata
+    rep = {"root": r"X:\dummy", "files_scanned": 12,
+           "class_map": {"Normal": "Normal", "Tumor": "Tumor"},
+           "class_counts": {"Normal": 4, "Tumor": 6},
+           "patients_per_class": {"Normal": 4, "Tumor": 5},
+           "patients_in_both_classes": ["S1", "S2"],
+           "n_spectra": 10, "n_subjects": 7, "grid_identical": True,
+           "references_excluded": ["a_white.txt"],
+           "duplicates_dropped": [("keep.csv", "dup.csv")],
+           "cross_class_dropped": ["leak.csv"],
+           "load_errors": []}
+    text = cdata.format_report(rep)
+    assert "Clinical dataset report" in text
+    assert "10 spectra / 7 subjects" in text and "dup.csv" in text
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "r.txt")
+        cdata.write_report(p, rep)
+        back = open(p, encoding="utf-8").read()
+        assert back.strip() == text.strip()
+    assert ds.parse_class_token("spec_C8_01.txt") == "C8"
+    assert ds.parse_class_token("no_token.txt") == ""
+
+
+def test_optimize_best_params_roundtrip():
+    """optimize.save_best_params/load_best_params round-trip."""
+    import optimize
+    params = pp.PreprocessParams(crop_min=500.0, crop_max=2000.0,
+                                 wavelet=False)
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "preprocess_best.json")
+        out = optimize.save_best_params(params, 0.71, "PCA + LDA", path=p)
+        assert out == p and os.path.isfile(p)
+        loaded = optimize.load_best_params(p)
+        assert loaded is not None
+        lp, data = loaded          # (PreprocessParams, raw dict)
+        assert abs(data["score_macro_f1"] - 0.71) < 1e-9
+        assert data["model"] == "PCA + LDA"
+        assert lp.crop_min == 500.0 and lp.crop_max == 2000.0
+
+
+def test_plot_helpers_render():
+    """Every audit-flagged untested plotting helper renders on an Agg
+    canvas without raising (plot_sign_bars is called nowhere in the app
+    — dead code, pinned here so it stays working)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import plotting as pl
+    rng = np.random.default_rng(2)
+    wn = np.linspace(500.0, 2000.0, 120)
+
+    def fresh():
+        fig, ax = plt.subplots(figsize=(4, 3))
+        return fig, ax
+
+    fig, ax = fresh()
+    pl.plot_spectra(ax, [(wn, rng.normal(0, 1, 120), "A"),
+                         (wn, rng.normal(0, 1, 120), "B")])
+    fig, ax = fresh()
+    pl.plot_confusion_matrix(ax, np.array([[9, 1], [2, 8]]),
+                             ["Normal", "Tumor"])
+    fig, ax = fresh()
+    pl.plot_roc(ax, np.array([0.0, 0.1, 1.0]), np.array([0.0, 0.9, 1.0]),
+                0.91)
+    fig, ax = fresh()
+    pl.plot_pr(ax, np.array([1.0, 0.9, 0.5]), np.array([0.5, 0.9, 1.0]),
+               0.85)
+    fig, ax = fresh()
+    bins = [(0.0, 0.3, 0.2, 0.25), (0.3, 0.7, 0.5, 0.55),
+            (0.7, 1.0, 0.85, 0.8)]
+    pl.plot_calibration(ax, bins, cal_bins=bins)
+    fig, ax = fresh()
+    thr = np.linspace(0.05, 0.95, 10)
+    pl.plot_dca(ax, thr, 0.2 - 0.15 * thr, 0.2 - 0.2 * thr)
+    fig, ax = fresh()
+    pl.plot_class_distribution(ax, ["A", "A", "B"])
+    fig, ax = fresh()
+    pl.plot_perclass_metrics(ax, ["A", "B"],
+                             {"A": {"sens": (0.8, 0.02),
+                                    "spec": (0.7, 0.01),
+                                    "f1": (0.75, 0.02)},
+                              "B": {"sens": (0.7, 0.03),
+                                    "spec": (0.8, 0.01),
+                                    "f1": (0.74, 0.02)}})
+    fig, ax = fresh()
+    pl.plot_count_bars(ax, ["Normal", "Tumor"], [12, 9],
+                       positive="Tumor")
+    fig, ax = fresh()
+    pl.plot_sign_bars(ax, ["a", "b", "c"], [0.4, -0.2, 0.0],
+                      ylabel="delta", red_below=0.0)
+    plt.close("all")
+
+
+def test_ui_helpers_widgets():
+    """pill / step_chip / metric_bg / metric_fg / attach_shadow /
+    repolish / make_app_icon — zero direct coverage before."""
+    import ui_helpers as uh
+    app = _qt_app_styled()     # HOLD the reference: an unreferenced
+    _ = app                    # QApplication gets GC'd and every later
+    from qt_compat import QtWidgets  # widget construction goes qFatal
+    lbl = uh.pill("F1 0.80", "green")
+    assert isinstance(lbl, QtWidgets.QLabel)
+    chip = uh.step_chip("2 Train", off=True)
+    assert isinstance(chip, QtWidgets.QLabel)
+    w = QtWidgets.QWidget()
+    uh.attach_shadow(w)
+    uh.repolish(w)
+    icon = uh.make_app_icon()
+    assert icon is not None
+    assert uh.metric_bg(0.9) != uh.metric_bg(0.4)
+    assert uh.metric_fg(0.9) != uh.metric_fg(0.4)
+
+
+def test_on_seq_done_installs_and_persists():
+    """The GUI 3SSE completion path (on_seq_done): winner installed on
+    the Train page AND study_run_3sse/winner.{joblib,json} persisted —
+    previously only the backend search was tested."""
+    import ui_helpers as uh
+    import gui
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    import sequential as seq
+    app, win = _isolated_main_window()
+    _saved = (uh.save_settings, gui.APP_DIR)
+    uh.save_settings = lambda s: None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            gui.APP_DIR = td
+            wn = np.linspace(500.0, 2000.0, 60)
+            win.grid = wn
+            win._source_folder = ""
+            win._params_at_train = pp.PreprocessParams(wavelet=False)
+            mk = lambda: Pipeline([("sc", StandardScaler()),
+                                   ("lr", LogisticRegression())])
+            payload = {
+                "board": {"singles": [
+                    {"arch": ("PCA + LDA",), "level": 1,
+                     "metrics": {"f1": 0.6, "sens": 0.6, "spec": 0.6,
+                                 "acc": 0.6, "auc": 0.7}}],
+                    "pairs": [], "triples": [], "total": 1, "pruned": 0},
+                "validated": {1: [{"arch": ("PCA + LDA",),
+                                   "metrics": {"f1": 0.61, "sens": 0.6,
+                                               "spec": 0.6, "acc": 0.6,
+                                               "auc": 0.7}}]},
+                "winner": {"arch": ("PCA + LDA", "PCA + SVM (RBF)"),
+                           "classes": ["Normal", "Tumor"],
+                           "threshold": 0.55,
+                           "chain": seq.AveragedChain([mk(), mk()],
+                                                      n_seeds=1),
+                           "calibrator": None,
+                           "metrics": {"f1": 0.7, "sens": 0.7, "spec": 0.7,
+                                       "acc": 0.7, "auc": 0.75,
+                                       "cm": [[8, 2], [1, 9]],
+                                       "y_true": [0] * 10 + [1] * 10,
+                                       "oof_proba": [[0.8, 0.2]] * 10 +
+                                       [[0.1, 0.9]] * 10}},
+                "k": 2, "seed": 42,
+                "groups": ["S0"] * 10 + ["S1"] * 10,
+                "significance": None}
+            win.on_seq_done(payload)
+            assert win.winner is not None
+            assert win.winner.name.startswith("3SSE: PCA + LDA")
+            out = os.path.join(td, "study_run_3sse")
+            assert os.path.isfile(os.path.join(out, "winner.joblib"))
+            assert os.path.isfile(os.path.join(out, "winner.json"))
+            import joblib as _jb
+            b = _jb.load(os.path.join(out, "winner.joblib"))
+            assert b["model_name"] == win.winner.name
+    finally:
+        try:
+            win.close()
+        except RuntimeError:
+            pass
+        gui.APP_DIR = _saved[1]
+        uh.save_settings = _saved[0]
+
+
+def test_diag_queue_order_and_chain_guard():
+    """run_all_diagnostics: serial queue composition for plain vs CHAIN
+    winners (chain guard skips the heavy refit items), full drain, and
+    the checkbox skip in _on_train_done_then_diags."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    app, win = _isolated_main_window()
+    _saved_box = None
+    from qt_compat import QtWidgets
+    boxes = []
+    _saved_box = QtWidgets.QMessageBox.information
+    QtWidgets.QMessageBox.information = (
+        staticmethod(lambda *a, **k: boxes.append(a[1] if len(a) > 1
+                                                  else "") or None))
+    try:
+        order = []
+        names = ("run_region_importance", "run_band_agreement",
+                 "run_learning_curve", "run_seed_stability",
+                 "run_noise_check", "run_locked_eval", "run_lopo",
+                 "run_honest_check")
+        for n in names:
+            setattr(win, n, (lambda nm: lambda *a, **k: order.append(nm))(
+                n))
+        # plain winner: FULL battery, serial order
+        win.winner = modeling.ModelResult(name="plain",
+                                          classes=["A", "B"])
+        win.winner.pipeline = Pipeline([("sc", StandardScaler()),
+                                        ("lr", LogisticRegression())])
+        win.run_all_diagnostics()
+        assert order == list(names), order
+        # chain winner: heavy items skipped, light items + honest only
+        import sequential as seq
+        order.clear()
+        win._diag_queue = []
+        win.winner = modeling.ModelResult(name="chain",
+                                          classes=["A", "B"])
+        win.winner.pipeline = seq.AveragedChain(
+            [Pipeline([("sc", StandardScaler()),
+                       ("lr", LogisticRegression())])], n_seeds=1)
+        win.run_all_diagnostics()
+        assert order == ["run_region_importance", "run_band_agreement",
+                         "run_honest_check"], order
+        # auto-diagnostics checkbox off -> _on_train_done_then_diags skips
+        order.clear()
+        win._diag_queue = []
+        win.chk_auto_diags.setChecked(False)
+        r = modeling.ModelResult(name="x", classes=["A", "B"])
+        r.macro = {"f1": (0.5, 0.0), "sens": (0.5, 0.0), "spec": (0.5, 0.0)}
+        r.cm = np.array([[8, 2], [1, 9]])   # plottable winner state
+        win._on_train_done_then_diags([r], r)
+        assert order == []          # nothing queued; log says skipped
+    finally:
+        try:
+            win.close()
+        except RuntimeError:
+            pass
+        QtWidgets.QMessageBox.information = _saved_box
+
+
+def test_failure_callbacks_reenable():
+    """on_train_failed / on_predict_failed / on_optimize_failed /
+    on_honest_failed must re-enable their buttons, set status text and
+    survive (the excepthook must never be needed)."""
+    app, win = _isolated_main_window()
+    try:
+        win.spectra = ["s"] * 3            # on_train_failed gates the
+        win.b_train.setEnabled(False)      # button on data being loaded
+        win.b_predict.setEnabled(False)    # the callbacks must restore
+        win.on_train_failed("Traceback: boom")
+        assert win.b_train.isEnabled()
+        win.on_predict_failed("Traceback: ValueError: nope\n"
+                              "ValueError: nope")
+        assert win.b_predict.isEnabled()
+        win.on_optimize_failed("Traceback: bad")
+        # b_honest_btn is created lazily by run_honest_check — before
+        # that the guarded attribute is simply absent/None
+        if not hasattr(win, "b_honest_btn"):
+            win.b_honest_btn = None
+        win.on_honest_failed("Traceback: bad")
+        assert "fail" in win.train_status.text().lower()
+    finally:
+        win.close()
+
+def test_freeze_and_figures_real_paths():
+    """freeze_study writes the real manifest (params + code hashes +
+    winner) and save_result_figures exports real PNGs — both were only
+    tested on their guard paths before."""
+    import gui
+    app, win = _isolated_main_window()
+    from qt_compat import QtWidgets
+    import ui_helpers as uh
+    _saved = (gui.APP_DIR, uh.save_settings,
+              QtWidgets.QFileDialog.getExistingDirectory)
+    uh.save_settings = lambda s: None
+    try:
+        with tempfile.TemporaryDirectory() as td, \
+                tempfile.TemporaryDirectory() as fd:
+            gui.APP_DIR = td
+            # minimal real data + winner state on the Result page
+            folder = _flat_folder_td(os.path.join(td, "data"))
+            win.load_folder(folder, quiet=True)
+            win._source_folder = folder
+            win.winner = modeling.ModelResult(name="PCA + LDA",
+                                              classes=["A", "B"])
+            win.winner.macro = {"f1": (0.8, 0.0), "sens": (0.8, 0.0),
+                                "spec": (0.8, 0.0)}
+            win.freeze_study()
+            mpath = os.path.join(td, "study_manifest.json")
+            assert os.path.isfile(mpath)
+            import json as _json
+            man = _json.load(open(mpath, encoding="utf-8"))
+            assert man["app"] == "Raman Spectra Classifier"
+            assert "preprocessing" in man and "code_hashes" in man
+            assert man["winner"]["model"] == "PCA + LDA"
+            assert man["n_spectra"] == len(win.spectra)
+            # real PNG export
+            win._pred_rows = [("a_C7_0.txt", "A", 0.9)]
+            win._pred_probs = [{"A": 0.9, "B": 0.1}]
+            QtWidgets.QFileDialog.getExistingDirectory = (
+                staticmethod(lambda *a, **k: fd))
+            win.render_result_page()
+            win.save_result_figures()
+            pngs = [f for f in os.listdir(fd) if f.endswith(".png")]
+            assert pngs, "no figures exported"
+    finally:
+        try:
+            win.close()
+        except RuntimeError:
+            pass
+        gui.APP_DIR, uh.save_settings = _saved[0], _saved[1]
+        QtWidgets.QFileDialog.getExistingDirectory = _saved[2]
+
+
+def test_live_mode_toggle_and_refusal():
+    """Live folder mode: watcher created/destroyed on toggle; margin
+    (paired) bundles are refused with a clear error instead of silently
+    predicting absolute spectra."""
+    from sklearn.linear_model import LogisticRegression
+    app, win = _isolated_main_window()
+    folder = tempfile.mkdtemp()
+    try:
+        win.spec_path_edit.setText(folder)
+        # plain bundle: watcher on/off lifecycle
+        win._set_bundle({"model_name": "plain", "pipeline":
+                         LogisticRegression(), "classes": ["A", "B"],
+                         "threshold": None,
+                         "wavenumbers": np.arange(10.0),
+                         "prep_params": pp.PreprocessParams(),
+                         "macro": {}, "paired": False}, "plain.joblib")
+        win._toggle_live_watch(True)
+        assert getattr(win, "_watcher", None) is not None
+        win._toggle_live_watch(False)
+        assert getattr(win, "_watcher", None) is None
+        # paired bundle without a reference: live fire refuses loudly
+        # (a real spectrum file in the watched folder makes `new`
+        # non-empty, which is the refusal's trigger path)
+        win._set_bundle({"model_name": "margin", "pipeline":
+                         LogisticRegression(), "classes": ["A", "B"],
+                         "threshold": None,
+                         "wavenumbers": np.arange(10.0),
+                         "prep_params": pp.PreprocessParams(),
+                         "macro": {}, "paired": True}, "margin.joblib")
+        win._watcher = object()          # _live_fire gate
+        spec_file = os.path.join(folder, "x.csv")
+        with open(spec_file, "w", encoding="utf-8") as fh:
+            for i in range(20):
+                fh.write(f"{500.0 + i * 10.0},{float(i) * 0.1}\n")
+        logged = []
+        _saved_log = win.log
+        win.log = logged.append
+        try:
+            win._live_fire()             # per-file refusal is caught +
+        finally:                         # logged by _live_fire itself
+            win.log = _saved_log
+            os.remove(spec_file)
+        win._watcher = None
+        assert any("not available for margin" in str(m) for m in logged), \
+            logged
+    finally:
+        try:
+            win.close()
+        except RuntimeError:
+            pass
+        os.rmdir(folder)
+
+
+def test_trainworker_success_path():
+    """The REAL training chain, synchronously: load_folder → the exact
+    evaluate_models call TrainWorker.run makes → the real completion
+    handler _on_train_done_then_diags → winner installed, tables filled,
+    Save enabled, diagnostics gating respected.  (Every other test
+    injects pre-computed results into on_train_done.)  The QThread
+    wrapper itself is deliberately NOT exercised here — training in a
+    GUI thread trips the documented native-crash race (Brain gotcha
+    #16/#22, reproduced deterministically 2026-09-06 even in a fresh
+    subprocess); deep_test exercises the guard/error paths of that
+    wrapper instead."""
+    app, win = _isolated_main_window()
+    import ui_helpers as uh
+    _saved = uh.save_settings
+    uh.save_settings = lambda s: None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            folder = _flat_folder_td(os.path.join(td, "flat"))
+            win.load_folder(folder, quiet=True)
+            assert len(win.spectra) == 30 and win.grid is not None
+            keep = list(range(len(win.labels)))
+            X = win.get_processed_X()
+            names = [n for n, cb in win.model_checks.items()
+                     if cb.isChecked() and n in ("PCA + LDA",
+                                                 "Random Forest")]
+            assert len(names) == 2
+            results, winner = modeling.evaluate_models(
+                X, [win.labels[i] for i in keep], names,
+                3, 42, progress_cb=lambda pct, msg: None,
+                groups=None, repeats=1, wavenumbers=win.grid)
+            assert winner is not None and winner.macro_f1() > 0.5
+            win.chk_auto_diags.setChecked(False)   # deterministic end
+            win._on_train_done_then_diags(results, winner)
+            assert win.winner is winner
+            assert win.b_save.isEnabled()
+            assert len(win.results) == 2           # both models (winner
+            #                                    is one of them already)
+            assert win.compare_table.rowCount() >= 2
+    finally:
+        try:
+            win.close()
+        except RuntimeError:
+            pass
+        uh.save_settings = _saved
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

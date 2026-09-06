@@ -7566,7 +7566,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 classes[int(k)]: {mk: (mv, 0.0) for mk, mv in v.items()}
                 for k, v in
                 modeling.class_metrics_from_cm(winner.cm).items()}
-        winner.oof_proba = m.get("oof_proba")
+        # ndarray like every other consumer expects (restore converts
+        # too; a raw list crashed _draw_winner_plots, 2026-09-06)
+        oof = m.get("oof_proba")
+        winner.oof_proba = (np.asarray(oof, dtype=float)
+                            if oof is not None else None)
         winner.y_true_encoded = np.asarray(m.get("y_true"))
         winner.groups = payload.get("groups")
         winner.threshold = fin.get("threshold")
@@ -7721,6 +7725,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _draw_winner_plots(self):
         w = self.winner
+        if w is None or w.cm is None:
+            # metrics-only winners (e.g. restored from a winner.json
+            # without a persisted cm) have nothing to plot — a bare
+            # None crashed here and half-restored the Train page
+            # (2026-09-06)
+            self.log("Winner plots skipped — no confusion matrix "
+                     "available (metrics-only winner).")
+            return
         # cm + roc share ONE side-by-side row at the top of the stack —
         # the two key winner charts are visible in a single glance
         if self._winner_row is None:
