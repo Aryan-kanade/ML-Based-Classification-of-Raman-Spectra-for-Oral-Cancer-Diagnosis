@@ -1,42 +1,49 @@
-# CodeRabbit configuration — https://docs.coderabbit.ai/reference/configuration
-language: "en-US"
+# CodeRabbit configuration — ML-Based-Classification-of-Raman-Spectra
+# Docs: https://docs.coderabbit.ai/reference/configuration
+language: en-US
+tone_instructions: >-
+  Clinical-research codebase (PyQt Raman spectroscopy classifier for
+  oral cancer screening). Patient privacy is paramount: never suggest
+  committing data, logs, or filenames containing patient identifiers.
+  Prefer minimal, surgical diffs that match the surrounding style.
+
+early_access: false
 
 reviews:
-  # balanced feedback; use "quiet" for critical-only, "assertive" for more
-  profile: "chill"
+  profile: chill
   request_changes_workflow: false
-  high_level_summary: true
-  poem: false
-  review_status: true
-  review_details: false
-  auto_review:
-    enabled: true
-    auto_incremental_review: true   # re-run the review on each push
-    drafts: false
+  # Privacy / generated artifacts: never review, quote, or learn from
+  # these (most are gitignored — belt and braces in case they appear)
   path_filters:
-    # keep reviews on source code + docs that matter; skip generated /
-    # changelog noise
-    - "!raman_app/model_*_card.md"  # auto-generated model cards
-    - "!**/*.lock"
-    - "!renders/**"
+    - "!Data/**"
     - "!Documatation/**"
     - "!_external/**"
+    - "!renders/**"
+    - "!.zcode/**"
+    - "!**/__pycache__/**"
+    - "!**/*.joblib"
+    - "!raman_app/session.log*"
+    - "!raman_app/data_report.txt"
+    - "!raman_app/result_report.*"
+    - "!raman_app/study_run*/**"
+    - "!raman_app/vit_outputs/**"
+    - "!raman_app/bench/**"
+    - "!raman_app/repro_out/**"
+    - "!*.zip"
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "main"
   tools:
     ruff:
-      enabled: true                 # the repo's pinned linter (CI uses it)
-    pylint:
-      enabled: false
-    flake8:
-      enabled: false                # redundant with ruff
+      enabled: true
 
 knowledge_base:
+  opt_out: false
+  learnings:
+    scope: local
   code_guidelines:
-    enabled: true
-    # the project's own rules: AGENTS.md points at Brain.md (project
-    # memory: architecture, methodology, gotchas, invariants)
     filePatterns:
-      - AGENTS.md
-      - Brain.md
-
-chat:
-  auto_reply: true
+      - "Brain.md"
+      - "AGENTS.md"
