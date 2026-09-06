@@ -1,0 +1,42 @@
+# CodeRabbit configuration — https://docs.coderabbit.ai/reference/configuration
+language: "en-US"
+
+reviews:
+  # balanced feedback; use "quiet" for critical-only, "assertive" for more
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  review_details: false
+  auto_review:
+    enabled: true
+    auto_incremental_review: true   # re-run the review on each push
+    drafts: false
+  path_filters:
+    # keep reviews on source code + docs that matter; skip generated /
+    # changelog noise
+    - "!raman_app/model_*_card.md"  # auto-generated model cards
+    - "!**/*.lock"
+    - "!renders/**"
+    - "!Documatation/**"
+    - "!_external/**"
+  tools:
+    ruff:
+      enabled: true                 # the repo's pinned linter (CI uses it)
+    pylint:
+      enabled: false
+    flake8:
+      enabled: false                # redundant with ruff
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    # the project's own rules: AGENTS.md points at Brain.md (project
+    # memory: architecture, methodology, gotchas, invariants)
+    filePatterns:
+      - AGENTS.md
+      - Brain.md
+
+chat:
+  auto_reply: true
