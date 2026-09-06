@@ -625,6 +625,9 @@ def main() -> int:
         params = win.read_params().validate()
         import preprocessing as pp
         win._lc_data = (X, win.labels, win.groups)
+        # dataset-consistency tag the locked guard requires (start_training
+        # sets this; hand-built scenarios must too)
+        win._lc_data_key = win._data_key
         win._lc_wn = np.asarray(win.grid)[pp.crop_mask(win.grid, params)]
         win.run_locked_eval()                     # question -> Yes
         wait_analysis(win)
@@ -687,6 +690,9 @@ def main() -> int:
         import preprocessing as pp
         params = win.read_params().validate()
         win._lc_data = (X, win.labels, win.groups)
+        # dataset-consistency tag the locked guard requires (start_training
+        # sets this; hand-built scenarios must too)
+        win._lc_data_key = win._data_key
         win._lc_wn = np.asarray(win.grid)[pp.crop_mask(win.grid, params)]
         # deep diagnostics (each runs on the shared analysis worker)
         win.run_lopo()

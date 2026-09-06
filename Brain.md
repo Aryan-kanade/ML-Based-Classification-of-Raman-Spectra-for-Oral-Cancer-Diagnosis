@@ -9,32 +9,69 @@
 > the matching section below. Keep the "Last updated" stamp current.
 > Keep it dense — tables and one-liners, no prose padding.
 
-Last updated: 2026-08-30 (expanded to full reference detail; git `876b624` code state)
+Last updated: 2026-09-06 (WHOLE-PROJECT DEEP AUDIT + REMEDIATION — ~190
+findings, fixed in batches B0–B4, §20 lists the number-changing
+semantics; previously 2026-09-05: WHOLE-PROJECT ERROR HANDLING, see gotcha #23;
+2026-09-04: COMPLETE UI/UX modernization: Preprocess page
+premium layout — live ①–⑥ step-chip strip, six step panels in a 2-col
+× 3-row grid of two-column FORMS (full label words, 300px floors, smart
+enabling), 6th panel = CHANGES & RESET (live modified-vs-defaults
+markers + ↺ Reset), Preview/Optimize buttons full-width BELOW the grid,
+full-width preview with empty state, NO splitter; design language
+v2 (10.5pt CardHeader, 15pt PageTitle, StepChip/StepArrow QSS, radius
+14/12, hover states, stronger shadows); nav shell (MDL2 sidebar icons
+with fallback, checked accent bar, footer step dots, Ctrl+1–6);
+Start page two-column with step chips; Data quality chips (✓/⚠
+colored); Train controls numbered 1·Mode 2·Models 3·CV; Predict
+pills/status moved into the Predictions card + margin-mode explainer
+card; Result anchor-pill jump row (10 sections, `_scroll_to_card`);
+diag panels show "computing…" placeholders at start (`_diag_running`);
+window min 1100×700 + maximized remembered; default crop = tuned
+500/2000 (PARAMS_VERSION 3), coif3/coif5 wavelets removed with sym8
+fallback; project-wide UI/graph
+consistency pass: one
+graph design system in plotting.py — named semantic colors, normalized
+fonts, shared `plot_count_bars`/`plot_sign_bars` helpers, styled seed
+boxplot, cm⁻¹ units on band annotations, apply_style in reproduce_study,
+HiDPI attributes; all inline graphs migrated off raw hex; fixed the
+orphaned Locked-FINAL Result card (never showed), Predict got a
+splitter, 3SSE Run button styled via primary property, banner/seq
+labels via QSS (`BannerTitle`/`SeqCounter`/`SeqTop5`), harmonized table
+caps, Data canvas floor + 26px rows; Preprocess page redesigned: 2-column params,
+draggable splitter, preview grows per class + updates LIVE after every
+tweak; fixed NameError `_cal`/`threshold` in render_result_page;
+Predict page overhauled: two-column, big
+resizable chart, triage+bar table shared with Result, live progress
+pills; ALL diagnostics auto-run serially after every
+training — no clicking, each in its own bordered card; Preprocess
+preview shows one row PER CLASS —
+Normal + Tumor side by side; each Train diagnostic graph in its own
+bordered sub-card, square confusion-matrix canvas; loader keeps the
+FULL 15.5–3862 axis — edge trim removed, every data point used;
+2026-09-03: inline per-result panels, deep_test 18/18, default crop
+15/3862, demo removed, portable data-root discovery)
 
 ---
 
 ## 1. What this project is
 
 Desktop app + headless CLI that classifies **SERS Raman spectra (785 nm)
-of oral-cancer tissue** into `Normal` / `Tumor` (legacy demo mode: 3
-classes C1/C5/C8). Research triage support for clinicians — **not** a
-diagnostic device; histopathology stays the reference standard.
+of oral-cancer tissue** into `Normal` / `Tumor`. Research triage support
+for clinicians — **not** a diagnostic device; histopathology stays the
+reference standard.
 
 - **Real dataset**: `D:\BARC\Data\<Class>\<Patient>\<file>.csv` —
   341 files scanned → **317 spectra / 72 subjects kept** (68 with both
   classes = paired), after hygiene: 4 white references, 18 duplicate
-  copies, 2 cross-class identical files dropped; 18 spectra spike-flagged
+  copies, 2 cross-class identical files dropped, **155 padded files
+  edge-trimmed in the loader** (gotcha #18); 18 spectra spike-flagged
   (score ≥ 300). **Never commit patient data** (gitignored).
-- **Demo data**: synthetic, from seed spectrum `P01_cAg_785_C8_3.txt`
-  (repo root) via `dataset.generate_demo_data`. All metrics ≈1.000 on
-  it — **never report demo numbers as results**.
 - Single-centre, no external validation. Confounders (site,
   keratinisation, tobacco) unrecorded.
-- `D:\BARC\Documatation\` (typo'd name) holds 8 reference PDFs: oral
-  cancer thesis (1-70), portable Raman spectrometer design rules, Raman
-  tongue cancer (biomedicines 11-01984), Raman for oncology, wavelet
-  denoising, JCM 08-013131, Sahu 2016 in-vivo subsite classification,
-  plus Raman.docx.
+- `D:\BARC\Documatation\` was deleted 2026-09-02 (user confirmed copies
+  elsewhere; had held 8 reference PDFs incl. oral-cancer thesis,
+  portable Raman design rules, biomedicines 11-01984, JCM 08-013131,
+  Sahu 2016).
 
 ## 2. Environment & how to run
 
@@ -46,18 +83,30 @@ scikit-learn 1.9.0, pandas 3.0.5, matplotlib 3.11.1, PyWavelets 1.9.0,
 joblib 1.5.3, xgboost 3.4.1, lightgbm 4.7.0, catboost 1.2.10,
 pybaselines 1.2.1, shap 0.52.0, torch 2.13.0, PyQt5 5.15.11. Optional
 deps (pybaselines/shap/torch/xgboost/lightgbm/catboost) all have
-graceful fallbacks via module HAS_* flags.
+graceful fallbacks via module HAS_* flags. **GPU since 2026-09-04**:
+torch is the **+cu130** build (RTX 3050 6 GB, driver 581.86/CUDA 13.0);
+`modeling.torch_device()` = cuda unless `RAMAN_DEVICE=cpu`. 1D-CNN
+fits on the GPU but stores fitted weights on CPU (portable bundles;
+predict runs on CPU — batches are tiny). ViT scripts auto-pick CUDA.
+3SSE loky workers set RAMAN_DEVICE=cpu (`_pin_threads`) — N child
+processes would mean N CUDA contexts (~300 MB VRAM each). Boosters
+(XGBoost/CatBoost/LightGBM) are CPU **by default** and need explicit
+`RAMAN_DEVICE=gpu` (§16c gotcha: auto-GPU boosters OOM'd loky
+children; they lose at n≈300 anyway). **tabpfn==6.0.6** (TabPFN v2.5
+foundation model entry; HF weights auto-download once, no account —
+do NOT upgrade to 8.x, it demands a browser login). GPU CNN folds are
+not bit-identical to
+CPU (CUDA atomics) — seeds still fix splits, weights may differ
+slightly.
 
 ```bash
 cd raman_app
 python main.py                                  # GUI (or run_app.bat)
-python main.py --smoke                          # headless smoke test
-python reproduce_study.py --demo --mini         # 30 s synthetic check
 python reproduce_study.py --data D:/BARC/Data --out study_run_X        # full real study
 python reproduce_study.py --data D:/BARC/Data --mode paired --out study_run_paired
 python test_all.py                              # 40 unit tests
 QT_QPA_PLATFORM=offscreen python gui_test.py    # GUI walk (writes result_report.txt in-tree!)
-QT_QPA_PLATFORM=offscreen python deep_test.py   # 17 adversarial scenarios
+QT_QPA_PLATFORM=offscreen python deep_test.py   # 18 adversarial scenarios
 ```
 
 Tests hardcode `C:\Windows\Fonts` — Linux CI would need patching (no CI
@@ -67,28 +116,28 @@ exists). `matplotlib.use("Agg")` for all headless figure writing.
 
 | File | ~Lines | Role |
 |---|---|---|
-| `gui.py` | 5121 | 6-page MainWindow, 5 QThread workers, all slots. See §14. |
+| `gui.py` | 6261 | 6-page MainWindow, 5 QThread workers, all slots. See §14. |
 | `modeling.py` | 1346 | Model registry + nested grouped CV + bundles + importance + bootstrap/McNemar. §7-8, 12. |
-| `test_all.py` | 912 | 41 unit tests incl. 4 regressions for the 2026-08-30 fixes + new-models test. |
-| `deep_test.py` | 644 | 17 adversarial GUI/CLI scenarios; `wait_analysis()` helper. |
-| `vit_train.py` / `vit_model.py` / `vit_test.py` | 558/207/143 | Secondary ViT track (torch). §15. |
+| `test_all.py` | 1054 | 47 unit tests incl. regressions for the 2026-08-30 fixes, new models, data-root discovery. |
+| `deep_test.py` | 716 | 18 adversarial GUI/CLI scenarios; `wait_analysis()` helper. |
+| `vit_train.py` / `vit_model.py` / `vit_test.py` | 551/207/144 | Secondary ViT track (torch). §15. |
 | `plotting.py` | 439 | rcParams theme, `MatplotlibCanvas` (lazy Qt-binding pin), plot helpers. |
-| `ui_helpers.py` | 391 | QSS stylesheet, `pill()`, tooltips, HOW_TO/METRIC_HELP, settings I/O. |
+| `ui_helpers.py` | 387 | QSS stylesheet, `pill()`, tooltips, HOW_TO/METRIC_HELP, settings I/O. |
 | `study_stats.py` | 375 | Friedman+Nemenyi, LOPO, seed/noise checks, BH-FDR band stats. §10. |
 | `clinical_data.py` | 324 | `load_clinical_dataset()` → `ClinicalData` + hygiene + report. §5. |
-| `reproduce_study.py` | 282 | One-shot headless study (works on real data since 2026-08-30). |
+| `reproduce_study.py` | 285 | One-shot headless study (works on real data since 2026-08-30). |
 | `clinical.py` | 259 | TRIPOD layer: Platt, DeLong, operating points, triage, PPV/NPV, DCA. §9. |
 | `preprocessing.py` | 254 | `PreprocessParams` + spectrum pipeline. §6. |
 | `biochemistry.py` | 250 | BANDS/RATIOS tables, NMF, keratin flags, plausibility. §11. |
 | `optimize.py` | 228 | Preprocessing auto-tune. §15. |
-| `dataset.py` | 182 | Flat loader, `common_grid`, `to_matrix`, demo generator. §5. |
+| `dataset.py` | 148 | Flat loader, `common_grid`, `to_matrix`. §5. |
 | `paired.py` | 160 | Within-patient deviation features. §4. |
-| `smoke_test.py` / `gui_test.py` / `main.py` / `qt_compat.py` | small | Harnesses / entry points. |
+| `gui_test.py` / `main.py` / `qt_compat.py` | small | Harnesses / entry points. |
 
-Root: `AGENTS.md` (ponytail rules + pointer here), `P01_…txt` (demo
-seed), `.gitignore` — excludes `Data/`, `Documatation/`, `_external/`,
+Root: `AGENTS.md` (pointer here), `.gitignore` —
+excludes `Data/`, `Documatation/`, `_external/`,
 `renders/`, `study_run*/`, `*.joblib`, `study_manifest.json`,
-`result_report.*`, `settings.json`, `session.log`, `demo_data/`,
+`result_report.*`, `settings.json`, `session.log`,
 `vit_outputs/`, `__pycache__/`, `*.zip`.
 
 ## 4. Data flow (memorize this)
@@ -128,17 +177,18 @@ GUI `PredictWorker._auto_reference` (`<root>/Normal/<patient>/`).
   maxs (intersection; raises if empty), n = median length clipped
   [50, 2000] → `np.linspace(lo, hi, n)`.
 - `to_matrix`: `np.interp(grid, s.wavenumbers, s.intensities)` per row.
-- Demo generator: 16 peak centers
-  `[480,525,640,725,830,880,1003,1095,1130,1205,1240,1335,1450,1555,1580,1655]`
-  cm⁻¹, width 28; 3 classes with peak gains C1=0.45 / C5=0.95 / C8=1.55,
-  15 spectra/class; noise: wavenumber shift N(0,0.35), baseline tilt
-  N(0,0.01), gain jitter N(1,0.06), additive N(0, 0.03·std(peaks));
-  files written descending-wavenumber, named
-  `DEMO_S{i:02d}_cAg_785_{cls}_{rep}.txt`.
 
 **clinical_data.py**
 - Layout `<root>/<class>/<patient>/*.csv`; label from top-level folder
   only (filenames unreliable).
+- **Portable root discovery** (works on any device — no hand-edits):
+  `find_data_root()` checks RAMAN_DATA_DIR env var →
+  `~/.raman_app_data_dir` pointer (auto-written by the GUI the first
+  time a clinical folder is loaded; home doesn't travel with a copied
+  project) → `raman_app/../Data` → `~/Desktop/data/Data` → `~/Data` →
+  `raman_app/Data`; every candidate validated with
+  `is_clinical_layout`. Used by GUI startup fallback and the `--data`
+  defaults of sequential.py / reproduce_study.py.
 - `CLASS_SYNONYMS` (lowercase): normal/control/healthy/benign→`Normal`;
   tumor/tumour/cancer/malignant→`Tumor`; else passthrough `strip()`ed.
 - `REFERENCE_MARKERS` (lowercase substrings of filename): white, black,
@@ -149,6 +199,14 @@ GUI `PredictWorker._auto_reference` (`<root>/Normal/<patient>/`).
 - Duplicates: SHA-1 over float64 raw bytes of (wn, it) — immune to
   line endings. Same-class dup → keep first; hash in >1 class → **all
   copies dropped** (`cross_class_dropped`, pure leakage).
+- **Site-token check (2026-09-06 audit)**: `TH\d` token inside
+  `Normal/` (or `NH\d` inside `Tumor/`) contradicts the folder label →
+  dropped as `site_token_dropped` (unambiguous files only). Real-data
+  effect: `TDOC067…TH01` — a UNIQUE mislabeled tumor spectrum in
+  Normal (no byte-twin, so SHA-1 could never catch it) — dropped;
+  `TDOC058…TH0` Normal copy dropped by token and its genuine Tumor
+  copy now KEPT (the cross-class rule used to destroy BOTH). n stays
+  317 but healthier (Normal 142 / Tumor 175).
 - `SPIKE_FLAG_THRESHOLD = 300.0` (median spike score of this dataset
   ~60; clean ≈5–30). `spike_score(y) = max|diff| / median|diff|`.
 - `is_clinical_layout`: ≥2 subfolders containing spectra one OR two
@@ -157,8 +215,8 @@ GUI `PredictWorker._auto_reference` (`<root>/Normal/<patient>/`).
   (`allclose` atol 1e-6); else `grid=None` → consumer falls back to
   `common_grid`.
 - Report keys: `root, class_map, references_excluded,
-  duplicates_dropped, cross_class_dropped, load_errors, grid_identical,
-  files_scanned, spike_scores{median,p95,max}, flagged_spectra,
+  duplicates_dropped, cross_class_dropped, site_token_dropped,
+  load_errors, grid_identical, files_scanned, spike_scores{median,p95,max}, flagged_spectra,
   class_counts, patients_per_class, patients_in_both_classes,
   n_spectra, n_subjects`.
 - `patient_split(groups, labels, seed=42)`: StratifiedGroupKFold
@@ -171,7 +229,7 @@ GUI `PredictWorker._auto_reference` (`<root>/Normal/<patient>/`).
 
 | Field | Default | Meaning / clamp in `validate()` |
 |---|---|---|
-| `crop_min` / `crop_max` | 400 / 1800 | 0 disables bound; min≥max ⇒ both 0 (no crop) |
+| `crop_min` / `crop_max` | 500 / 2000 (tuned working range; since 2026-09-04) | 0 disables bound; min≥max ⇒ both 0 (no crop) |
 | `despike` | **False** (exclusion beat despiking here) | Whitaker–Hayes |
 | `despike_z` | 7.0 | clip [3, 20] |
 | `despike_window` | 5 | ≥3, forced odd |
@@ -228,6 +286,12 @@ pipeline.
 - `fit_maybe_grouped`: passes `groups=` to `.fit` only if the estimator
   signature accepts it (StackedEnsemble yes, sklearn no) — via
   `inspect.signature`.
+- **`CalibratedSVC` calibrates GROUP-AWARE since 2026-09-06** —
+  `fit(X, y, groups=None)`; with groups it precomputes
+  StratifiedGroupKFold index splits for `CalibratedClassifierCV`
+  (same-patient spectra never straddle a calibration fold; the old
+  per-spectrum split leaked patients into every downstream
+  probability). PCA+SVM CV numbers may shift slightly vs older runs.
 - **`evaluate_pipeline` (honest nested check, GUI-only)**: per outer
   fold, preprocessing re-chosen by inner `optimize.optimize_preprocessing`
   over a compact 3-config grid: {crop 400–1800, deriv 0, vector},
@@ -242,7 +306,8 @@ pipeline.
   repeats; `bootstrap_ci` patient-level when groups given (both fixed
   2026-08-30); exact McNemar.
 
-## 8. Model registry — full hyperparameter grids (17 rows)
+## 8. Model registry — full hyperparameter grids (24 rows; 2026-09-05:
++1D-CNN ensemble (5 seeds, synth 0.3), +TabPFN foundation model — §16c)
 
 All share `random_state=42` where applicable. "PCA" pipelines =
 StandardScaler → PCA(n_components=0.95).
@@ -270,7 +335,8 @@ StandardScaler → PCA(n_components=0.95).
 - **`CNN1DClassifier`** (modeling.py, sklearn-compatible torch wrapper,
   BaseEstimator/ClassifierMixin): Conv1d(1→32,k7)+BN+ReLU+MaxPool →
   Conv1d(32→64,k5)+BN+ReLU+AdaptiveAvgPool → Dropout(0.2) → Linear
-  (~25k params, CPU). Class-weighted CE, Adam 1e-3, 40 epochs, batch
+  (~25k params; trains on `torch_device()` = GPU when present, weights
+  stored on CPU). Class-weighted CE, Adam 1e-3, 40 epochs, batch
   32, stratified 15 % val split, early stop patience 6 with best-weight
   restore; `torch.manual_seed(seed)`; X auto-shaped (n,1,L);
   predict_proba = batched softmax in eval/no_grad. Pickles into bundles.
@@ -297,8 +363,11 @@ StandardScaler → PCA(n_components=0.95).
 - `ppv_npv(sens, spec, prev)`: Bayes; NaN-safe.
 - `fit_platt/apply_platt`: LogisticRegression(C=1e6) on logit(p) →
   (a,b); `p' = σ(a·logit(p)+b)`; None if <10 rows/1 class.
-- `calibration_bins(y, p, n_bins=8)`: equal-count bins via interleaved
-  `order[b::n_bins]`; rows (mean_p, observed, n).
+- `calibration_bins(y, p, n_bins=8)`: equal-count CONTIGUOUS blocks of
+  the sorted p (`np.array_split(argsort(p), n_bins)` — since 2026-09-06;
+  the old interleaved `order[b::n]` put every bin across the full
+  range, flattening ECE/reliability to the global mean). rows
+  (mean_p, observed, n).
 - `decision_curve(y, p, t=0.05..0.95 step .05)`: NB = TP/n − FP/n·t/(1−t);
   treat-all = prev − (1−prev)·t/(1−t); returns (thr, nb_model, nb_all).
 - `wilson_ci(k, n)`, `delong_auc_ci(y, p)` (tie-corrected midranks,
@@ -385,10 +454,15 @@ threshold; tolerates legacy uncropped bundles (feature-length guessing).
 
 ## 13. Real study results (2026-08-30, seed 42, 5-fold grouped ×3)
 
+> **STALE on two counts now** (loader/crop change gotcha #18 AND the
+> 2026-09-06 site-token hygiene change) — re-run before citing.
+
 Hygiene per run: 317 spectra / 72 patients → 18 spike-flagged excluded
-(despike off). Artifacts (summary.txt, 3 PNGs, winner.joblib,
-run_meta.json, data_report.txt) in `raman_app/study_run_standard/` and
-`study_run_paired/` (gitignored).
+(despike off). **v1 artifacts (study_run_standard/paired/3sse) deleted
+2026-09-02** — all stale-pipeline; §13/§15 numbers below predate the
+trimmed-loader pipeline (see gotcha #18). v2 runs:
+`raman_app/study_run_paired_v2/` (winner Extra Trees 0.766/0.827) and
+`study_run_standard_v2/` (see below).
 
 | Mode | Winner | macro-F1 (95% CI) | AUC (DeLong) | LOPO |
 |---|---|---|---|---|
@@ -410,14 +484,25 @@ Start training → progress → Save) with the 3SSE card BELOW it
 (**collapsible** via `b_3sse_collapse`, auto-expands when its search
 starts). Mode dropdown uses **UserRole roles** (`mode_kind()` /
 `set_mode_kind()`: standard/paired/paired-pqn/seq-standard/seq-paired)
-— never rely on combo indices. Model chooser = 3-column grid +
+— never rely on combo indices. Model chooser = **2-column** grid
+(3 columns forced a 520px card minimum → inner side scrollbar; 2 cols
++ shorter labels keep the whole page ≤ ~860px min — no h-scroll) +
 presets (`_apply_model_preset`: all/none/classical/fast) + live
 "N of M models selected" counter (`_models_changed`, red < 3).
+**Train layout (2026-09-04, user request): NO result tabs** — right
+column stacks every card in one page scroll: Result banner →
+"Confusion matrix · ROC · diagnostics" (buttons + inline panels) →
+Model comparison → Per-class metrics → Biochemistry; `_reveal` scrolls
+the page (`stack.widget(TAB_TRAIN).ensureWidgetVisible`). deep_test
+`s_train_cards` pins this (no QTabWidget, cm/roc side-by-side, panels
+collapse).
 Diagnostic buttons live in `self._diag_buttons` (8), grouped under
 section labels, **disabled until a winner exists** (enabled in
 `on_train_done`, disabled when a training starts).
 **`restore_last_3sse()`** runs at the end of `__init__`: if
 `study_run_3sse/winner.json` exists it rebuilds the winner ModelResult
+(folder deleted 2026-09-02 → restore now silently skips; drop a new
+3SSE run there to re-enable)
 (cm/oof/y_true are PERSISTED via `sequential.persist_run` — `_dumpable`
 keeps ndarrays as JSON lists, plus threshold/calibrator) + the
 validated singles, loads the fitted chain from winner.joblib, and
@@ -433,27 +518,74 @@ bottom **Activity-log dock** (QPlainTextEdit, 300 lines, fed by
 asks before stopping running workers (No aborts the close; 3SSE keeps
 its checkpoint).
 Menu: File = Open folder (Ctrl+O),
-Reload (F5), Load model (Ctrl+L), Save model (Ctrl+S), Exit (Ctrl+Q);
-Help = How to (F1), Metrics, About. Logging: `log()` → stdout +
+Reload (F5), Load model (Ctrl+L), Save model (Ctrl+S), **Reset session
+(keep training)…**, Exit (Ctrl+Q); Help = How to (F1), Metrics, About.
+**`reset_session()`** (that menu item): guards running workers (same 6
+as closeEvent) + confirm dialog → clears Data/Preprocess/Predict/Result
+(state attrs, widgets, plots, `settings["folder"]`; prep params →
+`PreprocessParams()` defaults; Train-page data-coupled widgets →
+initial: b_train disabled, "Load data first", flag/replicate chk
+disabled) and KEEPS everything training produced (winner, results,
+bundle, `_region_bands`, `_op_points`, `_lc_data/_lc_wn`,
+`_locked/_lopo/_seed/_noise/_friedman/_band_stats/_honest`,
+`_seq_payload`) — Predict works on new data immediately after a reset. Logging: `log()` → stdout +
 `session.log` (rotating 1 MB ×2).
 
-**Start**: 3 hero pills (live counts), progress card, quick actions —
-Load data, Generate demo, **One-click demo** (`quick_start`: demo →
-load → Train → `start_training`), Predict with saved model.
+**Start** (reworked 2026-09-04, fills the window — no bottom void):
+columns row takes stretch 1 (old trailing `addStretch` deleted);
+left = hero (stretch 1, vertically centered content + 〰 `HeroGlyph`
+— QSS existed unused) → step chips → hint → "How to use this app"
+card (stretch 2, reuses `uh.HOW_TO` = F1 text); right = progress +
+quick-actions cards (stretch 1 each, status lines spread with
+interleaved stretches, buttons `addWidget(b, 1)` grow, min 46 px).
+Hero pills = live counts; quick actions = Load data folder, Predict
+with saved model. gui_test `[0]` asserts stretch(0)==1 + walkthrough
+label present.
 
 **Data**: `folder_edit` + Browse/Reload; `count_label`; `table` 7 cols
 (File, Patient, Class — double-click editable, Points, WN min/max,
 Quality "spiked"/"ok"; `cellChanged`→`on_cell_changed` writes
-`self.labels[row]`, guarded by `_loading_table`); Plot selected (≤10) /
-Plot class means → `data_canvas`.
+`self.labels[row]`, guarded by `_loading_table`); Plot selected (≤10) / **View file…** (per-file browser dialog:
+scrollable file list + Prev/Next + arrow keys; RAW PANEL ALWAYS
+FULL-RANGE with outside-crop regions shaded — viewing is decoupled
+from the crop spins; after-panel = cropped pipeline; SPIKE-FLAGGED
+marker; `view_file_dialog`) / Plot class means → `data_canvas`.
 
-**Preprocess**: crop spins (0–5000 step 50, def 400/1800); despike
-chk + z spin (3–20 def 7); wavelet chk + combo (sym4/6/8, db4/6,
-coif3/5) + level 1–8 def 4; SG window 5–51 def 11, poly 1–5 def 3,
+**Preprocess**: crop spins (0–5000 step 50, def 500/2000 = tuned
+working range;
+saved params restore is gated by PARAMS_VERSION so default changes take
+effect); despike
+chk + z spin (3–20 def 7); wavelet chk + combo (sym4/6/8, db4/6 —
+coif3/5 removed 2026-09-04; unknown saved names fall back to sym8)
++ level 1–8 def 4; SG window 5–51 def 11, poly 1–5 def 3,
 deriv combo 0/1/2; baseline combo als/arpls + λ exponent 2–9 def 5,
 p 0.001–0.5 def .01, iters 5–30 def 10; norm combo vector/snv/none.
-Preview (2-panel) → `prep_canvas`; **Optimize preprocessing** →
+Preview (**one row per class** since 2026-09-04 — Normal AND Tumor each
+get a raw + preprocessed pair; a Data-page selection wins for its class,
+others fall back to first-of-class; processed curve on twin y-axis —
+raw ~1e3 vs processed ~1e-2 after vector-norm, shared axis squashed it
+flat; x ASCENDING low→high, unlike all other plots which keep Raman
+high→low) → `prep_canvas`; **Optimize preprocessing** →
 `OptimizeWorker` → `_apply_params(best)` + `save_best_params`.
+**Page layout (2026-09-04, user request + polish)**: param card is ONE
+vertical flow in pipeline order; EVERY stage sits in a bordered
+`QFrame#DiagPanel` mini-panel built by the local `panel(title, *rows)`
+helper (header + one compact widget line per row) — REGION (keep range),
+DENOISING (one line per stage: despike chk + Z spin · wavelet chk +
+combo + level spin), SMOOTHING (win/poly/deriv), BASELINE
+(method/λ10^/p/iter), NORMALIZATION (method) — all STACKED full-width
+(three side-by-side forced a 728px-min band → horizontal scrollbar;
+stacking cut the page minimum width 865 → 447px). deriv combo texts are
+display-only ("0/1/2") — read/written by INDEX. Preview/Optimize
+buttons equal-width (stretch 1) under them, `optimize_status` below;
+preview panel titles use the file BASENAME (full relpath overflowed);
+legend fontsize 8. params | preview sit in a **QSplitter**
+(stretch 1:3, starts ~520/660 — the chart gets the room); the preview
+canvas `setMinimumHeight(400)` in the builder, raised per class count at
+preview time (`100·max(5, 2.3n+0.8)`); **live preview**: every param
+widget is
+connected to `_schedule_preview` → 350 ms single-shot `_preview_timer`
+→ redraw (bursts from `_apply_params` collapse into one redraw).
 
 **Train**: `combo_mode` = Standard / Margin (vs own normal) / Margin+PQN
 (idx ≥1 ⇒ paired, needs groups); `model_checks` 14 checkboxes from
@@ -461,19 +593,75 @@ Preview (2-panel) → `prep_canvas`; **Optimize preprocessing** →
 0–9999 def 42; `chk_repeat` (×3), `chk_exclude_flagged` (def checked,
 only if flags exist), `chk_avg_replicates` (per patient×class means).
 Result card: stat banner + `compare_table` (★ winner, green ≥.90 /
-amber ≥.70 / red). Buttons → `run_learning_curve`,
+amber ≥.70 / red). **Right column (2026-09-04, latest): pinned Result
+banner (stats + `chain_flow`) above FOUR stacked cards** —
+"Confusion matrix · ROC · diagnostics" (buttons + `diag_stack`),
+"Model comparison" (`compare_table`), per-class table, "Biochemistry";
+all visible in ONE page scroll (tabs removed on user request — nothing
+behind a click); left Controls card NOT scroll-wrapped (slimmed to fit
+instead). Buttons → `run_learning_curve`,
 `run_region_importance`, `run_honest_check`, `run_locked_eval`,
 `run_lopo`, `run_seed_stability`, `run_noise_check`,
-`run_biochemistry`. Canvases `cm_canvas` + `roc_canvas`; biochemistry
-card (`bio_canvas`, `bio_comp_canvas`, `bio_table` 6 cols); per-class
-table (Class, n, sens, spec, prec, F1).
+`run_biochemistry`. **Since 2026-09-03 the "Confusion matrix · ROC ·
+diagnostics" card has NO pre-placed charts**: results render INLINE,
+each in its OWN bordered sub-card (`QFrame#DiagPanel`, `_diag_panel(key,
+title, size)` → frame + canvas + caption; keys cm/roc after training,
+lc/regions/lopo/seeds/noise per click, honest/locked text-only) —
+nothing overwrites, honest+locked show here (Result page stays as the
+report view), retraining drops stale panels (`on_train_done`). Panel
+headers are COLLAPSIBLE QToolButtons (click ▾/▸ — chart folds away,
+caption verdict stays; `container=` param lets `_draw_winner_plots`
+put cm (4.6×3.6) + roc (5.4×3.6) side by side in `_winner_row` at the
+top of the stack, 46:54 stretch); `_reveal(frame)` switches the tab +
+`ensureWidgetVisible` so each finished result scrolls into view
+itself. Square
+charts (confusion matrix) use a taller canvas ratio than
+wide ones (9×3.6 in). Panel
+canvases draw **synchronously** (`draw()`, not `draw_idle()`) so no
+idle timer can fire on a deleted canvas (was RuntimeError + native
+abort; fixed 2026-09-03 together with the run_lopo
+`n_test_patients`→`n_patients` KeyError — a silent qFatal until
+then). **Since 2026-09-04 the whole battery runs AUTOMATICALLY after
+every training** (`_on_train_done_then_diags` → `run_all_diagnostics`
+→ serial `_diag_queue`, fast→slow: regions, learning curve, seeds,
+noise, locked (`auto=True` skips its confirm dialog), LOPO, honest; a
+"Run all diagnostics" button does the same for an existing winner).
+Chain invariants: `_run_async.finish/fail` + `on_honest_done/failed`
+call `_pop_diag_queue()`; each finished worker is `wait()`ed before
+the next starts; `run_honest_check` only accepts a real
+QAbstractButton as sender (the chain's sender() is the worker object —
+both were silent native aborts); `start_training` refuses to overlap
+the chain (gotcha #16); restore/3SSE paths do NOT auto-run.
+Biochemistry card (`bio_canvas`, `bio_comp_canvas`,
+`bio_table` 6 cols); per-class table (Class, n, sens, spec, prec, F1).
 
-**Predict**: model card (`model_path_edit`, Load…, `model_info`,
-`ref_row_widget` visible only for paired bundles); input card
-(`spec_path_edit`, folder or `;`-joined files; `_prediction_files()`
-walks `<root>/<patient>/` and `<root>/<class>/<patient>/`, skips
-REFERENCE_MARKERS + split_log.txt); Predict → `PredictWorker`;
-`pred_canvas` + `pred_table` (File, Prediction, P).
+**Predict** (since 2026-09-04: **two-column layout** — setup cards left
+(2/5): model card with `model_path_edit`/Load…/`model_info` and
+`ref_row_widget` INSIDE it (paired bundles only); input card
+`spec_path_edit` **editable** (paste a folder path or `;`-joined
+files; `textChanged` arms Predict) or folder/file browse + full-width
+primary Predict button; results right (3/5): `pred_pills` (n spectra +
+per-class counts, positive class red via `uh.repolish`), `predict_status`
+(empty state → live "Predicting… N%" from worker progress → done
+summary), card "3 — Predictions" = `pred_canvas` **8×4.5 in, holder
+minHeight 300, zoom/pan toolbar** (live first-spectrum plot during the
+run, `_draw_prediction_overview` after: all traces + mean + paired
+reference | class-count bars) over `pred_table` **4 cols** (File,
+Prediction, Triage, P as progress bar — filled by
+**`_fill_prediction_table`**, shared with Result's `r_pred_table`;
+helpers `_n_classes`/`_threshold_now`/`_positive_class` (bundle
+fallback → triage works in predict-only sessions)). Data flow
+unchanged: `_prediction_files()` = **recursive `os.walk`** — any
+nesting depth
+(<root>/<class>/<patient>/<anything>/*.csv), skips REFERENCE_MARKERS
++ split_log.txt (junk files fail per-file in the worker, logged);
+paired auto-refs are **file-anchored**: `_auto_reference` walks UP
+from each predicted file (≤6 levels) to find the clinical tree (an
+ancestor with a `Normal*` dir), patient = relpath component under
+the class dir — so ANY input works (whole tree, class folder, single
+patient folder, mixed `;` file lists, any depth); ref spectra
+collected recursively; Predict → `PredictWorker`; on done the app
+still jumps to Result (Predict stays populated for return visits).
 
 **Result** (top→bottom): hero banner + verdict + `LikelihoodMeter`;
 model card `r_stats`{sens,spec,f1,auc} + `r_model_note` (AUC DeLong CI +
@@ -518,6 +706,8 @@ PNGs @150 dpi, predictions ≤300 rows.
 **settings.json** (live UI state — drifts per session; not canonical):
 params (mirrors §6 defaults), folds, seed, models (gated by
 SUITE_VERSION), geometry hex, folder, last_model, predict_folder.
+Startup: saved `folder` if still on disk, else `find_data_root()` (§5)
+— a copied project auto-finds its data on any device.
 
 ## 15. 3SSE — sequential architecture search (sequential.py)
 
@@ -534,9 +724,13 @@ are possible and documented.
   default hyperparameters (identical for all 4,369 → fair level
   comparison). Efficiency: layer-1 OOF shared; **pair-major** loop
   (one feature matrix per pair, all 15 third models evaluated while
-  hot, O(1) memory); pairs processed best-first; **sound early-abandon**
-  (max reachable F1 after fold i < current top-N cutoff → prune; top-N
-  ranking stays exact); parallel across pairs (joblib, 1 thread inside);
+  hot, O(1) memory); pairs processed best-first; **early-abandon**
+  bounds the MEAN PER-FOLD F1 (`metrics["f1_mean"]` — the ranking key
+  for triples since 2026-09-06; pooled-OOF F1 was never bounded by the
+  fold-mean so pruning on it was unsound); patient truth = DOMINANT
+  class (was first-row — arbitrary on paired data); default beam
+  `prune_pairs=50` forfeits GLOBAL top-N exactness (exact within beam);
+  parallel across pairs (joblib, 1 thread inside);
   float32; JSONL checkpoint + `--resume`; `--prune-pairs K` beam option.
 - **FULL validation**: top-20 per level through nested grouped CV —
   OOF features regenerated inside each outer training fold only
@@ -549,11 +743,12 @@ are possible and documented.
   **Model-specific features (spec §9)**: "Peak bands + RF" needs the
   wn-aligned axis, so at chained positions (≥1) it is wrapped with
   `_SpectralSlice` (spectral columns only); ensemble voters likewise.
-- CLI: `python sequential.py --data D:/BARC/Data --mode paired --out
+- CLI: `python sequential.py [--data ROOT] --mode paired --out
   study_run_3sse [--k 3 --top 20 --jobs -2 --resume --models ...]`;
-  writes screening.jsonl, report.txt, run_meta.json, winner.joblib.
-  `prepare_dataset()` mirrors reproduce_study (GUI parity; demo data
-  falls back to standard mode — no patient groups).
+  ROOT defaults to `find_data_root()` (§5), missing data → clean
+  exit 2; writes screening.jsonl, report.txt, run_meta.json,
+  winner.joblib.
+  `prepare_dataset()` mirrors reproduce_study (GUI parity).
 - GUI: Train-page combo entries 3/4 = "3SSE search (standard/paired)";
   `SeqSearchWorker` (existing QThread pattern) runs screening +
   `validate_top` + `finalize_winner`; live progress `n/4369 · best ·
@@ -657,52 +852,304 @@ with default hyperparameters (identical for all 4,369 — fair).
    `common_grid`/`to_matrix`, exclude spike-flagged when
    `despike=False`, same label stripping.
 4. Bundle `threshold` lives in **Platt-calibrated** space.
-5. Demo data saturates all metrics (1.000) — McNemar/Friedman degenerate.
-6. `fold_f1` order = [rep0 f0..k, rep1 f0..k, …]; block statistics must
+5. `fold_f1` order = [rep0 f0..k, rep1 f0..k, …]; block statistics must
    reshape `(repeats, k)` and average over repeats.
-7. `bootstrap_ci(..., groups=)` resamples groups, not rows.
-8. Tests pressing async buttons need `wait_analysis(win)` /
+6. `bootstrap_ci(..., groups=)` resamples groups, not rows.
+7. Tests pressing async buttons need `wait_analysis(win)` /
    `worker.wait()` + `processEvents` — results land in queued callbacks.
-9. `gui_test.py`/`deep_test.py` **overwrite `result_report.txt/.html`
+8. `gui_test.py`/`deep_test.py` **overwrite `result_report.txt/.html`
    in the source tree** (known leftover).
-10. PLS-DA probabilities are softmax-of-scores (pseudo-probs). Friedman
+9. PLS-DA probabilities are softmax-of-scores (pseudo-probs). Friedman
     q_alpha hand-tabulated. `band_stats_paired` returns only FDR p.
-11. Duplicated helpers (consolidate someday): `_encode` ×3, PCA builders
-    ×6 + optimize copy, peak centers ×2 (dataset.py width 28 vs
-    modeling.py width 30), rank-with-ties ×2; optimize uses
+10. Duplicated helpers (consolidate someday): `_encode` ×3, PCA builders
+    ×6 + optimize copy, rank-with-ties ×2; optimize uses
     random_state=0 vs suite 42.
-12. Library modules `print` instead of logging (dataset, optimize,
+11. Library modules `print` instead of logging (dataset, optimize,
     vit_train) — GUI mirrors prints into session.log.
-13. sklearn "delayed/Parallel" UserWarnings in paired runs + joblib/
+12. sklearn "delayed/Parallel" UserWarnings in paired runs + joblib/
     loky shutdown warnings in deep_test — benign, every run.
-14. `sg_deriv≠0` **skips baseline correction** by design (derivative
+13. `sg_deriv≠0` **skips baseline correction** by design (derivative
     suppresses smooth baselines).
-15. qt_compat binding = import-success order (PyQt5 first), no QT_API
+14. qt_compat binding = import-success order (PyQt5 first), no QT_API
     env pinning; plotting.MatplotlibCanvas pins the binding for
     matplotlib at canvas creation.
-16. **ModelResult consumers expect `per_class[class_name][metric]` as
+15. **ModelResult consumers expect `per_class[class_name][metric]` as
     `(mean, std)` tuples** — building a winner by hand must match this
     (3SSE integration hit exactly this).
-17. **Concurrent loky pools from several QThreads are a native-crash
+16. **Concurrent loky pools from several QThreads are a native-crash
     race on Windows** (access violation in joblib retrieval; heavier
     child imports like torch/Qt make it likelier). Never start Train +
     Optimize + Honest workers simultaneously — deep_test's workers
     scenario runs them serially.
-18. deep_test `make_gui()` patches `uh.load_settings` to `{}` —
+17. deep_test `make_gui()` patches `uh.load_settings` to `{}` —
     settings.json last-folder restore would silently hand "no data"
     scenarios real data. Test harnesses must isolate from developer
     settings.
+18. Dataset = TWO file populations on ONE shared grid (all 341 CSVs:
+    identical 2271-row axis 15.5→3862 cm⁻¹): `Patient_xx/*_interpolated.csv`
+    = linear OR constant fill outside measured ~504–2001 (per-file,
+    NOT class-linked; 155 files); `TDOCxxx Spectra pro/raw/*.csv` =
+    genuinely measured full-range (180). **Since 2026-09-04 the loader
+    keeps every file AS-IS over its full axis (user decision: no data
+    point may be dropped)** — `trim_edge_padding` was REMOVED; the 155
+    interpolated files again contribute their padded outer regions
+    (known tradeoff, chosen for completeness). Common grid = full
+    15.5–3862 (~2000 pts after median-clip); default crop 500/2000
+    keeps the tuned window (780 pts). **All §13/§15 results predate
+    these loader/crop changes**
+    (padded grid + crop 400/1800) — re-run the study.
+    Session settings: despike on, arPLS (see #20/§14; crop 500/2000 is
+    now the default).
+19. **Unhandled Python exceptions inside Qt slots qFatal-abort the
+    process silently on PyQt ≥5.5** (exit code 127, no traceback) —
+    hit via a ValueError in `view_file_dialog`'s `show()` closure.
+    **RESOLVED 2026-09-05: `MainWindow._install_excepthook()`** installs
+    a `sys.excepthook` (log + status bar + ONE dialog per session,
+    restored in closeEvent) — PyQt routes slot exceptions to a custom
+    hook instead of aborting; gui_test [8] probes it with a raising
+    timer callback. Debug offscreen with `faulthandler.enable()` +
+    marker prints remains valid for NATIVE crashes.
+20. Tuned session preprocessing (2026-09-01, tuned on TDOC15NH0,
+    metric = residual-hump 500–900 / %<-0.02): crop 500/2000,
+    despike ON z=7, **arPLS λ=1e5** (hump 0.054 vs ALS 0.116 — ALS
+    leaves a big baseline hump on these steep SERS decays), rest
+    default. despike ON also recovers the 18 spike-flagged spectra
+    into training (paired n 287 → ~305).
+21. **3SSE worker RAM budget** (2026-09-05): loky children each import
+    torch+boosters (~1.5-2 GB); CPUs-1 workers OOM'd a 16 GB laptop with
+    ~7.7 GB free (CatBoostError 'bad allocation' /
+    TerminatedWorkerError at the pairs loop). Fix: `_safe_jobs`
+    (sequential.py) sizes workers by AVAILABLE RAM via ctypes
+    GlobalMemoryStatusEx — 2 GB/worker, ceiling 4 — and `as_env_device`
+    caps worker thread pools (CatBoost thread_count=1, XGB/LGBM/RF/ET
+    n_jobs=1 when RAMAN_DEVICE=cpu). Verified: 156 archs incl.
+    CatBoost/XGBoost on the real paired data in 8.5 min, 3 workers, no
+    OOM.
+23. **Whole-project error handling (2026-09-05, user request after a
+    Model Lab "bad allocation" killed the run)**:
+    (a) `RAMAN_DEVICE=cpu` is now setdefault-ed at GUI startup AND in
+    `sequential.search()` — the `as_env_device` thread caps
+    (CatBoost thread_count=1/CPU, XGB/LGBM/RF n_jobs=1) apply to
+    PARENT-process fits too (the uncapped GUI-process CatBoost fit was
+    the actual crash; set the env to "gpu" to opt out);
+    (b) 3SSE screening is ERROR-TOLERANT: workers return
+    `(key, None, None, err)` instead of raising; failed archs are
+    recorded as `{"arch","level","error"}` JSONL rows (resume treats
+    them done, never retried; rankings/cutoffs/winner filter them out);
+    pairs whose level-1 OOF failed record "level-1 features
+    unavailable"; the parent Ensemble OOF is guarded too — one broken
+    model costs one architecture, never the run
+    (`test_search_survives_broken_model` pins it);
+    (c) Model Lab degrades gracefully: validate/finalize failure of the
+    tuned chain → falls back to the best SINGLE model (tune=False);
+    (d) all 6 QThread workers wrap run() → failed.emit (buttons always
+    re-enable); (e) deep_test patches `remember_data_root` +
+    `save_settings` process-wide — temp clinical trees can no longer
+    poison ~/.raman_app_data_dir/settings.json (a leftover 32-spectrum
+    toy dataset was silently restored as "last session" 2026-09-05).
+22. **torch + full MainWindow in ONE test process natively aborts**
+    (exit 127, no traceback; 2026-09-05): the stage3 test's
+    CNN-fit/grad-cam followed by an UN-isolated `gui.MainWindow()`
+    (loads the real 317-spectrum dataset) dies on this machine — even
+    with RAMAN_DEVICE=cpu; each half passes alone. Same native-race
+    family as #16/#17 (heavy imports + Qt). test_all reaches 47 PASSes
+    and dies at stage3; stage3+stage4 need splitting or isolation.
+21. **Never hardcode device paths** (D:\BARC\Data, C:\Users\…): use
+    `clinical_data.find_data_root()` (env → pointer → known spots, §5).
+22. **`QToolBar { background: transparent }` made matplotlib 3.11
+    toolbar icons (zoom/pan/save…) WHITE-on-white** — mpl's
+    `_IconEngine._is_dark_mode()` reads the toolbar palette background
+    and transparent polishes to black (value 0 < 128 → paint icons
+    white). QSS now pins `background: #ffffff`; gui_test `[0b]`
+    asserts the palette stays light. Any future dark toolbar styling
+    must re-check icon contrast.
+    sequential's 3SSE checkpoint parent dir is auto-created before
+    append; missing `--data` exits 2 with a hint, not a traceback.
+22. **No newline inside an f-string's `{..}`** — that is Python 3.12+
+    syntax (PEP 701); on the dev machine (3.14) it runs, but the module
+    SyntaxErrors on older Pythons (copied project to a 3.11 device
+    2026-09-04, hand-edit needed in `format_report`). Keep the
+    expression on one line or hoist it into a parenthesized variable.
+    `test_all.test_fstring_device_portability` source-scans every .py
+    so it cannot come back.
+23. **GPU acceleration semantics (2026-09-04)** — works on ANY CUDA
+    GPU, detection never by card name: `modeling.gpu_ok()` (cached;
+    torch-CUDA check, XGBoost cuda-canary fallback) + `boost_device()`;
+    the device name in `device_report()` comes from the driver.
+    Registry: XGBoost `device=boost_device()`, CatBoost
+    `task_type=GPU-if-ok` (LightGBM: no GPU in standard Windows wheels
+    — skipped). `RAMAN_DEVICE=cpu` is the universal kill-switch,
+    checked on EVERY gpu_ok() call (env wins over the cache).
+    3SSE: estimators are built in the parent (GPU params baked in),
+    pickled into loky workers — `sequential.wrap()` re-points them via
+    `modeling.as_env_device()`; `_tune_hyperparams` runs GPU-model
+    GridSearchCV with `n_jobs=1` (n loky children × ~300 MB CUDA
+    contexts would swamp VRAM; grids are 2×2 so serial is free).
+    torch: 1D-CNN + ViT train under AMP (autocast+GradScaler) with
+    TF32 gated by `get_device_capability() >= (8,0)`; vit_train gained
+    `--device {auto,cuda,cpu}` (honors RAMAN_DEVICE) + pin_memory.
+    XGB GPU boosters predict from CPU numpy by design — the "Falling
+    back to prediction using DMatrix" warning is filtered in modeling.
+    GUI logs `device_report()` at train start; reproduce_study prints
+    it. Verified live: nvidia-smi 34–70% utilization during training
+    on the RTX 3050 6GB laptop card.
+
+## 16b. Speed & Accuracy program (2026-09-05) — scorecard
+Baseline before the program (bench.py, seed 42, real data, paired):
+Extra Trees F1 0.774 / AUC 0.826 · screening 500 archs (10 models) 12.5
+min · baselines 174 s. Every change below measured via `bench.py`
+(fixed seed/data; `--full` adds nested validation + LOPO).
+
+SPEED (all landed):
+- A1 3SSE engine: 2-fold screening ladder (`screen_folds` in board;
+  nested validate_top re-ranks at full fidelity), beam prune_pairs=50
+  DEFAULT (CLI+GUI), WARM cutoff seeded from pairs F1 −0.10, third
+  candidates tried best-single-F1-first, joblib memmap (max_nbytes=100)
+  shares X once, singles pooled. Checkpoint now records ALL levels with
+  their OOF arrays — resume replay = 0.8 s vs 23.4 s full (29×, smoke).
+- A2 CNN epochs 40→25. Lazy threshold-CV REJECTED (accuracy-coupled:
+  threshold feeds OOF predictions).
+- A3 preprocessing stage cache (preprocessing.py `_STAGE_CACHE` keyed
+  by spectrum hash + stage params): sweeps pay ~2-3 distinct
+  prefixes/baselines instead of N full pipelines.
+- A4 parallel refits REJECTED with evidence: LOPO refits ET with
+  n_jobs=-1 internally — parallel loops would oversubscribe.
+- A5 cross-session OOF cache: deferred (low ROI after A1 checkpointing).
+
+ACCURACY (every lever A/B-gated on the real data):
+- B1 `sequential.tune_chain`: greedy per-layer grid tuning on each
+  layer's real stacking context (grouped inner CV, reuses
+  _tune_hyperparams); `finalize_winner(tune=True)` nested-validates
+  tuned vs untuned and deploys tuned when not worse (params returned).
+- B2 paired sweep (optimize.optimize_paired + GRID_PAIRED, 15 configs,
+  62 s — deviation features had NEVER been swept): **defaults
+  CONFIRMED optimal** — ALS λ 1e6 within noise (0.768 vs 0.761);
+  deriv-1 HURTS paired (0.683) though it helped standard; despike-ON
+  recovery of the 18 spiked spectra DROPS F1 to 0.731 — exclusion
+  re-confirmed; crop 500/2000 ≫ 400/1800 (0.761 vs 0.697).
+- B3 registry model "Spectral + band features" (SUITE_VERSION 7, 22
+  models): FeatureUnion[PCA(spectrum) ‖ 16 band intensities] + ET;
+  wn-aligned in chains via WN_ALIGNED_MODELS.
+- B4 `AveragedChain`: deployable winner = 3-seed averaged chain
+  (finalize_winner). Patient-level F1 is a bench headline
+  (per-patient mean-P verdict).
+- B5 isotonic-by-ECE, B6 augmentation-for-trees: scoped out
+  (calibrator format is deploy-coupled; CNN-only aug already default).
+
+C1 **Model Lab** (Train page, ⚡ button): one click = paired sweep →
+apply best params → 3SSE beam search (checked models) → validate_top →
+tuned, seed-averaged AveragedChain → panel report + bundle saved to
+study_run_3sse/winner.joblib. FuncWorker gained a progress signal.
+
+bench.py = the program's scorecard (bench/latest.json); run before/
+after any future change.
+
+## 16c. Speed & Accuracy program 2 (2026-09-05, evening) — deep-research batch
+
+Research basis: wall-clock map + accuracy-lever map + SOTA review
+(TabPFN v2 Nature-2025, RamanBench-2026, Farnesi-2025, Jeng-2019).
+
+SPEED (landed, result-preserving unless noted):
+- **validate_top parallelized** (`_worker_validate` + joblib
+  `_safe_jobs`, generator-order results re-assembled into screening-
+  rank order): the ~25-min SERIAL nested-validation phase now uses the
+  same ≤4-worker pool as screening. Test: parallel == serial (1e-12).
+- **`modeling._tune_inner`** replaces GridSearchCV + the separate
+  threshold `cross_val_predict` in `run_cv`: ONE inner pass per
+  (param combo × inner fold) collects pooled OOF probabilities —
+  hyperparams AND binary threshold come from the same pooled OOF
+  (~4 fewer fits per fold per model; StackedEnsemble threshold now
+  from its own nearly-free `meta_oof_` = 3 logistic CVs instead of 3
+  full stacked refits). SEMANTIC CHANGE (flagged): hyperparam scoring
+  is pooled-OOF macro-F1, not mean-of-inner-folds.
+  Backend rule (new invariant): **threads, never loky, for inner-CV
+  fits** — `_NOT_THREAD_SAFE(name)` (XGBoost/CatBoost/LightGBM/
+  1D-CNN/TabPFN) runs serial-in-process; everything else
+  `Parallel(prefer="threads", 4)`. Reason below.
+- **noise_robustness fit-once**: folds fit once, re-predicted per
+  noise level with pre-drawn level-major noise → BIT-identical curve,
+  20→5 fits. Test asserts equality vs the old loop.
+- **LOPO stays serial by default** (`jobs=1` param kept): the §16b-A4
+  measured rejection (tree winners' internal n_jobs=-1 oversubscribe)
+  still stands; the machinery exists for future opt-in.
+
+ACCURACY (wired, A/B-gated where the data exists):
+- **"1D-CNN ensemble (5 seeds)" registry entry** (24 models now):
+  `CNNEnsemble` (Lakshminarayanan 2017 deep ensemble) finally
+  registered, WITH `synth=0.3` — within-class `lorentzian_synthesize`
+  blends of the TRAINING split only (val split stays real so
+  early-stop stays honest). Plain 1D-CNN stays the controlled variant.
+- **TTA at deploy**: `predict_with_bundle` uses `predict_proba_tta`
+  when the final estimator has it (implemented-since-long, never
+  called).
+- **optimize grids extended** (+4 standard, +4 paired): wn_calibrate
+  (Phe-1003 alignment — the project's own literature note), wavelet
+  bayes/garrote+cycle-spin (−23% RMSE measured), als_p=0.001; CLI
+  gained `--mode paired` (GRID_PAIRED was GUI-Model-Lab-only).
+- **Patient-level metrics first-class**: `study_stats.
+  patient_level_metrics` (per-patient mean-P, dominant-true-class)
+  surfaces in the Train banner line and reproduce_study summary —
+  the field's reported level (Jeng 2019 ~+6pp, Farnesi 2025).
+- **TabPFN (foundation model)** registry entry: PCA(0.95) →
+  TabPFNClassifier (v2.5 via **tabpfn==6.0.6** — last release whose
+  HF weights need NO account; 8.x demands a Prior Labs browser login,
+  do NOT upgrade blindly; weights auto-download once; research
+  license). Zero tuning; runs on the torch GPU.
+- **despike-ON-for-paired REVERTED before landing**: §16b-B2 already
+  measured it DROPS paired F1 (0.731 vs 0.766) — exclusion
+  re-confirmed; the plan's B5 was wrong and the measurement won.
+
+GOTCHA (new, hard-won): **full-registry training crashed twice**
+(CatBoost import-time CUDA probe OOM → native abort; then loky
+children each loading torch-CUDA DLLs → OpenBLAS alloc failures).
+Root fixes: (1) `gpu_ok()` now requires explicit **RAMAN_DEVICE=gpu**
+— boosters are CPU by default (they lose at n≈300 anyway); torch
+(1D-CNN/ViT/TabPFN) stays GPU-by-default via `torch_device()`.
+(2) `_tune_inner` thread backend (above). (3) `sequential.
+_child_cpu_only()` hides the GPU from loky children (search wrapper +
+validate_top) so no child ever probes CUDA at import.
+**Windows-vista fail-fast gotcha (same day)**: constructing
+MainWindow WITHOUT `app.setStyle("Fusion") + setStyleSheet(
+uh.STYLESHEET)` now fail-fasts (0xC0000409, silent, bash exit 127) —
+the default windowsvista style + this QSS-heavy UI broke after the
+tabpfn pip churn. run_app/deep_test/gui_test style first (safe);
+test_all's stage3 GUI block now does too. Debug red herring: the
+crash survives tabpfn stubs, CPU-only torch and stubbed pages —
+purely style-engine.
+**pip dependency casualty**: installing tabpfn silently DOWNGRADED
+pandas 3.0.5 → 2.3.3 (restored; re-verify numpy/sklearn pins after
+ANY tabpfn install). tabpfn 6.0.6 imports a sklearn-1.9-removed
+private API — use **6.4.1** exactly.
+
+SKIP list (researched, rejected — do not re-litigate without new
+evidence): MoE (no small-n evidence, gating adds variance) · GAN/
+diffusion augmentation (cost >> gain at n≈300, only evidence is
+non-grouped CV) · learnable baseline networks (variance source) ·
+FDA machinery (≈PCA parity) · cuML/WSL2 GPU for classical stack
+(no Windows build; tiny-n loses anyway) · TabICL (large-n tool) ·
+isotonic/stacked calibration (Platt is the small-n standard) ·
+snapshot ensembles (cyclic LR not worth tuning).
 
 ## 17. Testing map
 
 | Suite | What it proves | Runtime |
 |---|---|---|
-| `test_all.py` (40) | loader hygiene, preprocessing, grouped+repeated CV/ensembles, bundle roundtrip, optimize, ViT forward/checkpoint, clinical stats, biochem, FDR/Friedman + 4 regressions (clinical reproduce path, paired single-preprocess, OOF repeat pooling, patient bootstrap) | ~40 s |
-| `deep_test.py` (17) | blank-GUI guards, one-class train, predict edge paths, legacy bundles, clinical auto refs, locked eval, HTML report, deep diagnostics, CLI demo roundtrip | ~60 s |
-| `gui_test.py` (7) | 6-page walk: load→preprocess→train→save→predict→result→report | ~20 s |
-| `smoke_test.py` | headless e2e on demo data | ~15 s |
+| `test_all.py` (56) | loader hygiene (incl. site-token), preprocessing, grouped+repeated CV/ensembles, bundle roundtrip, optimize, ViT forward/checkpoint, clinical stats, biochem, FDR/Friedman + regressions (clinical reproduce path, paired single-preprocess, OOF repeat pooling, patient bootstrap, data-root discovery, device-portability scan; 2026-09-06: CONTIGUOUS calibration-bins regression, auc_power formula regression) | ~2 min |
+| `deep_test.py` (19) | blank-GUI guards, one-class train, predict edge paths, legacy bundles, clinical auto refs, locked eval (+`_lc_data_key` tag in hand-built scenarios), HTML report, deep diagnostics, reset-session, train-tabs layout, CLI roundtrip (cwd-safe since 2026-09-06) | ~60 s |
+| `gui_test.py` (8 steps) | 6-page walk: load→preprocess→train→save→predict→result→report (report asserted in the TEMP APP_DIR since 2026-09-06, not in-tree) | ~20 s |
 
-No pytest config, no coverage, no CI; plain-assert custom collectors.
+CI COMMITTED since 2026-09-06 (`.github/workflows/ci.yml`: windows,
+py3.14, offscreen, ruff==0.16.5 pinned, HF-weights cache for TabPFN,
+90-min timeout, pip cache). Optional-dep honesty line printed by
+`test_all.main()` when torch/shap/pybaselines/lightgbm/catboost/
+xgboost/tabpfn are missing.
+**2026-09-03 (resolved):** deep_test used to segfault (exit 139)
+mid-suite — root cause: pending matplotlib `draw_idle` timers firing
+on canvases of CLOSED scenario windows (`RuntimeError: wrapped C/C++
+object … has been deleted` → native abort). Fixes: (a) `check()` now
+flushes the event loop after every scenario, (b) the new inline Train
+panels draw synchronously (`draw()`). Full suite now runs **18/18,
+exit 0** on this machine.
 
 ## 18. Git state & open items
 
@@ -710,14 +1157,254 @@ Repo `D:\BARC`, branch `main`, init 2026-08-30; per-commit history:
 `git log --oneline`. Patient data & artifacts gitignored (§3).
 
 **Open (prioritized):**
-1. `--locked` one-shot holdout for reproduce_study (port GUI
-   `run_locked_eval`, ~30 lines) — honest final-exam number for §13.
+0. **git history still contains `P01_cAg_785_C8_3.txt` (initial
+   commit) — purge with `git filter-repo` BEFORE any push** (user
+   decision pending 2026-09-06).
+1. ~~`--locked` one-shot holdout for reproduce_study~~ DONE (A1).
 2. ViT vs classical comparison in one harness; ViT predict not in GUI.
-3. gui.py 5.1k monolith (split per page); txt/HTML report duplication.
-4. No CI/packaging/LICENSE; tests write artifacts in-tree; Windows font
-   paths.
+3. gui.py 7.7k monolith (split per page); txt/HTML report duplication.
+4. ~~No CI~~ COMMITTED 2026-09-06 (needs its first green run).
 5. Winner selected on the reporting CV (nested eval is opt-in, GUI-only);
    no external cohort; confounders unrecorded.
 6. 3SSE winner: run seed-stability (5 seeds) on the winning chain +
    baseline before claiming the +0.023 F1 gain (McNemar p=0.327 so
    far); screening used default hyperparameters only.
+7. §13 numbers stale on TWO counts (gotcha #18 + site-token hygiene) —
+   full re-run needed; bench re-baseline too.
+8. Known-remaining audit lows deferred deliberately (see §20 "not
+   fixed" list).
+
+## 19. Research roadmap changelog (see raman_app/RESEARCH.md)
+
+**Stage 0+1 (2026-09-04, after the deep study of the Bidipta Rana
+internship report + ~120 sources):**
+- `biochemistry.REPORT_BANDS`: the report's Table 4.1 (19 significant
+  wavenumbers + assignments) as a literature reference for agreement
+  checks.
+- Wavelet denoising grew up (`preprocessing.wavelet_denoise`):
+  threshold rules **universal|bayes|sure** (BayesShrink Chang 2000,
+  SUREShrink Donoho-Johnstone per-level), shrinkage **soft|hard|garrote**
+  (Gao 1998), **cycle-spinning** (±N shifts, translation-invariant).
+  Measured on synthetic Lorentzians: bayes/sure cut RMSE ~23% below the
+  old fixed universal rule. coif5 back in the GUI combo (report's
+  wavelet). Params: `wavelet_threshold/wavelet_mode/wavelet_cycle`
+  (defaults preserve old behavior — no PARAMS_VERSION bump needed).
+- Baselines +: **iarpls / pspline-arpls / snip** via installed
+  pybaselines (`_pybase`); norms +: **area / minmax**; **detrend**
+  (linear) step; **Phe-1003 wavenumber calibration**
+  (`estimate_wn_drift`/`calibrate_wn`/`wn_calibrate` param —
+  icoshift-style single anchor; literature: axis alignment beat every
+  intensity normalization).
+- `modeling.TTestSelect` (Welch t + Cohen's d, p<0.05 & |d|>0.1, the
+  report's filter — binary, fallback=all, leakage-safe inside CV
+  pipelines) and `modeling.PLSScores` (PLS LV scores as features;
+  binary uses 1-D codes so 5 components work on 2 classes, multiclass
+  one-hot).
+- **`reproduce_report.py`**: the report's exact pipeline (crop 700–1800,
+  ASLS, vector norm, coif5/SURE/soft, t-test filter, PCA(5)/PLS(5), its
+  7 models with its tuned XGB params) run BOTH spectrum-level 5-fold
+  (report protocol) AND patient-grouped 5×3 + Friedman (honest
+  protocol); writes `report_replication.md`. **Result on this cohort:
+  ALL models land at F1 0.52–0.55, Friedman p=0.44 — the report's
+  PLS+XGB 0.733 does not survive grouped CV here; PLS+XGB is still
+  best under protocol A (0.549) — direction consistent, magnitude not.**
+- GUI Preprocess page: new combos/spins (threshold rule, shrinkage
+  mode, cycle shifts, iarpls/pspline/snip, area/minmax, detrend,
+  Phe-1003 align) wired through read_params/_apply_params; pipeline
+  chip shows the rule/mode.
+- tests: `test_adaptive_wavelet_and_new_steps`,
+  `test_ttest_select_pls_scores_report_replication` — suite 49/49,
+  gui_test PASS.
+
+**Stage 2 (2026-09-04, model arsenal):**
+- Registry 17→**21** (SUITE_VERSION 5→6): **Sparse PLS-DA**
+  (loading-based top-k selection, Lê Cao 2008), **PLS + XGBoost**
+  (the report's winner), **PCA + XGBoost**, **t-test filter + XGBoost**
+  (report's Welch/Cohen-d filter inside the pipeline — leakage-proof).
+  All flow into 3SSE automatically (SLOW_MODELS untouched).
+- `modeling.PLSScores`: PLS LV scores as features (binary → 1-D codes
+  so 5 components work on 2 classes; multiclass → one-hot).
+- 1D-CNN gains ViT-parity augmentation in-fit: noise 5%, roll ±2,
+  mixup β(0.2,0.2), SpecAugment band-mask (CNN1DClassifier(augment=True)
+  — changes CNN CV numbers vs pre-stage runs).
+- Deep uncertainty: `CNN1DClassifier.predict_proba_mc` (MC-dropout),
+  `CNNEnsemble` (n-seed mean + `predict_proba_std` disagreement);
+  `vit_train.mc_dropout_predict` + `gradient_saliency` for the ViT;
+  ViT augmentation gains SpecAugment masking.
+- `modeling.lorentzian_synthesize`: physics-safe synthetic spectra
+  (convex blends + smooth gain/tilt perturbations; fold-internal only).
+- PR curves: `modeling.pr_points` + `plotting.plot_pr`; the Result
+  page and the diagnostics ROC panel are now 1×2 ROC+PR figures;
+  AUPRC logged.
+
+**Stage 3 (2026-09-04, uncertainty & explainability):**
+- Conformal prediction (hand-rolled split-conformal LAC, no MAPIE):
+  `clinical.conformal_q/conformal_sets/conformal_metrics`; Predict and
+  Result tables have a **"Set 90%"** column (two classes = ambiguous,
+  "∅ abstain" = INDETERMINATE); coverage/abstain logged after training.
+- `modeling.permutation_auc_p`: patient-level label-shuffle null
+  (50 perms × 3-fold) → empirical p for the winner's OOF AUC; new
+  "Permutation AUC" diagnostics button (classical winners; CNN too
+  slow). Real synthetic signal → p≤0.07; pure noise → p>0.1 (tested).
+- Calibration quality: `clinical.ece` + `clinical.isotonic_compare`
+  (ECE raw/Platt/isotonic logged; Platt stays applied at n<500).
+- Deep/PLS explainability: `CNN1DClassifier.grad_cam` (1-D Grad-CAM,
+  forward+full-backward hooks on the last Conv1d — grad_OUT not
+  grad_in), `modeling.pls_vip` (per-component SSY VIP formula),
+  `modeling.winner_importance` dispatcher, ViT `gradient_saliency`.
+- `biochemistry.agreement_report`: top-k importance vs literature
+  BANDS + REPORT_BANDS (match fractions + rank correlation); new "Band
+  agreement" diagnostics button (also in the auto battery) logs
+  matches per wavenumber.
+- Patient verdicts upgraded to **probability-mean** (Jeng 2019:
+  mean P(positive) over ALL the patient's spectra, ≥0.5 rule;
+  majority-vote counts still displayed) — `_aggregate_patients` now
+  groups by index so `self._pred_probs` aligns.
+- tests: `test_stage3_conformal_permutation_explainability` — 51/51,
+  gui_test PASS (pred_table now 5 columns).
+
+**Stage 4 (2026-09-04, clinical/strategic):**
+- `clinical.auc_power` (Hanley-McNeil variance): detectable AUC at 80%
+  power + n-per-group for a target — used in the model card and
+  validate_external.
+- `modeling.export_model_card`: TRIPOD+AI-flavored card (data,
+  preprocessing, protocol, F1/AUC/AUPRC + power, limitations) written
+  automatically as `<model>_card.md` on every Save best model.
+- Saliva mode: `PreprocessParams.saliva()` preset (crop 400–2300 so the
+  thiocyanate band is measured, despike, SNIP, SNV — "🧪 Saliva preset"
+  button on the Preprocess page); `bio.SALIVA_BANDS`,
+  `bio.thiocyanate_index` (2100–2136 QC/discriminative marker).
+- `bio.BANDS` now includes the carotenoid pair (1155/1520, fall in
+  cancer) — the classic oral-cancer narrative was missing.
+- `bio.biochemical_shift`: class-mean band deltas + Welch p (top-3
+  logged after every data load); `bio.dataset_qc` (median SNR, spike
+  proxy, thiocyanate availability) logged per data state.
+- `modeling.covariate_fusion_cv` + "Fuse covariates (CSV)" diagnostics
+  button: patient-keyed CSV → logistic meta-model [p, covariates] vs
+  [p] under grouped CV; ΔAUC logged (Hanna 2024 open gap).
+- `validate_external.py`: external-cohort CLI for any saved bundle —
+  metrics + AUC power + band-profile PSI drift verdict vs the internal
+  folder.
+- Predict page: **"⏺ Live folder"** toggle — QFileSystemWatcher on the
+  spectra folder, 800 ms debounce, auto re-classify (real-time
+  screening station; inference sub-100 ms).
+- Threshold/prevalence sweep: already covered by the static PPV/NPV ×3
+  prevalences + DCA panels (interactive slider deliberately not added).
+- tests: `test_stage4_power_card_fusion_saliva_external` — **52/52**,
+  gui_test PASS.
+
+**Research-stage totals**: 21-model registry, adaptive denoising,
+reproduce_report head-to-head, conformal triage, permutation AUC,
+Grad-CAM/VIP/saliency + band agreement, patient probability-mean,
+covariate fusion, external validation, model cards, saliva mode, live
+prediction. RESEARCH.md holds the study + sources.
+
+**ROADMAP v3 batch 1 (2026-09-05, see raman_app/ROADMAP.md):**
+- **A1** locked one-shot FINAL EXAM in reproduce_study (--no-locked to
+  skip): patient 70/15/15 split, winner refit on train patients, one
+  shot on unseen test + DeLong CI. Real-data mini run: 45 spectra /
+  10 patients, F1 0.505, AUC 0.504 (CI 0.32–0.68) — honest and noisy
+  at this n (run the full config for the real number).
+- **B1** gui_test redirects APP_DIR to a temp dir (reports/logs out of
+  the tree). **B2** `.github/workflows/ci.yml` (windows, offscreen,
+  test_all + gui_test + ruff, log artifacts) + pyproject ruff config;
+  repo now lint-clean. **B3** LICENSE (MIT, research-only note),
+  CITATION.cff. Ruff pass also fixed a LATENT BUG: sequential CLI's
+  `main` referenced `_dumpable` outside its function → hoisted to
+  module level.
+- **J1** `modeling.label_error_report` (confident-learning flags from
+  winner OOF: p_self<0.10/p_other>0.90 = likely, 0.25/0.75 = review)
+  + "Label errors (OOF)" Train-page button: logs flags AND selects the
+  rows in the Data table for double-click relabel. Synthetic test:
+  8/8 planted mislabels caught, 0 false.
+- **E3** TTA: `CNN1DClassifier.predict_proba_tta` + `vit_train.
+  tta_predict` (noise+roll+mask averaged inference).
+- **E7** `modeling.band_stability`: per-profile top-k Jaccard +
+  consensus stable-band mask (which bands are REAL across folds).
+- **J2** `modeling.phantom_cohort`: ground-truth synthetic OSCC cohort
+  (planted 785/1003/1090/1335 up, 1155/1520 down in tumor; patient
+  random effects, baseline humps, spikes) — CI smoke + explainability
+  ground truth; test asserts planted bands dominate a diff profile and
+  PCA+LDA scores F1>0.9 on it.
+- **A2** no new code needed: 3SSE significance_of already computes
+  5-seed stability + McNemar (persisted since commit e108167); the
+  open item is an execution run, not code.
+- **B7+C4** live mode is now truly INCREMENTAL: `_live_fire` classifies
+  only mtime-new files via `predict_with_bundle`, appends rows, and
+  shows measured ms/spectrum — no more folder-wide re-runs.
+
+---
+
+## 20. 2026-09-06 WHOLE-PROJECT DEEP AUDIT + REMEDIATION (B0–B4)
+
+Three-agent adversarial audit + line verification: **~190 findings**
+(16 CRITICAL / 35 HIGH / ~67 MED / ~72 LOW). Commits `011bb58`,
+`2267d71`, `ea00383`-family, `432cbd3`, `434bcb9` + audit-B1 commit.
+
+### Number-changing semantic fixes (re-run anything older)
+1. `_tune_hyperparams` grouped branch had a NameError → **B1 chain
+   tuning NEVER RAN in paired mode**; fixed + refits best params on the
+   full fold. `tune_chain` now wraps wn-aligned layers with
+   `_SpectralSlice` (band-feature winners aborted tuning before).
+2. `calibration_bins` interleaved → contiguous; **every ECE /
+   reliability / Platt-vs-isotonic number ever printed was invalid**
+   (flattened to |mean p − prev|).
+3. `auc_power` divided by √2 → power claims were ~1.4× optimistic
+   (model cards + validate_external).
+4. `CalibratedSVC` calibration now patient-grouped (precomputed SGKF
+   splits) — PCA+SVM probabilities change.
+5. 3SSE screening: triple ranking/cutoff on `f1_mean` (mean per-fold
+   F1) — the abandon bound's true objective; patient truth = dominant
+   class; `validate_arch` no longer falls back to in-sample features
+   (degenerate-inner-fold archs now FAIL and are recorded as errors).
+6. `wn_calibrate` anchors on the PHYSICAL Phe-1003 position (constant)
+   instead of the cohort median — leakage-free and predict-time-real.
+7. bench `patient_level_f1` = per-class-conditioned patient verdicts
+   (old version averaged a paired patient's Normal+Tumor probabilities
+   against the first row's label — reorder noise).
+8. `lorentzian_synthesize` documented honestly: convex same-class
+   blends + gain/tilt, NO Lorentzian fitting (never was).
+
+### Data hygiene
+`site_token_dropped` (§5) — TDOC067 TH-in-Normal mislabel was live in
+training. `Patient data in git history` (P01_cAg_785_C8_3.txt, initial
+commit) — history rewrite PENDING USER DECISION; IDs scrubbed from
+README/docstring.
+
+### GUI fixes
+on_train_failed re-enables ALL buttons; `_pop_diag_queue` in
+try/finally; SeqSearchWorker import-try restructure; start_training
+guards opt/pred/seq/lab workers; honest-check guards the analysis
+chain; locked-eval dataset-consistency guard (`_lc_data_key` tag —
+deep_test hand-built scenarios must set it); label-error review maps
+OOF rows via `_train_row_map` (None in averaged/paired modes — logs
+filenames instead) and accumulates row selections; Model Lab: PQN
+winner propagates (mode switches to Margin+PQN), own out-dir
+`study_run_lab/` (no longer clobbers study_run_3sse), ⚡→⏹ cooperative
+cancel; live mode refuses paired bundles without a reference;
+`predict_with_bundle` rejects axes that don't span the stored grid
+(interp would fabricate); reset_session clears `_train_row_map`.
+
+### Reports/packaging truth
+"patient-grouped CV" statements conditional on groups actually being
+present (txt + HTML + literature table + TRIPOD section); model card
+records the REAL folds/repeats/grouping + observed-AUC power label;
+freeze_study/report record TRAINING-time params (`_params_at_train`) +
+tz-aware timestamp + per-file guarded hashing; reproduce_report
+Friedman now uses PATIENT blocks (repeats were correlated blocks);
+README/ROADMAP truth pass; vit_model imports without torch;
+install.bat = pinned requirements.txt; main.py faulthandler +
+startup_error.log + visible failure box; session.log handler guarded;
+CI committed (§17).
+
+### Not fixed (deliberate, LOW + scoped-out)
+`_STAGE_CACHE` cross-thread benign race; env setdefault BLAS pinning
+after LOPO; 3SSE parent RAMAN_DEVICE=cpu session leak; OOF
+repeat-averaging feeding DeLong (documented methodology tradeoff);
+PLS-DA pseudo-probs; padded-interpolated regions (user decision);
+conformal exchangeability caveat; GUI-thread freezes on heavy
+report/freeze operations; Qt6 enum stragglers outside hot paths;
+deep_test tempdir leakage; single-group SGKF crashes (raise cleanly
+now but no friendly dialog). Gotcha numbering has legacy duplicates
+(#21/#22/#23 reused) — NOT renumbered to keep old references stable;
+new entries continue at #24.
