@@ -934,12 +934,6 @@ class AveragedChain:
             np.argmax(self.predict_proba(X), axis=1)]
 
 
-def chain_factory(arch, factories, k: int = 3, seed: int = 42):
-    """Factory for a SequentialChain over the given architecture."""
-    return lambda: SequentialChain(  # noqa: E731
-        [factories[n]() for n in arch], k=k, seed=seed)
-
-
 def tune_chain(arch, X, y, groups, wavenumbers, seed: int = 42,
                cnn_epochs: int = 40, progress=None) -> dict:
     """

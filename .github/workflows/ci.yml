@@ -34,19 +34,25 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install ruff==0.16.5
+          pip install ruff==0.16.5 coverage==7.16.0
 
       - name: Lint
         run: ruff check .
 
-      - name: Unit + integration tests
+      # Line coverage of the app+library modules under the unit suite,
+      # with an enforced floor. Measured 2026-09-06 at 65% (library
+      # include set below); floor set 5 points lower for env drift.
+      # Raise the floor as coverage improves — never lower it.
+      - name: Unit + integration tests (coverage floor 60%)
         env:
           QT_QPA_PLATFORM: offscreen
           QT_QPA_FONTDIR: C:\Windows\Fonts   # windows-latest only —
           # replace with a repo-bundled font dir before adding a Linux job
           MPLBACKEND: QtAgg
           HF_HOME: ${{ github.workspace }}/.hf
-        run: python test_all.py
+        run: |
+          coverage run --source=. test_all.py
+          coverage report --include="gui.py,modeling.py,preprocessing.py,paired.py,sequential.py,study_stats.py,clinical.py,clinical_data.py,dataset.py,optimize.py,biochemistry.py,plotting.py,ui_helpers.py,vit_model.py" --fail-under=60
 
       - name: GUI offscreen test
         env:
@@ -55,6 +61,18 @@ jobs:
           MPLBACKEND: QtAgg
           HF_HOME: ${{ github.workspace }}/.hf
         run: python gui_test.py
+
+      # Full-window scenario battery (19 checks): every page, worker
+      # guard/error paths, clinical-tree prediction, LOPO/seeds/noise,
+      # report export, CLI round-trips. ~4 min locally, roughly double
+      # on the 2-core runner — well inside the job timeout.
+      - name: Deep GUI scenario test
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_QPA_FONTDIR: C:\Windows\Fonts
+          MPLBACKEND: QtAgg
+          HF_HOME: ${{ github.workspace }}/.hf
+        run: python deep_test.py
 
       - name: Upload logs on failure
         if: failure()

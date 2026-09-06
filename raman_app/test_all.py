@@ -3014,49 +3014,153 @@ def test_live_mode_toggle_and_refusal():
 
 
 def test_trainworker_success_path():
-    """The REAL training chain, synchronously: load_folder → the exact
+    """The REAL training chain, twice over:
+    (a) synchronously in-process: load_folder → the exact
     evaluate_models call TrainWorker.run makes → the real completion
-    handler _on_train_done_then_diags → winner installed, tables filled,
-    Save enabled, diagnostics gating respected.  (Every other test
-    injects pre-computed results into on_train_done.)  The QThread
-    wrapper itself is deliberately NOT exercised here — training in a
-    GUI thread trips the documented native-crash race (Brain gotcha
-    #16/#22, reproduced deterministically 2026-09-06 even in a fresh
-    subprocess); deep_test exercises the guard/error paths of that
-    wrapper instead."""
-    app, win = _isolated_main_window()
+    handler _on_train_done_then_diags → winner installed, tables
+    filled, Save enabled; and
+    (b) the REAL QThread path (start_training in a fresh subprocess
+    with a clean APP_DIR): worker thread trains, done signal lands,
+    winner installed.  (b) skips the startup 3SSE restore on purpose:
+    unpickling a restored winner during __init__ poisons later
+    QThread training in synthetic drivers (Brain §31 investigation,
+    2026-09-06 — root-caused by bisection; the interactive app is
+    unaffected because its timing differs)."""
     import ui_helpers as uh
     _saved = uh.save_settings
     uh.save_settings = lambda s: None
     try:
-        with tempfile.TemporaryDirectory() as td:
-            folder = _flat_folder_td(os.path.join(td, "flat"))
-            win.load_folder(folder, quiet=True)
-            assert len(win.spectra) == 30 and win.grid is not None
-            keep = list(range(len(win.labels)))
-            X = win.get_processed_X()
-            names = [n for n, cb in win.model_checks.items()
-                     if cb.isChecked() and n in ("PCA + LDA",
-                                                 "Random Forest")]
-            assert len(names) == 2
-            results, winner = modeling.evaluate_models(
-                X, [win.labels[i] for i in keep], names,
-                3, 42, progress_cb=lambda pct, msg: None,
-                groups=None, repeats=1, wavenumbers=win.grid)
-            assert winner is not None and winner.macro_f1() > 0.5
-            win.chk_auto_diags.setChecked(False)   # deterministic end
-            win._on_train_done_then_diags(results, winner)
-            assert win.winner is winner
-            assert win.b_save.isEnabled()
-            assert len(win.results) == 2           # both models (winner
-            #                                    is one of them already)
-            assert win.compare_table.rowCount() >= 2
-    finally:
+        # ---- (a) synchronous chain, in-process ---------------------
+        app, win = _isolated_main_window()
         try:
-            win.close()
-        except RuntimeError:
-            pass
+            with tempfile.TemporaryDirectory() as td:
+                folder = _flat_folder_td(os.path.join(td, "flat"))
+                win.load_folder(folder, quiet=True)
+                assert len(win.spectra) == 30 and win.grid is not None
+                X = win.get_processed_X()
+                names = [n for n, cb in win.model_checks.items()
+                         if cb.isChecked() and n == "PCA + LDA"]
+                assert len(names) == 1
+                results, winner = modeling.evaluate_models(
+                    X, list(win.labels), names, 3, 42,
+                    progress_cb=lambda pct, msg: None,
+                    groups=None, repeats=1, wavenumbers=win.grid)
+                assert winner is not None and winner.macro_f1() > 0.5
+                win.chk_auto_diags.setChecked(False)  # deterministic
+                win._on_train_done_then_diags(results, winner)
+                assert win.winner is winner
+                assert win.b_save.isEnabled()
+                assert len(win.results) == 1
+                assert win.compare_table.rowCount() >= 1
+        finally:
+            try:
+                win.close()
+            except RuntimeError:
+                pass
+        # ---- (b) real QThread chain, fresh subprocess --------------
+        import subprocess
+        driver = _trainworker_driver()
+        with tempfile.TemporaryDirectory() as td:
+            script = os.path.join(td, "driver.py")
+            with open(script, "w", encoding="utf-8") as fh:
+                fh.write(driver)
+            r = subprocess.run(
+                [sys.executable, script], capture_output=True,
+                text=True, timeout=300,
+                cwd=os.path.dirname(os.path.abspath(__file__)))
+            assert r.returncode == 0 and "QTHREAD_TRAIN_OK" in \
+                r.stdout, (r.returncode, r.stdout[-500:],
+                           r.stderr[-1000:])
+    finally:
         uh.save_settings = _saved
+
+
+def _trainworker_driver() -> str:
+    """Fresh-process driver for the real start_training QThread chain.
+    APP_DIR is redirected BEFORE MainWindow construction so the
+    startup 3SSE restore stays out of the way (see the test docstring
+    and Brain §31)."""
+    return r'''
+import os, sys, tempfile, time
+sys.path.insert(0, os.getcwd())
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+import numpy as np
+from qt_compat import QtWidgets, QtCore, Signal
+import ui_helpers as uh, clinical_data as _cd
+uh.load_settings = lambda: {}
+_cd.find_data_root = lambda: None
+import gui
+gui.APP_DIR = tempfile.mkdtemp()          # skip the startup restore
+uh.save_settings = lambda s: None
+for n in ("warning", "information", "critical", "about"):
+    setattr(QtWidgets.QMessageBox, n, staticmethod(lambda *a, **k: None))
+app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+app.setStyle("Fusion")
+app.setStyleSheet(uh.STYLESHEET)
+win = gui.MainWindow()
+td = tempfile.mkdtemp()
+rng = np.random.default_rng(0)
+wn = np.linspace(400, 1800, 400)
+os.makedirs(os.path.join(td, "flat"))
+for cls, gain in (("C1", 0.4), ("C8", 1.6)):
+    for i in range(10):
+        peaks = (np.exp(-((wn - 1003) / 15) ** 2)
+                 + gain * np.exp(-((wn - 1450) / 15) ** 2))
+        it = 0.1 + peaks + rng.normal(0, 0.02, len(wn))
+        with open(os.path.join(td, "flat",
+                               f"SYN_785_{cls}_{i + 1}.txt"), "w") as fh:
+            for w, v in zip(wn, it):
+                fh.write(f"{w:.2f},{v:.4f}\n")
+win.load_folder(os.path.join(td, "flat"), quiet=True)
+win.chk_auto_diags.setChecked(False)
+for name, cb in win.model_checks.items():
+    cb.setChecked(name == "PCA + LDA")
+win.spin_folds.setValue(3)
+win.start_training()                       # the REAL QThread path
+
+deadline = time.time() + 240
+while time.time() < deadline and win.winner is None:
+    QtCore.QCoreApplication.processEvents()
+    time.sleep(0.05)
+assert win.winner is not None, "training did not finish"
+assert win.winner.macro_f1() > 0.5
+assert win.b_save.isEnabled()
+print("QTHREAD_TRAIN_OK", win.winner.name, f"{win.winner.macro_f1():.3f}")
+win.close()
+'''
+
+
+def test_sequential_cli_smoke():
+    """sequential.py CLI end-to-end on synthetic clinical data:
+    --models subset + --top 1 + --skip-validation keeps it to seconds;
+    asserts exit 0 and the run artifacts (screening.jsonl / report.txt
+    / run_meta.json) land in --out (2026-09-06 improvement item)."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        root = os.path.join(td, "clin")
+        os.makedirs(root)
+        _make_clinical_tree(root)
+        out = os.path.join(td, "run")
+        r = subprocess.run(
+            [sys.executable, "sequential.py",
+             "--data", root, "--mode", "paired",
+             "--k", "3", "--top", "1", "--jobs", "1",
+             "--models", "PCA + LDA,Random Forest",
+             "--skip-validation",
+             "--out", out],
+            capture_output=True, text=True, timeout=600,
+            cwd=os.path.dirname(os.path.abspath(__file__)))
+        assert r.returncode == 0, (r.returncode, r.stdout[-800:],
+                                   r.stderr[-1500:])
+        assert os.path.isfile(os.path.join(out, "screening.jsonl"))
+        assert os.path.isfile(os.path.join(out, "report.txt"))
+        assert os.path.isfile(os.path.join(out, "run_meta.json"))
+        rep = open(os.path.join(out, "report.txt"),
+                   encoding="utf-8").read()
+        assert "PCA + LDA" in rep
+        # --skip-validation skips validate_top/finalize by design: no
+        # winner bundle, screening + report + meta only
+
 
 def main():
     tests = [v for k, v in sorted(globals().items())

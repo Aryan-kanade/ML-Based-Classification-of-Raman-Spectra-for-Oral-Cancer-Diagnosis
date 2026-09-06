@@ -1789,3 +1789,38 @@ coverage tool installed (functional coverage 136/151 public functions
 candidate for deletion).
 
 Final: 86/86 unit + gui_test PASSED + 19/19 deep + ruff clean.
+
+## 31. 2026-09-06/07 (wave 11) — the 5 recommended improvements, implemented
+
+1. **CI coverage floor**: `coverage==7.16.0` installed in CI; unit step
+   now `coverage run --source=. test_all.py` + `coverage report
+   --include=<15 app/library modules> --fail-under=60`. Measured
+   locally: 65% library line coverage (63% overall incl. scripts).
+   Rule: raise the floor as coverage improves, never lower it.
+2. **deep_test.py in CI**: new step after gui_test (same offscreen env
+   + HF cache). 19 scenario checks now gate every push/PR.
+3. **QThread-training crash ROOT-CAUSED** (bisection ladder, each step
+   3x): bare QThread+sklearn STABLE → +project imports STABLE →
+   +evaluate_models STABLE → +MainWindow WITHOUT startup restore
+   STABLE (3/3) → WITH restore CRASHES. The startup 3SSE restore
+   (unpickling the saved AveragedChain during __init__) poisons later
+   QThread training in synthetic drivers — native 0xC0000005. NOT
+   loky (JOBLIB env was a 1-run fluke; env runs later crashed 3/3),
+   NOT RF n_jobs, NOT BLAS threads, NOT the Qt event pump (crashes
+   with pure sleep too). Interactive app unaffected (user trained all
+   day with restores between). Mitigations: JOBLIB_MULTIPROCESSING=0
+   set at gui import (honest comment: gotcha-#16 hardening, NOT a fix
+   for this); test now exercises the REAL QThread chain in a fresh
+   subprocess with a clean APP_DIR (restore skipped) —
+   `test_trainworker_success_path` covers sync + QThread paths.
+4. **Dead code**: `sequential.chain_factory` deleted (zero refs).
+   `plot_sign_bars` KEPT as a pinned plotting utility (no caller
+   invented — UI scope creep).
+5. **`test_sequential_cli_smoke`**: sequential.py CLI end-to-end on
+   `_make_clinical_tree` synthetic data (--models subset, --top 1,
+   --skip-validation → seconds; asserts exit 0 + screening.jsonl/
+   report.txt/run_meta.json; note: --skip-validation skips finalize,
+   so no winner.joblib by design).
+
+Suite now 87/87 + GUI PASSED + 19/19 deep + ruff clean + coverage
+65%/floor 60.

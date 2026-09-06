@@ -36,6 +36,15 @@ from qt_compat import (QtWidgets, QtCore, Signal, QAction, ALIGN_CENTER,
                        BINDING, EDIT_NO, EDIT_DC, EDIT_SC, SELECT_ROWS,
                        WAIT_CURSOR, TEXT_RICH)
 
+# Defensive (Brain gotcha #16): the GUI's analysis QThreads must not
+# spawn concurrent loky process pools — native-crash race on Windows.
+# joblib reads this env AT IMPORT, so it must be set BEFORE importing
+# modeling (which pulls joblib).  NOTE: this is hardening, NOT a fix
+# for the restore×QThread training crash (see Brain §31 — unpickling
+# a restored winner during __init__ poisons later QThread training in
+# synthetic drivers; scoped to the GUI process, CLI keeps parallelism).
+os.environ.setdefault("JOBLIB_MULTIPROCESSING", "0")
+
 import dataset
 import modeling
 import preprocessing
@@ -133,6 +142,8 @@ class TrainWorker(QtCore.QThread):
 
     def run(self):
         try:
+            # (JOBLIB_MULTIPROCESSING hardening lives at gui.py import
+            # — joblib reads the env at ITS import time)
             results, winner = modeling.evaluate_models(
                 self.X, self.y, self.model_names, self.k_folds, self.seed,
                 progress_cb=lambda pct, msg: self.progress.emit(pct, msg),
