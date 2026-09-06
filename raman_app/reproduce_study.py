@@ -1,8 +1,8 @@
 """
 reproduce_study.py — headless one-shot reproduction of the whole study.
 
-Runs the complete pipeline on the clinical dataset (or synthetic demo
-data) with a fixed seed and writes every artifact into an output folder:
+Runs the complete pipeline on the clinical dataset with a fixed seed
+and writes every artifact into an output folder:
 
     * model bundle (.joblib, Platt-calibrated when binary)
     * model comparison + clinical summary (summary.txt)
@@ -10,8 +10,7 @@ data) with a fixed seed and writes every artifact into an output folder:
     * run metadata (run_meta.json)
 
 Usage:
-    python reproduce_study.py                 # D:\\BARC\\Data (or --demo)
-    python reproduce_study.py --demo          # synthetic demo data
+    python reproduce_study.py                 # auto-detected dataset root
     python reproduce_study.py --mini          # fast subset (3 models)
     python reproduce_study.py --data PATH --seed 7 --out my_run
 """
@@ -22,6 +21,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
 
 import numpy as np
 
@@ -33,10 +33,13 @@ import modeling                              # noqa: E402
 import plotting                              # noqa: E402
 import preprocessing as pp                   # noqa: E402
 import study_stats as sstats                 # noqa: E402
-from clinical_data import load_clinical_dataset, write_report  # noqa: E402
+from clinical_data import (find_data_root, load_clinical_dataset,  # noqa: E402
+                           write_report)
 
-DEFAULT_DATA = r"D:\BARC\Data"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# auto-detected per device — no hardcoded machine path to edit when the
+# project moves to another computer (see clinical_data.find_data_root)
+DEFAULT_DATA = find_data_root() or os.path.join(APP_DIR, "..", "Data")
 
 
 def main(argv=None) -> int:
@@ -44,8 +47,6 @@ def main(argv=None) -> int:
         description="One-shot headless reproduction of the study.")
     ap.add_argument("--data", default=DEFAULT_DATA,
                     help="clinical dataset root (default: %(default)s)")
-    ap.add_argument("--demo", action="store_true",
-                    help="use synthetic demo data instead of --data")
     ap.add_argument("--mini", action="store_true",
                     help="fast subset: PCA+LDA / Logistic / Ensemble")
     ap.add_argument("--seed", type=int, default=42)
@@ -53,6 +54,15 @@ def main(argv=None) -> int:
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--mode", choices=["standard", "paired", "paired-pqn"],
                     default="standard")
+    ap.add_argument("--crop-min", type=float, default=None,
+                    help="override crop_min (default: pipeline default)")
+    ap.add_argument("--crop-max", type=float, default=None,
+                    help="override crop_max (default: pipeline default)")
+    ap.add_argument("--despike", action="store_true",
+                    help="despike (also keeps spike-flagged spectra)")
+    ap.add_argument("--baseline", choices=["als", "arpls"], default=None)
+    ap.add_argument("--no-locked", action="store_true",
+                    help="skip the one-shot locked final exam")
     ap.add_argument("--out", default=None, help="output folder")
     args = ap.parse_args(argv)
 
@@ -63,29 +73,19 @@ def main(argv=None) -> int:
     # ---- data ------------------------------------------------------------
     groups: list[str] | None
     flagged: list[bool] | None = None
-    if args.demo:
-        import tempfile
-        src = ds.find_default_source_spectrum()
-        root = ds.generate_demo_data(
-            src, os.path.join(tempfile.mkdtemp(), "demo"))
-        spectra = ds.load_folder(root)
-        labels = [s.label for s in spectra]
-        groups = None
-        print(f"[reproduce] demo data: {len(spectra)} spectra")
-    else:
-        if not os.path.isdir(args.data):
-            print(f"[reproduce] data folder not found: {args.data}"
-                  " (use --demo for synthetic data)")
-            return 2
-        cd = load_clinical_dataset(args.data)
-        spectra = cd.spectra
-        labels = [s.label for s in spectra]
-        groups = cd.groups or None
-        flagged = cd.flagged or None
-        write_report(os.path.join(out_dir, "data_report.txt"), cd.report)
-        print(f"[reproduce] {len(spectra)} spectra, "
-              f"{len(set(labels))} classes, "
-              f"{len(set(groups)) if groups else 0} patients")
+    if not os.path.isdir(args.data):
+        print(f"[reproduce] data folder not found: {args.data} "
+              "(pass --data PATH or set RAMAN_DATA_DIR)")
+        return 2
+    cd = load_clinical_dataset(args.data)
+    spectra = cd.spectra
+    labels = [s.label for s in spectra]
+    groups = cd.groups or None
+    flagged = cd.flagged or None
+    write_report(os.path.join(out_dir, "data_report.txt"), cd.report)
+    print(f"[reproduce] {len(spectra)} spectra, "
+          f"{len(set(labels))} classes, "
+          f"{len(set(groups)) if groups else 0} patients")
     if len(set(labels)) < 2:
         print("[reproduce] need at least two classes")
         return 2
@@ -94,6 +94,11 @@ def main(argv=None) -> int:
     # Mirrors the GUI path exactly: common_grid/to_matrix, then either
     # paired_features (which preprocesses internally) or preprocess_matrix.
     params = pp.PreprocessParams().validate()
+    overrides = {"crop_min": args.crop_min, "crop_max": args.crop_max,
+                 "despike": True if args.despike else None,
+                 "baseline_method": args.baseline}
+    params = replace(params, **{k: v for k, v in overrides.items()
+                                if v is not None}).validate()
     grid = ds.common_grid(spectra)
     X_raw, _ = ds.to_matrix(spectra, grid)
     keep = [i for i, lab in enumerate(labels) if lab.strip()]
@@ -126,6 +131,7 @@ def main(argv=None) -> int:
     model_names = (["PCA + LDA", "PCA + Logistic Regression",
                     "Ensemble (top-3)"] if args.mini else None)
     print("[reproduce] training…")
+    print(f"[reproduce] {modeling.device_report()}")
     results, winner = modeling.evaluate_models(
         X, y, model_names=model_names, k_folds=args.folds,
         seed=args.seed, groups=g, repeats=args.repeats,
@@ -144,6 +150,24 @@ def main(argv=None) -> int:
               f" · specificity "
               f"{winner.macro.get('spec', (0,))[0]:.3f}"
               f" · macro-F1 {winner.macro_f1():.3f}"]
+    # B6: patient-level (mean-probability) reading — the operating
+    # level the field reports (Jeng 2019; Farnesi 2025)
+    if (getattr(winner, "groups", None) is not None
+            and winner.oof_proba is not None
+            and winner.y_true_encoded is not None):
+        try:
+            pm = sstats.patient_level_metrics(winner.y_true_encoded,
+                                              winner.groups,
+                                              winner.oof_proba)
+            if pm is not None:
+                lines.append(
+                    f"  PATIENT-level (mean P, n={pm['n_patients']}): "
+                    f"macro-F1 {pm['f1']:.3f}"
+                    + (f" · AUC {pm['auc']:.3f}" if "auc" in pm else ""))
+                print(f"[reproduce] patient-level: F1 {pm['f1']:.3f}"
+                      + (f", AUC {pm['auc']:.3f}" if "auc" in pm else ""))
+        except Exception as exc:
+            print(f"[reproduce] patient-level metrics skipped: {exc}")
 
     # ---- clinical layer (binary winners) ----------------------------------
     extras: dict = {}
@@ -177,6 +201,48 @@ def main(argv=None) -> int:
             extras["op_points"] = (lo_o, hi_o)
         if ab:
             extras["calibrator"] = ab
+
+    # ---- locked one-shot final exam (TRIPOD-style) ------------------------
+    # split PATIENTS 70/15/15, refit the winner on the training patients
+    # only, evaluate ONE-SHOT on the untouched test patients — the honest
+    # headline number next to the (optimistic) pooled-CV numbers.
+    if (g is not None and len(set(g)) >= 7 and winner.pipeline is not None
+            and not args.no_locked):
+        try:
+            from sklearn.base import clone as _clone
+            from sklearn.metrics import (confusion_matrix as _cm,
+                                         f1_score as _f1)
+            from clinical_data import patient_split
+            tr_idx, _va_idx, te_idx = patient_split(
+                list(g), list(y), seed=args.seed)
+            te_pats = {g[i] for i in te_idx}
+            rows_tr = [i for i in range(len(y)) if g[i] not in te_pats]
+            rows_te = [i for i in range(len(y)) if g[i] in te_pats]
+            est = _clone(winner.pipeline).fit(
+                X[rows_tr], [y[i] for i in rows_tr])
+            pred = est.predict(X[rows_te])
+            y_te = [y[i] for i in rows_te]
+            cm_ = _cm(y_te, pred, labels=list(winner.classes))
+            f1_ = float(_f1(y_te, pred, average="macro"))
+            lines += ["", "LOCKED FINAL EXAM (one-shot, unseen patients):",
+                      f"  {len(rows_te)} spectra / {len(te_pats)} unseen "
+                      f"patients — macro-F1 {f1_:.3f}"]
+            if len(winner.classes) == 2:
+                tp = int(cm_[1, 1])
+                fn_ = int(cm_[1].sum()) - tp
+                tn = int(cm_[0, 0])
+                fp_ = int(cm_[0].sum()) - tn
+                proba_ = est.predict_proba(X[rows_te])[:, 1]
+                yv_ = (np.asarray(y_te) == winner.classes[1]).astype(int)
+                a_, _se_, lo_, hi_ = clin.delong_auc_ci(yv_, proba_)
+                lines.append(
+                    f"  sens {tp / max(tp + fn_, 1):.3f} · "
+                    f"spec {tn / max(tn + fp_, 1):.3f} · "
+                    f"AUC {a_:.3f} (DeLong 95% CI {lo_:.2f}-{hi_:.2f})")
+            lines.append("  (noisy at this n — run once per configuration; "
+                         "re-running until it looks good defeats it)")
+        except Exception as e:
+            lines.append(f"\nLocked exam skipped: {e}")
     lines += ["", "Literature benchmark (pooled sens/spec):",
               "  Han 2022 meta              0.89 / 0.84",
               "  2025 OSCC meta             0.89 / 0.91",
@@ -238,6 +304,7 @@ def main(argv=None) -> int:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    plotting.apply_style()   # house style for the saved PNGs too
     if winner.cm is not None:
         fig, ax = plt.subplots(figsize=(6, 5))
         plotting.plot_confusion_matrix(ax, winner.cm, winner.classes)

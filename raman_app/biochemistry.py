@@ -35,6 +35,8 @@ BANDS: tuple[tuple[float, float, str, str, int], ...] = (
     (938.0, 10.0, "keratin", "C-C backbone (keratin marker)", -1),
     (1003.0, 8.0, "protein", "phenylalanine ring breathing", +1),
     (1090.0, 10.0, "nucleic acids", "PO2- stretch", +1),
+    (1155.0, 8.0, "carotenoids", "C-C stretch (falls in cancer)", -1),
+    (1520.0, 10.0, "carotenoids", "C=C stretch (falls in cancer)", -1),
     (1240.0, 12.0, "collagen/protein", "amide III", -1),
     (1335.0, 10.0, "nucleic acids", "purine bases (A, G)", +1),
     (1445.0, 10.0, "lipids/protein", "CH2/CH3 deformation", 0),
@@ -56,6 +58,34 @@ RATIOS: tuple[tuple[str, float, float, str], ...] = (
 )
 
 MATCH_TOL_CM1 = 25.0     # band-matching tolerance for the plausibility check
+
+# Top discriminative wavenumbers from Bidipta Rana's internship report
+# (BARC/IIT-M, July 2026) — Welch t-test + Cohen's d on the OSCC dataset
+# (Table 4.1, p<0.05, |d|>0.1), with literature assignments.  Used by the
+# band-agreement diagnostics to check whether the trained models
+# independently rediscover the same biochemistry.
+REPORT_BANDS: tuple[tuple[float, float, str, str], ...] = (
+    # (shift cm-1, |Cohen's d|, molecule, assignment)
+    (743.6, 0.526, "nucleic acids/phospholipid", "adenine, C-S stretch"),
+    (739.3, 0.504, "nucleic acids/phospholipid", "adenine, C-S stretch"),
+    (737.2, 0.482, "nucleic acids/phospholipid", "adenine, C-S stretch"),
+    (1222.4, 0.490, "collagen/protein", "amide III"),
+    (1242.3, 0.485, "collagen/protein", "amide III"),
+    (1519.0, 0.475, "carotenoids", "C=C stretch (falls in cancer)"),
+    (1752.0, 0.459, "lipids", "C=O ester stretch"),
+    (1608.9, 0.446, "protein/lipid", "phenylalanine / C=C"),
+    (1786.3, 0.445, "lipids", "C=O ester stretch"),
+    (1569.8, 0.438, "protein/nucleic acids", "tryptophan / guanine-adenine"),
+    (1317.1, 0.433, "collagen/nucleic acids", "adenine / protein CH-twist"),
+    (1391.0, 0.431, "protein/lipids", "CH3 symmetric deformation"),
+    (1614.5, 0.428, "protein/lipid", "phenylalanine / C=C"),
+    (865.4, 0.427, "collagen", "proline / hydroxyproline ring"),
+    (1303.4, 0.413, "collagen/protein", "amide III / CH wag"),
+    (1416.1, 0.411, "lipids/protein", "CH2/CH3 deformation"),
+    (1797.1, 0.412, "lipids", "C=O ester stretch"),
+    (1299.5, 0.407, "collagen/protein", "amide III / CH wag"),
+    (1798.9, 0.405, "lipids", "C=O ester stretch"),
+)
 
 
 def _window(wn: np.ndarray, center: float, halfwidth: float) -> np.ndarray:
@@ -106,7 +136,7 @@ def ratio_table(wn, X, y, groups) -> tuple[list[tuple], list[tuple]]:
                  for c in classes}
         class_rows.append((key, meaning, means))
     # paired deltas: tumor minus the same patient's normal, per ratio
-    # (needs patient groups; flat demo data simply yields no pairing)
+    # (needs patient groups; flat data simply yields no pairing)
     paired: dict[str, list[float]] = {}
     for g in dict.fromkeys(groups or []):
         rows_n = [per_row[i] for i in range(len(y))
@@ -162,6 +192,143 @@ def plausibility(bands, tol: float = MATCH_TOL_CM1) -> tuple[list[tuple],
     return rows, (agree, known)
 
 
+def agreement_report(wn, importance, top_k: int = 20,
+                     tol: float = 30.0) -> dict:
+    """
+    Cross-model / cross-source band agreement: take the `top_k` most
+    important wavenumbers of ANY model's importance profile (SHAP, VIP,
+    Grad-CAM, …) and check them against (a) the literature BANDS table
+    and (b) the internship report's significant bands (REPORT_BANDS).
+
+    Returns {'matches': [(shift, source, molecule, assignment), ...],
+             'lit_frac', 'report_frac', 'spearman'} where spearman is
+    the rank correlation between the importance profile and a synthetic
+    literature profile (Gaussian bumps at every literature band).
+    """
+    from scipy.stats import spearmanr
+    wn = np.asarray(wn, dtype=float)
+    imp = np.asarray(importance, dtype=float)
+    if len(wn) != len(imp) or len(imp) < 10:
+        return {"matches": [], "lit_frac": 0.0, "report_frac": 0.0,
+                "spearman": float("nan")}
+    top = wn[np.argsort(-imp)[:top_k]]
+    lit_centers = [b[0] for b in BANDS]
+    rep_centers = [b[0] for b in REPORT_BANDS]
+
+    def _near(x, centers):
+        return any(abs(x - c) <= tol for c in centers)
+
+    lit_hits = [s for s in top if _near(s, lit_centers)]
+    rep_hits = [s for s in top if _near(s, rep_centers)]
+    matches = []
+    for s in lit_hits:
+        bc, _hw, mol, assign, _d = min(
+            BANDS, key=lambda b: abs(b[0] - s))
+        matches.append((float(s), "literature", mol, assign))
+    for s in rep_hits:
+        sh, _d, mol, assign = min(
+            REPORT_BANDS, key=lambda b: abs(b[0] - s))
+        matches.append((float(s), "internship report", mol, assign))
+    # synthetic literature profile: unit Gaussians at every band center
+    sig = 20.0
+    ref = np.zeros_like(wn)
+    for c in lit_centers:
+        ref += np.exp(-((wn - c) / sig) ** 2)
+    rho = float(spearmanr(ref, imp).statistic) \
+        if np.isfinite(imp).all() and imp.std() > 0 else float("nan")
+    return {"matches": matches,
+            "lit_frac": len(lit_hits) / top_k,
+            "report_frac": len(rep_hits) / top_k,
+            "spearman": rho}
+
+
+# saliva SERS: the review-endorsed leading biofluid (Hanna 2024 — saliva
+# 93.6/94.0 vs serum 85/90); its thiocyanate band doubles as QC AND
+# discriminative feature (about 2x lower area in cancer: Fălămaș 2020,
+# Faur 2023)
+SALIVA_BANDS: tuple[tuple[float, float, str, str, int], ...] = (
+    (875.0, 10.0, "protein", "tryptophan ring (Trp-caged)", +1),
+    (1003.0, 8.0, "protein", "phenylalanine ring breathing", +1),
+    (1078.0, 10.0, "protein", "C-C stretch", +1),
+    (1445.0, 10.0, "lipids/protein", "CH2/CH3 deformation", 0),
+    (1590.0, 10.0, "protein/nucleic acids", "C=C / purine", +1),
+    (2120.0, 16.0, "thiocyanate", "SCN- C≡N stretch", -1),
+)
+
+
+def thiocyanate_index(wn, X) -> np.ndarray:
+    """
+    Normalized 2100–2136 cm-1 thiocyanate band area per spectrum — the
+    saliva-specific sample-quality and discrimination marker.  NaN when
+    the wavenumber range does not cover it (tissue datasets).
+    """
+    wn = np.asarray(wn, dtype=float)
+    X = np.asarray(X, dtype=float)
+    m = _window(wn, 2118.0, 18.0)
+    if m.sum() < 3:
+        return np.full(len(X), np.nan)
+    area = np.array([np.trapezoid(row[m], wn[m]) for row in X])
+    total = np.array([np.abs(np.trapezoid(row, wn)) for row in X])
+    out = np.where(total > 1e-12, area / np.maximum(total, 1e-12),
+                   np.nan)
+    return out
+
+
+def biochemical_shift(X, wn, labels) -> list[tuple]:
+    """
+    The one-glance cancer narrative: class-mean band-area deltas over
+    the literature BANDS with Welch p-values — normal tissue is
+    lipid/carotenoid-dominated; cancer shifts toward protein + nucleic
+    acids (Baraga/Feld fingerprint; Li 2023).  Positive class = the
+    alphabetically-later class (Tumor > Normal).
+    Returns rows (center, molecule, expected, delta_norm, p).
+    """
+    from scipy.stats import ttest_ind
+    X = np.asarray(X, dtype=float)
+    wn = np.asarray(wn, dtype=float)
+    labels = np.asarray(labels)
+    classes = sorted(set(labels))
+    if len(classes) != 2:
+        return []
+    a = X[labels == classes[0]]
+    b = X[labels == classes[1]]
+    rows = []
+    for center, hw, mol, _assign, direction in BANDS:
+        m = _window(wn, center, hw)
+        if m.sum() < 3:
+            continue
+        aa = np.array([np.trapezoid(r[m], wn[m]) for r in a])
+        bb = np.array([np.trapezoid(r[m], wn[m]) for r in b])
+        denom = max(abs(np.mean(aa)) + abs(np.mean(bb)), 1e-12)
+        delta = (np.mean(bb) - np.mean(aa)) / denom
+        try:
+            p = float(ttest_ind(bb, aa, equal_var=False).pvalue)
+        except Exception:
+            p = float("nan")
+        rows.append((center, mol, direction, float(delta), p))
+    return rows
+
+
+def dataset_qc(X, wn) -> dict:
+    """
+    Cohort quality snapshot: per-spectrum SNR (range vs robust HF-noise
+    estimate from first differences), spike proxy, and whether the
+    saliva thiocyanate QC band is inside the measured range.
+    """
+    X = np.asarray(X, dtype=float)
+    noise = np.median(np.abs(np.diff(X, axis=1)), axis=1) * 1.4826
+    snr = (X.max(axis=1) - X.min(axis=1)) / np.maximum(noise, 1e-12)
+    jumps = np.abs(np.diff(X, axis=1)).max(axis=1) / np.maximum(
+        np.median(np.abs(np.diff(X, axis=1)), axis=1), 1e-12)
+    return {
+        "snr_median": float(np.median(snr)),
+        "snr_p10": float(np.percentile(snr, 10)),
+        "spike_proxy_max": float(jumps.max()),
+        "thiocyanate_band": bool(_window(np.asarray(wn, dtype=float),
+                                         2118.0, 18.0).sum() >= 3),
+    }
+
+
 def nmf_components(X, wn, k: int = 5, seed: int = 0):
     """
     Non-negative unmixing of the spectra into biochemical components.
@@ -172,8 +339,8 @@ def nmf_components(X, wn, k: int = 5, seed: int = 0):
     """
     from sklearn.decomposition import NMF
 
-    X = np.asarray(X, dtype=float)
-    X = np.clip(X, 0.0, None)          # ALS output can dip slightly < 0
+    X = np.ascontiguousarray(X, dtype=float)  # NMF's Cython kernel needs
+    X = np.clip(X, 0.0, None)                 # C-order, non-view arrays
     model = NMF(n_components=k, init="nndsvda", max_iter=600,
                 random_state=seed)
     W = model.fit_transform(X)          # (n, k) weights

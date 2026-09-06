@@ -51,35 +51,57 @@ def bh_fdr(pvals: list[float]) -> list[float]:
 # --------------------------------------------------------------------------
 # Leave-one-patient-out
 # --------------------------------------------------------------------------
+def _lopo_fit_predict(X, ye, tr, te, estimator, params):
+    """Worker: one LOPO fold (fit on all-but-one patient, predict the
+    left-out one).  Runs inside a loky child — threads pinned to 1 so
+    N workers don't oversubscribe the CPU (same pattern as the 3SSE
+    search workers)."""
+    import os
+    from sklearn.base import clone
+    for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(_v, "1")
+    est = clone(estimator)
+    if params:
+        est = est.set_params(**params)
+    est.fit(X[tr], ye[tr])
+    return te, est.predict_proba(X[te])
+
+
 def lopo_evaluate(X, y, groups, estimator, params: dict,
-                  classes: list[str], seed: int = 0) -> dict:
+                  classes: list[str], seed: int = 0,
+                  jobs: int = 1) -> dict:
     """
     Refit `estimator` (with fixed `params`, no re-tuning) once per
     left-out PATIENT and evaluate every patient unseen.  Returns pooled
     metrics + per-patient accuracy rows.  This is the strictest
     generalization check available on a small paired dataset.
+
+    `jobs` > 1 validates folds in a joblib process pool — DEFAULT 1
+    (serial): the measured rejection stands (tree winners refit with
+    n_jobs=-1 internally; process × thread oversubscription lost more
+    than the parallelism won, §16b-A4).
     """
     from sklearn.metrics import (confusion_matrix, f1_score,
                                  roc_auc_score)
-    from sklearn.base import clone
 
     X = np.asarray(X)
     groups = np.asarray(groups)
     y = list(y)
     lut = {c: i for i, c in enumerate(classes)}
     ye = np.array([lut[v] for v in y], dtype=int)
-    per_patient = []
-    y_true, y_pred, y_score = [], [], []
+    tasks = []
     for g in sorted(set(groups.tolist())):
         te = np.flatnonzero(groups == g)
         tr = np.flatnonzero(groups != g)
         if len(tr) == 0 or len(set(ye[tr].tolist())) < 2:
             continue
-        est = clone(estimator)
-        if params:
-            est = est.set_params(**params)
-        est.fit(X[tr], ye[tr])
-        proba = est.predict_proba(X[te])
+        tasks.append((X, ye, tr, te, estimator, params))
+    from joblib import Parallel, delayed
+    results = Parallel(n_jobs=jobs)(
+        delayed(_lopo_fit_predict)(*t) for t in tasks)
+    per_patient = []
+    y_true, y_pred, y_score = [], [], []
+    for (te, proba) in results:
         pred = np.argmax(proba, axis=1)
         acc = float(np.mean(pred == ye[te]))
         pos_rate = (float(np.mean(proba[:, 1]))
@@ -87,7 +109,8 @@ def lopo_evaluate(X, y, groups, estimator, params: dict,
         # the patient's dominant TRUE class (paired datasets have both)
         vals, counts = np.unique(ye[te], return_counts=True)
         true_cls = classes[int(vals[np.argmax(counts)])]
-        per_patient.append((str(g), int(len(te)), acc, pos_rate, true_cls))
+        per_patient.append((str(groups[te][0]), int(len(te)), acc,
+                            pos_rate, true_cls))
         y_true.extend(ye[te].tolist())
         y_pred.extend(pred.tolist())
         if len(classes) == 2:
@@ -235,18 +258,91 @@ def noise_robustness(X, y, groups, estimator, params, classes: list[str],
     Fit on clean training folds, predict test folds with calibrated
     Gaussian noise added at inference (per-spectrum scale).  Returns
     [(noise_fraction, macro_f1)] — the degradation curve.
+
+    Every level shares the SAME folds and the SAME clean fits — each
+    fold is fit ONCE and only re-predicted per noise level (the naive
+    level-by-level loop refit 4x for nothing).  Noise is pre-drawn in
+    the identical order the sequential version consumed it, so the
+    curve is bit-identical to the original implementation.
     """
+    from sklearn.base import clone
+    from sklearn.metrics import f1_score
+    from sklearn.model_selection import StratifiedGroupKFold
+
     lut = {c: i for i, c in enumerate(classes)}
     ye = np.array([lut[v] for v in y], dtype=int)
+    X = np.asarray(X, dtype=float)
+    n_groups = len(set(np.asarray(groups).tolist()))
+    k = int(min(k, n_groups))
+    sgkf = StratifiedGroupKFold(n_splits=k, shuffle=True,
+                                random_state=seed)
+    folds = list(sgkf.split(X, ye, groups))
     rng = np.random.default_rng(seed)
-    return [(lv, _grouped_f1(X, ye, groups, estimator, params, k, seed,
-                             noise_level=lv, rng=rng))
+    noise = {lv: ([rng.normal(0, 1, X[te].shape) for _tr, te in folds]
+                  if lv > 0 else [None] * len(folds))
+             for lv in levels}
+    preds = {lv: [] for lv in levels}
+    y_true: list = []
+    for i, (tr, te) in enumerate(folds):
+        est = clone(estimator)
+        if params:
+            est = est.set_params(**params)
+        est.fit(X[tr], ye[tr])
+        scale = np.std(X[te], axis=1, keepdims=True)
+        for lv in levels:
+            Xte = X[te]
+            if noise[lv][i] is not None:
+                Xte = Xte + noise[lv][i] * scale * lv
+            preds[lv].extend(np.asarray(est.predict(Xte)).tolist())
+        y_true.extend(ye[te].tolist())
+    return [(lv, float(f1_score(y_true, preds[lv], average="macro")))
             for lv in levels]
 
 
 # --------------------------------------------------------------------------
 # Per-patient rollup of out-of-fold predictions
 # --------------------------------------------------------------------------
+def patient_level_metrics(y, groups, oof_proba) -> dict | None:
+    """
+    B6: pool the out-of-fold probabilities per PATIENT (mean), call
+    each patient by its dominant true class, and report macro-F1 (+AUC
+    for 2-class) at the PATIENT level — the operating level the field
+    reports (Jeng 2019 ~+6pp; Farnesi 2025 majority-vote standard).
+    Works with string labels or pre-encoded ints; returns None when
+    there are no groups."""
+    from sklearn.metrics import f1_score, roc_auc_score
+
+    oof = np.asarray(oof_proba, dtype=float)
+    if groups is None:
+        return None
+    y = list(y)
+    groups = np.asarray(groups)
+    keep = ~np.isnan(oof).any(axis=1)
+    oof, y, groups = oof[keep], [v for v, k in zip(y, keep, strict=True)
+                                 if k], groups[keep]
+    if not len(y) or len(set(groups.tolist())) < 2:
+        return None
+    classes = sorted(set(y))
+    lut = {c: i for i, c in enumerate(classes)}
+    ye = np.array([lut[v] for v in y], dtype=int)
+    y_pat, p_pat = [], []
+    for g in sorted(set(groups.tolist())):
+        m = groups == g
+        p_pat.append(oof[m].mean(axis=0))
+        vals, counts = np.unique(ye[m], return_counts=True)
+        y_pat.append(int(vals[np.argmax(counts)]))
+    P = np.vstack(p_pat)
+    Y = np.array(y_pat)
+    out = {"n_patients": int(len(Y)),
+           "f1": float(f1_score(Y, P.argmax(axis=1), average="macro"))}
+    if len(classes) == 2 and len(set(Y.tolist())) == 2:
+        try:
+            out["auc"] = float(roc_auc_score(Y, P[:, 1]))
+        except Exception:
+            out["auc"] = float("nan")
+    return out
+
+
 def per_patient_rollup(y, groups, oof_proba, classes: list[str],
                        pos_idx: int = 1) -> list[tuple]:
     """

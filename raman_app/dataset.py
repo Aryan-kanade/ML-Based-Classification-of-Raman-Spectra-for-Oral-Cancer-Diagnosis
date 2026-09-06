@@ -1,6 +1,6 @@
 """
 dataset.py — loading Raman spectra, parsing class labels from filenames,
-building a common wavenumber grid, and generating a demo dataset.
+building a common wavenumber grid.
 
 File format: 2 columns (wavenumber, intensity) separated by any whitespace,
 one spectrum per file.  Class label is auto-detected from the filename via
@@ -109,74 +109,3 @@ def to_matrix(spectra: list[Spectrum], grid: np.ndarray,
         X[i] = np.interp(grid, s.wavenumbers, s.intensities)
     y = list(labels) if labels is not None else [s.label for s in spectra]
     return X, y
-
-
-# --------------------------------------------------------------------------
-# Demo dataset generator (derived from a real spectrum)
-# --------------------------------------------------------------------------
-# Spectral peak windows (cm-1) that get scaled per class: typical SERS
-# biochemical contributors (lipids/proteins/nucleic acids).
-_PEAK_CENTERS = np.array([480, 525, 640, 725, 830, 880, 1003, 1095,
-                          1130, 1205, 1240, 1335, 1450, 1555, 1580, 1655])
-_PEAK_WIDTH = 28.0
-
-
-def _peak_mask(wn: np.ndarray) -> np.ndarray:
-    m = np.zeros_like(wn, dtype=bool)
-    for c in _PEAK_CENTERS:
-        m |= np.abs(wn - c) <= _PEAK_WIDTH
-    return m
-
-
-def generate_demo_data(source_path: str, out_dir: str,
-                       n_per_class: int = 15, seed: int = 42) -> str:
-    """
-    Create a synthetic 3-class dataset (C1 / C5 / C8) from one real spectrum:
-    the baseline is kept, the Raman peak signal is scaled per class, plus
-    noise, small wavenumber shifts and baseline tilt.  Files are named
-    DEMO_S{i}_cAg_785_{class}_{rep}.txt so the loader auto-detects classes.
-
-    Returns the output directory.
-    """
-    from preprocessing import als_baseline, savgol_smooth
-
-    rng = np.random.default_rng(seed)
-    wn, y = load_spectrum(source_path)
-    y = savgol_smooth(y, window=15, poly=3)
-    baseline = als_baseline(y, lam=1e5, p=0.01, niter=10)
-    peaks = y - baseline
-    pk = _peak_mask(wn)
-    noise_sigma = 0.03 * float(np.std(peaks[pk])) if pk.any() else 0.01 * float(np.std(y))
-
-    # class -> peak gain (separable by design so the demo shows good metrics)
-    class_gains = {"C1": 0.45, "C5": 0.95, "C8": 1.55}
-
-    os.makedirs(out_dir, exist_ok=True)
-    for cls, gain in class_gains.items():
-        for i in range(n_per_class):
-            shift = rng.normal(0.0, 0.35)
-            wns = wn + shift
-            tilt = rng.normal(0.0, 0.01) * (wn - wn.min()) / max(float(np.ptp(wn)), 1.0)
-            gain_i = gain * rng.normal(1.0, 0.06)
-            synth = baseline.copy()
-            synth[pk] += gain_i * peaks[pk]
-            synth = synth + tilt * float(np.median(np.abs(baseline)))
-            synth = synth + rng.normal(0.0, noise_sigma, size=wn.shape)
-            rep = (i % 3) + 1
-            fname = f"DEMO_S{i + 1:02d}_cAg_785_{cls}_{rep}.txt"
-            with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as fh:
-                for w, v in zip(wns[::-1], synth[::-1], strict=True):  # descending, like source
-                    fh.write(f"{w:.2f}\t{v:.1f}\n")
-    return out_dir
-
-
-def find_default_source_spectrum() -> str | None:
-    """Look for a real spectrum .txt next to the app folder (parent dir)."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    for cand_dir in (os.path.dirname(here), here):
-        if not os.path.isdir(cand_dir):
-            continue
-        for fn in sorted(os.listdir(cand_dir)):
-            if fn.lower().endswith(".txt") and not fn.upper().startswith("DEMO"):
-                return os.path.join(cand_dir, fn)
-    return None

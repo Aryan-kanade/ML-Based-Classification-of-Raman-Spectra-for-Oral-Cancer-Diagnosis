@@ -14,9 +14,21 @@ catboost==1.2.10
 pybaselines==1.2.1   # arPLS baseline correction (Baek 2015)
 shap==0.52.0         # signed SHAP region importance
 
-# Vision Transformer scripts (vit_train.py / vit_test.py) — CPU build is
-# sufficient for these small spectrum models:
+# torch: 1D-CNN (modeling.py) + ViT scripts. GPU since 2026-09-04
+# (RTX 3050, CUDA 13.0): 1D-CNN/ViT train on cuda under AMP/TF32.
+# Boosters stay CPU by DEFAULT (at n≈300 they lose on GPU and their
+# CUDA contexts OOM'd loky children); opt in with RAMAN_DEVICE=gpu.
+# RAMAN_DEVICE=cpu forces everything to CPU (3SSE workers set it).
+# CUDA torch install (pick the wheel matching your driver, e.g. cu130):
+# pip install --no-deps --force-reinstall torch==2.13.0+cu130 \
+#   --index-url https://download.pytorch.org/whl/cu130
 torch==2.13.0
+
+# Optional: tabular foundation model in the model lineup (2026-09-05).
+# 6.4.1 = sklearn-1.9-compatible + weights need NO account/token (they
+# auto-download from HuggingFace once; v2.5 weights are research-use).
+# 8.x requires a Prior Labs browser login — do NOT upgrade blindly.
+tabpfn==6.4.1
 
 # Qt binding for the GUI — this environment uses PyQt5; on newer Pythons
 # without PyQt5 wheels, PyQt6 or PySide6 work too (the app auto-detects):

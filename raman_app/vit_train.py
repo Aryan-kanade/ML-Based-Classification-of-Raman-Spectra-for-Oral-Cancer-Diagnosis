@@ -13,7 +13,6 @@ Outputs (in --out, default `vit_outputs/`):
   vit_confusion_matrix.png   confusion matrix on the held-out test set
 
 Examples:
-    python vit_train.py                              # demo data, 10 epochs
     python vit_train.py --data D:\\data\\my_spectra --epochs 25
 """
 
@@ -34,8 +33,9 @@ from sklearn.model_selection import train_test_split
 
 import dataset as ds
 import preprocessing as pp
-from clinical_data import (is_clinical_layout, load_clinical_dataset,
-                           patient_split, write_report)
+from clinical_data import (find_data_root, is_clinical_layout,
+                           load_clinical_dataset, patient_split,
+                           write_report)
 from optimize import load_best_params
 from plotting import COL_MAIN, COL_RESULT, apply_style, plot_confusion_matrix
 from vit_model import (SpectraDataset, SpectralViT, ViTConfig, require_torch,
@@ -46,7 +46,8 @@ from vit_model import (SpectraDataset, SpectralViT, ViTConfig, require_torch,
 # Data
 # --------------------------------------------------------------------------
 def resolve_data_folder(explicit: str | None) -> str:
-    """--data folder, else ../Data (clinical layout), else demo_data/."""
+    """--data folder, else ../Data (clinical layout), else the
+    auto-detected dataset root (clinical_data.find_data_root)."""
     if explicit:
         if not os.path.isdir(explicit):
             raise SystemExit(f"Data folder not found: {explicit}")
@@ -55,22 +56,13 @@ def resolve_data_folder(explicit: str | None) -> str:
     real = os.path.join(os.path.dirname(here), "Data")
     if is_clinical_layout(real):
         return real
-    demo = os.path.join(here, "demo_data")
-    if os.path.isdir(demo) and any(
-            fn.lower().endswith((".txt", ".dat", ".csv"))
-            for fn in os.listdir(demo)):
-        return demo
-    src = ds.find_default_source_spectrum()
-    if src is None:
-        raise SystemExit(
-            "No --data folder given, no ../Data clinical dataset, no "
-            "demo_data/ found, and no real spectrum .txt next to "
-            "raman_app/.  Re-run with:  python vit_train.py --data <folder>"
-        )
-    print(f"[vit] no demo_data/ found - generating it from "
-          f"{os.path.basename(src)} (synthetic 3-class dataset)")
-    ds.generate_demo_data(src, demo)
-    return demo
+    root = find_data_root()
+    if root:
+        return root
+    raise SystemExit(
+        "No --data folder given and no clinical dataset found.  "
+        "Re-run with:  python vit_train.py --data <folder>"
+    )
 
 
 def load_xy(folder: str):
@@ -112,25 +104,35 @@ def stratified_split(names, labels, test_size, val_size, seed):
 # Training / evaluation
 # --------------------------------------------------------------------------
 def run_epoch(model, loader, criterion, device,
-              optimizer=None, scheduler=None, augment=False
+              optimizer=None, scheduler=None, augment=False, scaler=None
               ) -> tuple[float, float]:
     """One pass over `loader` -> (mean loss, accuracy). Optimizer=None: eval.
 
     With `augment`, training batches get gaussian noise (sigma = 5% of the
     feature std) plus a random wavenumber shift of up to 2 points — cheap
-    regularization for small spectral datasets.
+    regularization for small spectral datasets. CUDA runs under AMP
+    (autocast + GradScaler) for the tensor-core speedup.
     """
     import torch
 
     training = optimizer is not None
+    amp = device.type == "cuda"
     model.train() if training else model.eval()
     total_loss = correct = n = 0
     with torch.set_grad_enabled(training):
         for X, y in loader:
-            X, y = X.to(device), y.to(device)
+            X, y = (X.to(device, non_blocking=amp),
+                    y.to(device, non_blocking=amp))
             if augment:
                 X = X + torch.randn_like(X) * (0.05 * X.std())
                 X = torch.roll(X, int(torch.randint(-2, 3, (1,))), dims=1)
+                if torch.rand(1).item() < 0.5:
+                    # SpecAugment band-masking (Park 2019): zero one
+                    # random wavenumber window — forces peak redundancy
+                    L = X.shape[1]
+                    w = max(4, int(0.05 * L))
+                    st = int(torch.randint(0, max(1, L - w), (1,)))
+                    X[:, st:st + w] = 0.0
                 if torch.rand(1).item() < 0.5:
                     # mixup (Zhang 2018): interpolate pairs; targets become
                     # one-hot probability vectors so CrossEntropyLoss
@@ -143,12 +145,18 @@ def run_epoch(model, loader, criterion, device,
                     oh = torch.nn.functional.one_hot(
                         y.long(), num_classes=n_cls).float()
                     y = lam * oh + (1 - lam) * oh[perm]
-            logits = model(X)
-            loss = criterion(logits, y)
+            with torch.autocast(device.type, enabled=amp):
+                logits = model(X)
+                loss = criterion(logits, y)
             if training:
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
             total_loss += loss.item() * len(y)
             if y.dim() == 2:                    # one-hot mixup targets
                 tgt = y.argmax(1)
@@ -170,11 +178,105 @@ def evaluate(model, X: np.ndarray, y: np.ndarray, device, batch_size: int):
 
     model.eval()
     preds = []
-    loader = DataLoader(SpectraDataset(X, y), batch_size=batch_size)
-    with torch.no_grad():
+    amp = device.type == "cuda"
+    loader = DataLoader(SpectraDataset(X, y), batch_size=batch_size,
+                        pin_memory=amp)
+    with torch.no_grad(), torch.autocast(device.type, enabled=amp):
         for Xb, _ in loader:
-            preds.append(model(Xb.to(device)).argmax(1).cpu().numpy())
+            preds.append(model(Xb.to(device, non_blocking=amp))
+                         .argmax(1).cpu().numpy())
     return np.asarray(y), np.concatenate(preds)
+
+
+def tta_predict(model, X: np.ndarray, device, batch_size: int = 16,
+                n_aug: int = 8) -> np.ndarray:
+    """
+    Test-time augmentation for the ViT: mean softmax over n_aug jittered
+    copies (gaussian noise + wavenumber roll + one masked window) —
+    acquisition-invariant predictions at inference time.
+    """
+    import torch
+
+    model = model.to(device).eval()
+    rng = np.random.default_rng(0)
+    X = np.asarray(X, dtype=np.float32)
+    L = X.shape[1]
+
+    def _proba(x):
+        probs = []
+        amp = device.type == "cuda"
+        with torch.no_grad(), torch.autocast(device.type, enabled=amp):
+            for s in range(0, len(x), batch_size):
+                xb = torch.as_tensor(x[s:s + batch_size], device=device)
+                probs.append(torch.softmax(model(xb), dim=1)
+                             .float().cpu().numpy())
+        return np.concatenate(probs)
+
+    acc = _proba(X)
+    for _ in range(int(n_aug)):
+        j = X + rng.normal(0, 0.05 * X.std(), X.shape).astype(np.float32)
+        j = np.roll(j, int(rng.integers(-2, 3)), axis=1)
+        w = max(4, int(0.05 * L))
+        st = int(rng.integers(0, max(1, L - w)))
+        j[:, st:st + w] = 0.0
+        acc = acc + _proba(j)
+    return acc / (int(n_aug) + 1)
+
+
+def gradient_saliency(model, X: np.ndarray, device) -> np.ndarray:
+    """
+    Input-gradient saliency for the ViT: |d top-logit / d input| per
+    wavenumber, batch-averaged — the deep-model counterpart of SHAP/VIP
+    band profiles (attention-rollout substitute; robust, 10 lines).
+    Returns (n, seq_len), row-max normalized.
+    """
+    import torch
+
+    model = model.to(device).eval()
+    Xt = torch.as_tensor(np.asarray(X, dtype=np.float32), device=device)
+    Xt.requires_grad_(True)
+    logits = model(Xt)
+    score = logits.gather(1, logits.argmax(dim=1).view(-1, 1)).sum()
+    model.zero_grad()
+    score.backward()
+    sal = Xt.grad.detach().abs().squeeze(1).cpu().numpy()
+    mx = sal.max(axis=1, keepdims=True)
+    return sal / np.maximum(mx, 1e-9)
+
+
+def mc_dropout_predict(model, X: np.ndarray, device, batch_size: int = 16,
+                       n_passes: int = 20):
+    """
+    MC-dropout uncertainty for the ViT: enable the dropout modules at
+    inference, sample `n_passes` stochastic forward passes, and return
+    (mean probs, per-class std) — the std is an epistemic-uncertainty
+    proxy usable for abstention alongside conformal sets.
+    """
+    import torch
+    from torch.utils.data import DataLoader
+
+    model = model.to(device)
+    for m in model.modules():
+        if isinstance(m, torch.nn.Dropout):
+            m.train()
+    try:
+        amp = device.type == "cuda"
+        loader = DataLoader(
+            SpectraDataset(X, np.zeros(len(X), dtype=int)),
+            batch_size=batch_size, pin_memory=amp)
+        runs = []
+        with torch.no_grad(), torch.autocast(device.type, enabled=amp):
+            for _ in range(int(n_passes)):
+                probs = []
+                for Xb, _ in loader:
+                    probs.append(torch.softmax(
+                        model(Xb.to(device, non_blocking=amp)),
+                        dim=1).float().cpu().numpy())
+                runs.append(np.concatenate(probs))
+        stacked = np.stack(runs)
+        return stacked.mean(axis=0), stacked.std(axis=0)
+    finally:
+        model.eval()
 
 
 def standardize_fit(X: np.ndarray, idx) -> tuple[np.ndarray, np.ndarray]:
@@ -203,8 +305,11 @@ def train_vit(X_tr, y_tr, X_va, y_va, args, device, cfg, verbose=True):
         weight=torch.as_tensor(w, dtype=torch.float32, device=device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.weight_decay)
+    amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
     mk = lambda Xa, ya, sh: DataLoader(  # noqa: E731 (local helper)
-        SpectraDataset(Xa, ya), batch_size=args.batch_size, shuffle=sh)
+        SpectraDataset(Xa, ya), batch_size=args.batch_size, shuffle=sh,
+        pin_memory=amp)
     loaders = {"train": mk(X_tr, y_tr, True), "val": mk(X_va, y_va, False)}
     history = {"train_loss": [], "train_acc": [], "val_loss": [],
                "val_acc": [], "val_f1": []}
@@ -224,7 +329,7 @@ def train_vit(X_tr, y_tr, X_va, y_va, args, device, cfg, verbose=True):
     for epoch in range(1, args.epochs + 1):
         tr_loss, tr_acc = run_epoch(model, loaders["train"], criterion,
                                     device, optimizer, scheduler,
-                                    augment=True)
+                                    augment=True, scaler=scaler)
         va_loss, va_acc = run_epoch(model, loaders["val"], criterion,
                                     device)
         _, yv_pred = evaluate(model, X_va, y_va, device, args.batch_size)
@@ -341,7 +446,8 @@ def parse_args():
     ap = argparse.ArgumentParser(
         description="Train the spectral Vision Transformer on Raman spectra")
     ap.add_argument("--data", default=None,
-                    help="folder of labelled spectra (default: demo_data)")
+                    help="folder of labelled spectra (default: "
+                         "auto-detected dataset root)")
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--patience", type=int, default=10,
                     help="early-stopping patience on validation macro-F1")
@@ -367,6 +473,10 @@ def parse_args():
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--device", choices=["auto", "cuda", "cpu"],
+                    default="auto",
+                    help="auto = use any CUDA GPU that is present; "
+                         "RAMAN_DEVICE=cpu forces CPU regardless")
     ap.add_argument("--out", default=os.path.join(here, "vit_outputs"))
     ap.add_argument("--model-name", default="vit_model.pt")
     return ap.parse_args()
@@ -379,7 +489,24 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device: never hardcoded to a card — whatever CUDA GPU the driver
+    # exposes; RAMAN_DEVICE=cpu is the same kill-switch the app uses
+    if (os.environ.get("RAMAN_DEVICE", "").lower() == "cpu"
+            or args.device == "cpu"):
+        device = torch.device("cpu")
+    elif args.device == "cuda":
+        device = torch.device("cuda")   # explicit: fail loudly if absent
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available()
+                              else "cpu")
+    if device.type == "cuda":
+        try:
+            if tuple(torch.cuda.get_device_capability(device)) >= (8, 0):
+                # TF32 matmuls: free speedup on Ampere+ GPUs only
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
 
     print("=" * 78)
     print("Vision Transformer (ViT) - Raman spectra classification")

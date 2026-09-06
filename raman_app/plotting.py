@@ -23,6 +23,14 @@ COL_RAW = "#94a3b8"        # faded raw reference traces
 COL_MAIN = "#2563eb"       # primary blue
 COL_RESULT = "#dc2626"     # processed / ROC curve
 COL_WIN = "#16a34a"        # winner / predicted class
+# shared graph vocabulary (inline graphs must use these, never raw hex)
+COL_SIGN_POS = COL_RESULT  # toward the positive class / above zero
+COL_SIGN_NEG = COL_MAIN    # away from the positive class / below zero
+COL_ANNOT = "#b45309"      # amber annotations (thresholds, band markers)
+COL_ZERO = "#64748b"       # zero / mean reference lines
+COL_HIST = "#93c5fd"       # histogram bars below the cut-off
+COL_BAND = "#f59e0b"       # biochemical band shading
+COL_TEXT = "#334155"       # value labels on bars
 
 
 def class_color(i: int) -> str:
@@ -139,23 +147,33 @@ def plot_spectra(ax, spectra: list[tuple[np.ndarray, np.ndarray, str]],
 
 
 def plot_preprocess_preview(ax_before, ax_after, wn, raw, processed,
-                            title: str = ""):
+                            title: str = "", overlay=None):
+    """overlay: optional (wn, y) pair for the raw reference curve on the
+    'after' panel when it must not span the full wn range."""
     ax_before.clear()
     ax_before.plot(wn, raw, lw=0.9, color=COL_MAIN, solid_capstyle="round")
     ax_before.set_title("Raw (on common grid)")
     ax_before.set_xlabel("Raman shift (cm$^{-1}$)")
     ax_before.set_ylabel("Intensity (a.u.)")
-    ax_before.invert_xaxis()
 
     ax_after.clear()
-    ax_after.plot(wn, raw, lw=0.8, color=COL_RAW, alpha=0.45,
-                  label="raw (reference)")
-    ax_after.plot(wn, processed, lw=1.0, color=COL_RESULT,
-                  solid_capstyle="round", label="preprocessed")
+    own = overlay if overlay is not None else (wn, raw)
+    ax_after.plot(own[0], own[1], lw=0.8, color=COL_RAW, alpha=0.45,
+                  label="raw (left axis)")
+    # twin y-axis — raw (~1e3 counts) vs processed (~1e-2 after
+    # vector-norm) differ ~1e5x; a shared axis squashes the processed curve
+    # into a flat line.
+    ax2 = ax_after.twinx()
+    ax2.plot(own[0], processed, lw=1.0, color=COL_RESULT,
+             solid_capstyle="round", label="preprocessed (right axis)")
     ax_after.set_title("Preprocessed")
     ax_after.set_xlabel("Raman shift (cm$^{-1}$)")
-    ax_after.invert_xaxis()
-    ax_after.legend(loc="best")
+    ax2.set_ylabel("Processed intensity", color=COL_RESULT)
+    ax2.tick_params(axis="y", labelcolor=COL_RESULT)
+    h1, l1 = ax_after.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax_after.legend(h1 + h2, l1 + l2, loc="best", fontsize=8,
+                    framealpha=0.85)
     if title:
         ax_before.figure.suptitle(title, fontsize=9, fontweight="bold",
                                   color="#1e293b")
@@ -215,14 +233,14 @@ def plot_prob_histogram(ax, p_pos: np.ndarray, threshold: float | None = None,
     p_pos = np.asarray(p_pos, dtype=float)
     p_pos = p_pos[~np.isnan(p_pos)]
     bins = np.linspace(0.0, 1.0, 11)
-    ax.hist(p_pos, bins=bins, color="#93c5fd", edgecolor="white",
+    ax.hist(p_pos, bins=bins, color=COL_HIST, edgecolor="white",
             linewidth=0.8)
     # color the bars left/right of the cut-off differently
     if len(p_pos):
         cut = threshold if threshold is not None else 0.5
         centers = (bins[:-1] + bins[1:]) / 2
         for patch, c in zip(ax.patches, centers, strict=False):
-            patch.set_facecolor("#dc2626" if c >= cut else "#93c5fd")
+            patch.set_facecolor(COL_RESULT if c >= cut else COL_HIST)
     if threshold is not None:
         ax.axvline(threshold, color="#b45309", lw=1.4, ls="--")
         ax.annotate(f"cut {threshold:.2f}", xy=(threshold, ax.get_ylim()[1]),
@@ -262,13 +280,13 @@ def plot_prediction_spectra(ax, wn, spectra, mean_trace=None,
     if bands:
         for b in bands[:3]:
             center, name = float(b[0]), str(b[2] or "")
-            ax.axvspan(center - 20, center + 20, color="#f59e0b",
+            ax.axvspan(center - 20, center + 20, color=COL_BAND,
                        alpha=0.14, zorder=0, lw=0)
-            label = f"{center:.0f} {name}".strip()
+            label = f"{center:.0f} cm⁻¹ {name}".strip()
             ymin, ymax = ax.get_ylim()
             ax.annotate(label, xy=(center, ymax), xytext=(0, -3),
                         textcoords="offset points", rotation=90,
-                        ha="right", va="top", fontsize=7.5, color="#b45309")
+                        ha="right", va="top", fontsize=8, color=COL_ANNOT)
     traces = [t for t in (mean_trace, reference) if t is not None]
     if traces:
         ax.legend(loc="upper left", fontsize=8)
@@ -282,7 +300,7 @@ def plot_calibration(ax, bins, cal_bins=None,
     (post-calibration) series for before/after comparison.
     """
     ax.clear()
-    ax.plot([0, 1], [0, 1], "--", color="#94a3b8", lw=0.9)
+    ax.plot([0, 1], [0, 1], "--", color=COL_RAW, lw=0.9)
     mp = [b[0] for b in bins]
     ob = [b[1] for b in bins]
     ax.plot(mp, ob, "o-", color=COL_MAIN, ms=5, lw=1.4, mec="white",
@@ -311,7 +329,7 @@ def plot_dca(ax, thresholds, nb_model, nb_all,
             label="treat by model")
     ax.plot(thresholds, nb_all, lw=1.1, color="#059669", ls="--",
             label="treat all")
-    ax.axhline(0, color="#94a3b8", lw=0.9, label="treat none")
+    ax.axhline(0, color=COL_RAW, lw=0.9, label="treat none")
     ax.set_xlabel("threshold probability")
     ax.set_ylabel("net benefit")
     lo = min(-0.05, float(np.min(nb_model)) - 0.02)
@@ -341,14 +359,30 @@ def plot_class_distribution(ax, labels: list[str]):
     ax.margins(y=0.05)
 
 
+def plot_pr(ax, prec, rec, ap: float, label: str = ""):
+    """Precision-recall curve with the average-precision value."""
+    ax.clear()
+    ax.plot(rec, prec, lw=1.8, color=COL_RESULT,
+            label=f"{label} (AP = {ap:.3f})" if label
+            else f"AP = {ap:.3f}")
+    ax.fill_between(rec, prec, alpha=0.12, color=COL_RESULT)
+    ax.set_xlabel("Recall (sensitivity)", fontsize=9)
+    ax.set_ylabel("Precision (PPV)", fontsize=9)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1.02)
+    ax.legend(loc="lower left", fontsize=8)
+    ax.grid(alpha=0.25, lw=0.5)
+    ax.set_title("Precision–Recall — out-of-fold", fontsize=10)
+
+
 def plot_roc(ax, fpr, tpr, auc: float, label: str = ""):
     ax.clear()
     ax.plot(fpr, tpr, lw=1.8, color=COL_RESULT,
             label=f"{label} (AUC = {auc:.3f})" if label
             else f"AUC = {auc:.3f}")
     ax.fill_between(fpr, tpr, alpha=0.12, color=COL_RESULT)
-    ax.plot([0, 1], [0, 1], "--", color="#94a3b8", lw=0.9)
-    ax.text(0.62, 0.55, "chance", rotation=45, color="#94a3b8",
+    ax.plot([0, 1], [0, 1], "--", color=COL_RAW, lw=0.9)
+    ax.text(0.62, 0.55, "chance", rotation=45, color=COL_RAW,
             fontsize=8, ha="center", va="center")
     # Youden J: the operating point farthest above the chance line
     try:
@@ -423,7 +457,7 @@ def plot_prediction(fig, wn, y_raw, y_proc, pred: str, probs: dict,
     ax.text(0.98, 0.05,
             f"Prediction:  {pred}\np = {pmax:.3f}",
             transform=ax.transAxes, ha="right", va="bottom",
-            fontsize=11, fontweight="bold", color="#14532d", bbox=box)
+            fontsize=10, fontweight="bold", color="#14532d", bbox=box)
 
     items = sorted(probs.items(), key=lambda kv: kv[1])   # smallest on top
     cls = [c for c, _ in items]
@@ -431,9 +465,72 @@ def plot_prediction(fig, wn, y_raw, y_proc, pred: str, probs: dict,
     colors = [COL_WIN if c == pred else "#cbd5e1" for c in cls]
     bars = axp.barh(cls, vals, color=colors, edgecolor="white",
                     linewidth=0.6, height=0.6)
-    axp.bar_label(bars, fmt="%.3f", fontsize=8, color="#334155",
+    axp.bar_label(bars, fmt="%.3f", fontsize=8, color=COL_TEXT,
                   padding=3)
     axp.set_xlim(0, 1.15)
     axp.set_xlabel("P(class)")
     axp.set_title("Class probabilities", fontsize=10)
     axp.margins(y=0.08)
+
+
+# --------------------------------------------------------------------------
+# shared bar-chart looks (Result distribution, Predict overview,
+# biochemistry deltas, NMF deltas, LOPO, local explanation)
+# --------------------------------------------------------------------------
+def plot_count_bars(ax, labels, counts, title="Class counts",
+                    positive=None):
+    """Vertical class-count bars; the positive class gets the result
+    red, the rest follow the palette."""
+    cols = [COL_RESULT if lab == positive else class_color(i)
+            for i, lab in enumerate(labels)]
+    bars = ax.bar(labels, counts, color=cols, edgecolor="white",
+                  linewidth=0.8, width=0.62)
+    total = sum(counts) or 1
+    ax.bar_label(bars, labels=[f"{v} ({v / total:.0%})" for v in counts],
+                 fontsize=9, fontweight="bold", color=COL_TEXT, padding=3)
+    ax.set_ylabel("spectra")
+    ax.set_title(title)
+    if len(counts):
+        ax.set_ylim(0, max(counts) + max(1, int(max(counts) * 0.25)))
+    return ax
+
+
+def plot_sign_bars(ax, labels, values, ylabel="", title="",
+                   orientation="v", red_below=None, fmt="%+.2f"):
+    """
+    Sign-colored bars + zero reference line + value labels — the shared
+    look of the paired biochemistry deltas, NMF component deltas, LOPO
+    per-patient accuracy and the local-explanation bars.
+    orientation 'v' draws up/down bars, 'h' left/right bars.
+    red_below (e.g. 0.5 for LOPO accuracy) colors weak bars red
+    instead of using the sign convention.
+    """
+    vals = np.asarray(values, dtype=float)
+    if orientation == "h":
+        cols = ([COL_RESULT if v < red_below else COL_SIGN_NEG
+                 for v in vals] if red_below is not None else
+                [COL_SIGN_POS if v >= 0 else COL_SIGN_NEG for v in vals])
+        bars = ax.barh(labels, vals, color=cols, edgecolor="white",
+                       linewidth=0.6)
+        ax.axvline(0, color=COL_ZERO, lw=0.8)
+        for b, v in zip(bars, vals, strict=True):
+            ax.text(v, b.get_y() + b.get_height() / 2, f" {v:{fmt}}",
+                    va="center", ha="left" if v >= 0 else "right",
+                    fontsize=8, color=COL_TEXT)
+        ax.invert_yaxis()
+    else:
+        cols = ([COL_RESULT if v < red_below else COL_SIGN_NEG
+                 for v in vals] if red_below is not None else
+                [COL_SIGN_POS if v >= 0 else COL_SIGN_NEG for v in vals])
+        bars = ax.bar(labels, vals, color=cols, edgecolor="white",
+                      linewidth=0.6)
+        ax.axhline(0, color=COL_ZERO, lw=0.8)
+        for b, v in zip(bars, vals, strict=True):
+            ax.text(b.get_x() + b.get_width() / 2, v, f"{v:{fmt}}",
+                    ha="center", va="bottom" if v >= 0 else "top",
+                    fontsize=8, color=COL_TEXT)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+    return ax

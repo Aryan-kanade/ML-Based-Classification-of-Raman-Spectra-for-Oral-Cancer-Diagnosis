@@ -38,17 +38,33 @@ QPushButton[nav="true"] {
     font-size: 10.5pt;
 }
 QPushButton[nav="true"]:hover { background: #e8edf7; color: #1e293b; }
+QPushButton[nav="true"]:pressed { background: #dbe4f5; }
 QPushButton[nav="true"]:checked {
     background: #ffffff; color: #4338ca; font-weight: 700;
-    border: 1px solid #dfe6f3;
+    border: 1px solid #dfe6f3; border-left: 3px solid #4338ca;
 }
 
 /* ---------- cards ---------- */
 QFrame#Card { background: #ffffff; border: 1px solid #e6eaf2;
-              border-radius: 12px; }
-QLabel#CardHeader { color: #1e3a8a; font-weight: 700; font-size: 10pt; }
+              border-radius: 14px; }
+QFrame#DiagPanel { background: #ffffff; border: 1px solid #cdd9e6;
+                   border-radius: 12px; }
+QFrame#DiagPanel:hover { border-color: #9fb4d4; }
+QLabel#CardHeader { color: #1e3a8a; font-weight: 700; font-size: 10.5pt; }
 QLabel#CardHint { color: #64748b; font-size: 9pt; }
 QLabel#SectionLabel { color: #64748b; font-weight: 700; font-size: 9pt; }
+QLabel#PageTitle { color: #0f172a; font-weight: 800; font-size: 15pt;
+                   background: transparent; border: none; }
+QLabel#BannerTitle { color: #1e3a8a; font-weight: 800; font-size: 13pt;
+                     background: transparent; border: none; }
+QLabel#SeqCounter { color: #312e81; font-weight: 700; font-size: 15pt; }
+QLabel#SeqTop5 { color: #334155;
+                 font-family: Consolas, "Cascadia Mono", monospace; }
+QLabel#StepChip { border-radius: 10px; padding: 3px 10px; font-size: 9pt;
+                  font-weight: 600; background: #eef2ff; color: #4338ca; }
+QLabel#StepChip[tone="off"] { background: #e2e8f0; color: #94a3b8; }
+QLabel#StepArrow { color: #94a3b8; font-size: 11pt; font-weight: 700;
+                   background: transparent; border: none; }
 
 /* ---------- hero panel (welcome page) ---------- */
 QFrame#Hero {
@@ -162,6 +178,15 @@ QToolTip { font-size: 9pt; background: #1e293b; color: #f1f5f9;
 QStatusBar { color: #475569; background: transparent; }
 QStatusBar::item { border: none; }
 QSplitter::handle { background: #dde4ef; border-radius: 2px; }
+QTabWidget::pane { background: #ffffff; border: 1px solid #e6eaf2;
+                   border-radius: 10px; }
+QTabBar::tab { background: transparent; color: #475569; padding: 7px 16px;
+               margin-right: 3px; border-top-left-radius: 9px;
+               border-top-right-radius: 9px; }
+QTabBar::tab:hover { color: #1e3a8a; }
+QTabBar::tab:selected { background: #ffffff; color: #1e3a8a;
+                        font-weight: 700; border: 1px solid #e6eaf2;
+                        border-bottom: none; }
 QMenuBar { background: transparent; border: none; }
 QMenuBar::item { padding: 5px 9px; border-radius: 7px; }
 QMenuBar::item:selected { background: #e8edf7; }
@@ -186,7 +211,9 @@ QScrollBar::sub-line:horizontal, QScrollBar::add-line:horizontal { width: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 
 /* ---------- matplotlib navigation toolbar ---------- */
-QToolBar { background: transparent; border: none; spacing: 3px;
+/* solid white, NOT transparent: matplotlib 3.11 tints its icons white
+   when the toolbar palette background resolves dark (transparent=black) */
+QToolBar { background: #ffffff; border: none; spacing: 3px;
            padding: 0; }
 QToolBar QToolButton { padding: 3px 4px; border-radius: 6px;
                        background: transparent; }
@@ -199,15 +226,27 @@ QToolBar QLabel { color: #64748b; font-size: 8pt; }
 # --------------------------------------------------------------------------
 # UI kit: card shadows, status pills, app icon
 # --------------------------------------------------------------------------
-def attach_shadow(widget, radius: int = 20, alpha: int = 30,
-                  dy: int = 4) -> None:
-    """Soft drop shadow for a card/frame (Qt QSS has no box-shadow)."""
+def attach_shadow(widget, radius: int = 26, alpha: int = 34,
+                  dy: int = 5) -> None:
+    """Soft layered drop shadow for a card/frame (Qt QSS has no
+    box-shadow)."""
     from qt_compat import QtWidgets, QtGui
     effect = QtWidgets.QGraphicsDropShadowEffect(widget)
     effect.setBlurRadius(radius)
     effect.setColor(QtGui.QColor(30, 41, 89, alpha))   # slate-900 tint
     effect.setOffset(0, dy)
     widget.setGraphicsEffect(effect)
+
+
+def step_chip(text: str, off: bool = False):
+    """Live pipeline-step chip (StepChip QSS style); off=True grays it."""
+    from qt_compat import QtWidgets
+    lbl = QtWidgets.QLabel(text)
+    lbl.setObjectName("StepChip")
+    if off:
+        lbl.setProperty("tone", "off")
+        repolish(lbl)
+    return lbl
 
 
 def pill(text: str, tone: str = "indigo"):
@@ -220,6 +259,13 @@ def pill(text: str, tone: str = "indigo"):
     w.setObjectName("Pill")
     w.setProperty("tone", tone)
     return w
+
+
+def repolish(widget):
+    """Re-apply QSS after a dynamic property change (pill tone, …)."""
+    st = widget.style()
+    st.unpolish(widget)
+    st.polish(widget)
 
 
 def make_app_icon():
@@ -344,7 +390,7 @@ HOW_TO = """<h3>How to use this app</h3>
 <li><b>Data</b> — load the folder with your spectra (.txt, 2 columns).
 Classes are read from the C-number in each filename
 (P01_cAg_785_C8_3.txt → class C8) and can be fixed by double-clicking
-the Class column. No data yet? Use <i>Generate demo data</i>.</li>
+the Class column.</li>
 <li><b>Preprocess</b> — wavelet denoising, Savitzky–Golay smoothing,
 ALS baseline correction and normalization. The defaults suit most Raman
 data; press <i>Preview</i> to see the effect.</li>
@@ -354,11 +400,7 @@ with k-fold cross-validation and keeps the model with the best
 sensitivity / specificity / F1. Then <i>Save best model</i>.</li>
 <li><b>Predict</b> — load the saved model once, then choose the folder
 with new spectra and press <i>Predict</i>.</li>
-</ol>
-<p>Tip: the <b>One-click demo</b> button on the Start tab does steps
-1-3 for you in one go.</p>
-<p><b>Caution:</b> the demo dataset is synthetic (derived from one real
-spectrum). Use your real labeled folder for scientific results.</p>"""
+</ol>"""
 
 
 def about_text(binding: str) -> str:

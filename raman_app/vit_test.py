@@ -26,15 +26,16 @@ from sklearn.metrics import classification_report, confusion_matrix
 
 import dataset as ds
 import preprocessing as pp
-from clinical_data import (is_clinical_layout, load_clinical_dataset)
+from clinical_data import (find_data_root, is_clinical_layout,
+                           load_clinical_dataset)
 from vit_model import load_checkpoint, require_torch, resample_to_len
 from vit_train import evaluate, save_confusion_matrix_png
 
 
 def resolve_data_folder(explicit: str | None, recorded: str | None) -> str:
-    """--data, else the folder recorded in the checkpoint, else demo_data."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [explicit, recorded, os.path.join(here, "demo_data")]
+    """--data, else the folder recorded in the checkpoint, else the
+    auto-detected dataset root."""
+    candidates = [explicit, recorded, find_data_root()]
     for cand in candidates:
         if cand and os.path.isdir(cand):
             return cand
@@ -55,7 +56,7 @@ def main():
                     default=os.path.join(here, "vit_outputs", "vit_model.pt"))
     ap.add_argument("--data", default=None,
                     help="folder of spectra (default: the checkpoint's "
-                         "training folder, else demo_data)")
+                         "training folder, else the auto-detected root)")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--out", default=os.path.join(here, "vit_outputs"))
     args = ap.parse_args()
