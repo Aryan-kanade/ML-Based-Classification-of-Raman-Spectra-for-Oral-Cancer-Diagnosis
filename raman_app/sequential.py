@@ -59,6 +59,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -839,13 +840,18 @@ class SequentialChain:
     """
 
     def __init__(self, estimators: list, k: int = 3, seed: int = 42):
-        self.estimators = list(estimators)     # unfitted, clone-safe
+        # stored VERBATIM: sklearn's clone() requires __init__ to not
+        # modify params (list(...) copies failed clone's identity check
+        # and killed every GUI diagnostic that clones the winner —
+        # learning curve / seeds / noise / locked / LOPO, 2026-09-06).
+        # Mutation-safety comes from fit() cloning each layer anyway.
+        self.estimators = estimators
         self.k = k
         self.seed = seed
 
     # -- sklearn protocol --------------------------------------------------
     def get_params(self, deep=True):
-        return {"estimators": list(self.estimators), "k": self.k,
+        return {"estimators": self.estimators, "k": self.k,
                 "seed": self.seed}
 
     def set_params(self, **params):
@@ -894,13 +900,14 @@ class AveragedChain:
 
     def __init__(self, estimators: list, k: int = 3, seed: int = 42,
                  n_seeds: int = 3):
-        self.estimators = list(estimators)     # unfitted, clone-safe
+        # stored VERBATIM (sklearn clone contract — see SequentialChain)
+        self.estimators = estimators
         self.k = k
         self.seed = seed
         self.n_seeds = n_seeds
 
     def get_params(self, deep=True):
-        return {"estimators": list(self.estimators), "k": self.k,
+        return {"estimators": self.estimators, "k": self.k,
                 "seed": self.seed, "n_seeds": self.n_seeds}
 
     def set_params(self, **params):
@@ -1337,8 +1344,34 @@ def _dumpable(m):
 def persist_run(out_dir: str, board: dict, validated: dict, winner,
                 significance: dict | None = None):
     """Write validated.json / winner.json / significance.json so the
-    next app start can restore the winner into the Train page."""
+    next app start can restore the winner into the Train page.
+    (2026-09-06: validated/winner were accepted but never written — a
+    CLI run left the PREVIOUS run's artifacts behind, mixing
+    generations at restore time.)"""
 
+    def _num(v):
+        if isinstance(v, dict):
+            return {str(k): _num(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [_num(x) for x in v]
+        if isinstance(v, np.ndarray):
+            return v.tolist()          # oof_proba / cm / y_true in the
+        if isinstance(v, np.generic):  # GUI worker's validated+winner
+            v = v.item()               # metrics (2026-09-06 regression:
+        if isinstance(v, float) and v != v:   # ndarray killed finished
+            return None                         # searches at persist time)
+        return v
+
+    if validated:
+        with open(os.path.join(out_dir, "validated.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(_num(validated), fh)
+    if winner:
+        wcopy = {k: _num(v) for k, v in winner.items()
+                 if k not in ("chain", "calibrator")}
+        with open(os.path.join(out_dir, "winner.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(wcopy, fh, indent=2)
     if significance is not None:
         with open(os.path.join(out_dir, "significance.json"), "w",
                   encoding="utf-8") as fh:
@@ -1437,8 +1470,14 @@ def main(argv=None) -> int:
         persist_winner = {
             "arch": winner["arch"], "metrics": winner["metrics"],
             "threshold": None, "calibrator": None}
-    persist_run(out_dir, board, validated, persist_winner,
-                significance=sig)
+    try:
+        persist_run(out_dir, board, validated, persist_winner,
+                    significance=sig)
+    except Exception:
+        # persistence must never kill a COMPLETED search: the report,
+        # run meta and winner bundle below still get written (2026-09-06)
+        print(f"[3sse] WARNING: result persistence failed:\n"
+              f"{traceback.format_exc()}", flush=True)
     report = build_report(board, validated, baseline, significance=sig)
     print(report)
     with open(os.path.join(out_dir, "report.txt"), "w",

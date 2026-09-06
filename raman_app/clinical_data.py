@@ -141,7 +141,7 @@ def remember_data_root(path: str):
 def subject_key(patient_folder: str) -> str:
     """Normalize a patient folder name to a subject key.
 
-    Patient_15 / TDOC015 / 'TDOC015 Spectra pro'  ->  'S15'
+    Patient_15 / TDOC123 / 'TDOC123 Spectra pro'  ->  'S123'
     (same subject measured in both naming generations).  Folders without
     a number keep their uppercased name.
     """

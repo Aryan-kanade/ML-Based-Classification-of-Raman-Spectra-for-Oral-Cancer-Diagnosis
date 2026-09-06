@@ -405,6 +405,30 @@ def calibrate_wn(X: np.ndarray, wn: np.ndarray) -> np.ndarray:
     return out
 
 
+def align_to_grid(wavenumbers: np.ndarray, intensities: np.ndarray,
+                  grid: np.ndarray,
+                  params: PreprocessParams) -> np.ndarray:
+    """Interpolate one raw spectrum onto `grid` and apply the training-time
+    wavenumber calibration when the params request it.
+
+    Deploy-time twin of the calibrate→crop order in `preprocess_matrix`:
+    `predict_with_bundle` and `paired.reference_vector` must go through
+    this so a bundle trained with wn_calibrate=True receives identically
+    aligned features at prediction time.  (2026-09-06: the predict path
+    used to skip calibration entirely, feeding such models shifted,
+    out-of-distribution features — every prediction saturated to one
+    class.)"""
+    p = params.validate()
+    order = np.argsort(wavenumbers)
+    wn = np.asarray(wavenumbers)[order]
+    it = np.asarray(intensities)[order]
+    y = np.interp(np.asarray(grid, dtype=float), wn, it)
+    if p.wn_calibrate:
+        y = calibrate_wn(y.reshape(1, -1), np.asarray(grid,
+                                                      dtype=float))[0]
+    return y
+
+
 _STAGE_CACHE: dict = {}          # (spectrum-hash, stage-key) -> array
 _STAGE_CACHE_CAP = 6000          # ~6000 cached spectra-stages is plenty
 

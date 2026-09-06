@@ -104,8 +104,11 @@ def reference_vector(bundle: dict, paths: list[str]) -> np.ndarray:
     accs = []
     for p in paths:
         wn, it = ds.load_spectrum(p)
-        order = np.argsort(wn)
-        y = np.interp(grid, np.asarray(wn)[order], np.asarray(it)[order])
+        # align_to_grid (2026-09-06): apply the Phe-1003 calibration the
+        # model was trained with — training averages CALIBRATED normals
+        # (preprocess_matrix), so the deploy reference must match or every
+        # paired deviation goes out-of-distribution
+        y = pp.align_to_grid(wn, it, grid, params)
         accs.append(pp.preprocess_spectrum(y[m], params))
     if not accs:
         raise ValueError("No reference spectra could be loaded.")

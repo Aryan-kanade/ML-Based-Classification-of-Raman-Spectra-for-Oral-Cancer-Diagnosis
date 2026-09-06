@@ -1956,12 +1956,17 @@ def evaluate_pipeline(X_raw: np.ndarray, wn: np.ndarray, y: list[str],
 
 def learning_curve_by_groups(X, y_encoded, groups, estimator,
                              k: int = 5, seed: int = RANDOM_STATE,
-                             fractions=(0.25, 0.50, 0.75, 1.0)):
+                             fractions=(0.25, 0.50, 0.75, 1.0),
+                             cancel_check=None, progress=None):
     """
     Grouped-CV macro-F1 at a growing number of patients — the classic
     diagnostic for 'how much would more data be worth?'.
 
     Returns (n_patients_list, mean_f1_list, std_f1_list).
+    `cancel_check` (callable -> bool) aborts between folds with
+    RuntimeError('diagnostics cancelled by user'); `progress(msg)`
+    fires per fraction (2026-09-06: chain winners make this slow —
+    the user must see movement).
     """
     from sklearn.metrics import f1_score
 
@@ -1971,6 +1976,8 @@ def learning_curve_by_groups(X, y_encoded, groups, estimator,
     rng.shuffle(uniq)
     sizes, means, stds = [], [], []
     for frac in fractions:
+        if cancel_check is not None and cancel_check():
+            raise RuntimeError("diagnostics cancelled by user")
         take = uniq[:max(2, int(round(len(uniq) * frac)))]
         m = np.isin(groups, take)
         Xs, ys, gs = X[m], np.asarray(y_encoded)[m], groups[m]
@@ -1981,6 +1988,8 @@ def learning_curve_by_groups(X, y_encoded, groups, estimator,
                                     random_state=seed)
         f1s = []
         for tr, te in sgkf.split(Xs, ys, gs):
+            if cancel_check is not None and cancel_check():
+                raise RuntimeError("diagnostics cancelled by user")
             est = clone(estimator)
             est.fit(Xs[tr], ys[tr])
             f1s.append(f1_score(ys[te], est.predict(Xs[te]),
@@ -1988,6 +1997,9 @@ def learning_curve_by_groups(X, y_encoded, groups, estimator,
         sizes.append(len(take))
         means.append(float(np.mean(f1s)))
         stds.append(float(np.std(f1s)))
+        if progress is not None:
+            progress(f"{len(take)} patients: F1 "
+                     f"{means[-1]:.3f} ± {stds[-1]:.3f}")
     return sizes, means, stds
 
 
@@ -2012,7 +2024,7 @@ def _aggregate(res: ModelResult, fold_metrics, cm_total):
 # --------------------------------------------------------------------------
 def save_bundle(path: str, winner: ModelResult, wavenumbers: np.ndarray,
                 prep_params, dataset_name: str = "",
-                paired: bool = False, **extra) -> str:
+                paired: bool = False, pqn: bool = False, **extra) -> str:
     bundle = {
         "model_name": winner.name,
         "pipeline": winner.pipeline,
@@ -2021,8 +2033,16 @@ def save_bundle(path: str, winner: ModelResult, wavenumbers: np.ndarray,
         "wavenumbers": np.asarray(wavenumbers),
         "prep_params": prep_params,
         "macro": winner.macro,
+        # SimpleNamespace winners (3SSE dialog / Model Lab finalize)
+        # carry no per-class table — getattr, never attribute access
+        # (2026-09-06: bare winner.per_class broke saving 3SSE bundles)
+        "per_class": getattr(winner, "per_class", None),
         "dataset_name": dataset_name,
         "paired": paired,          # predict-time needs a normal reference
+        "pqn": pqn,                # Margin+PQN: PQN-normalize against the
+        #                          # reference BEFORE the deviation
+        #                          # (2026-09-06: the flag never existed and
+        #                          # every deploy path skipped the PQN step)
     }
     cal = extra.get("calibrator")
     if (cal and len(bundle["classes"]) == 2
@@ -2052,6 +2072,24 @@ def load_bundle(path: str) -> dict:
     return joblib.load(path)
 
 
+def _apply_reference(xc: np.ndarray, reference: np.ndarray,
+                     bundle: dict) -> np.ndarray:
+    """Finish a paired feature EXACTLY like training (paired.py):
+    PQN-normalize against the reference when the bundle was trained in
+    Margin+PQN mode, then subtract the reference.  Shared by the single
+    and batched predict paths so they cannot drift apart (2026-09-06:
+    the PQN step was silently skipped at deploy for every PQN bundle —
+    same failure class as the wn_calibrate mismatch)."""
+    from preprocessing import pqn_normalize
+    if len(reference) != len(xc):
+        raise ValueError(
+            f"paired reference has {len(reference)} points but "
+            f"the spectrum has {len(xc)} after preprocessing")
+    if bundle.get("pqn"):
+        xc = pqn_normalize(xc, reference)
+    return xc - reference
+
+
 def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
                         intensities: np.ndarray,
                         reference: np.ndarray | None = None) -> dict:
@@ -2063,7 +2101,7 @@ def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
     probabilities (and the stored threshold, which is saved in
     CALIBRATED units) are mapped through it first.
     """
-    from preprocessing import (PreprocessParams, crop_mask,
+    from preprocessing import (PreprocessParams, align_to_grid, crop_mask,
                                preprocess_spectrum)
 
     def _as_params(p):
@@ -2087,6 +2125,13 @@ def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
             f"missing region")
     y = np.interp(grid, wn, it)
     params = _as_params(bundle["prep_params"])
+    # 2026-09-06: bundles trained with wn_calibrate=True were predicted
+    # WITHOUT the Phe-1003 alignment — every deploy-time feature was
+    # shifted/out-of-distribution and predictions saturated to one class
+    # (all-Normal→Tumor).  align_to_grid mirrors preprocess_matrix's
+    # calibrate-then-crop order so deploy features match training.
+    if params.wn_calibrate:
+        y = align_to_grid(wn, it, grid, params)
     # apply the crop range exactly as at training time (the model expects
     # the cropped feature count); fall back to the uncropped vector for
     # bundles that were trained without cropping
@@ -2095,11 +2140,7 @@ def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
     for vec in ((y[m], y) if int(m.sum()) != len(grid) else (y,)):
         xc = preprocess_spectrum(vec, params)
         if reference is not None:
-            if len(reference) != len(xc):
-                raise ValueError(
-                    f"paired reference has {len(reference)} points but "
-                    f"the spectrum has {len(xc)} after preprocessing")
-            xc = xc - reference
+            xc = _apply_reference(xc, reference, bundle)
         try:
             # B3: winners that support test-time augmentation (the
             # 1D-CNN) predict from an augmented-view average — small
@@ -2120,6 +2161,12 @@ def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
         raise ValueError(
             "Spectrum length does not match the saved model "
             f"(expected {int(m.sum())} or {len(grid)} points).")
+    return _postprocess_prediction(bundle, proba)
+
+
+def _postprocess_prediction(bundle: dict, proba: np.ndarray) -> dict:
+    """Shared result assembly for single + batched prediction: Platt
+    mapping (binary), tuned-threshold class decision."""
     classes = list(bundle["classes"])
     cal = bundle.get("calibrator")
     if cal and len(classes) == 2:
@@ -2135,6 +2182,107 @@ def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
     return {"prediction": pred,
             "probabilities": {c: float(p) for c, p in zip(classes, proba, strict=True)},
             "threshold": thr}
+
+
+def _expected_features(bundle: dict) -> int | None:
+    """Feature count the fitted pipeline was trained on (walks chain
+    wrappers); None when undetectable."""
+    c = bundle["pipeline"]
+    for _ in range(4):
+        n = getattr(c, "n_features_in_", None)
+        if n:
+            return int(n)
+        nxt = getattr(c, "fitted_", None)
+        c = nxt[0] if isinstance(nxt, list) and nxt else None
+        if c is None:
+            return None
+    return None
+
+
+def predict_with_bundle_many(bundle: dict, spectra: list,
+                             references: list | None = None
+                             ) -> tuple[list, dict]:
+    """
+    Batched twin of predict_with_bundle: identical per-spectrum result
+    dicts, but ONE pipeline call per feature-length group instead of
+    one call per spectrum.  Exists because per-CALL cost dominates for
+    some voters (TabPFN ≈ seconds per call on CPU): file-by-file
+    prediction of a folder took minutes, batched takes seconds
+    (2026-09-06).  Per-row predictors are batch-equivalent (measured
+    max |Δp| ≈ 8e-8 on the TabPFN voter, i.e. float noise).
+
+    spectra: list of (wavenumbers, intensities); references: list of
+    preprocessed reference vectors or None per spectrum.  Returns
+    (results, errors): results[i] is the result dict or None; errors
+    maps i -> message for the failed rows.
+    """
+    from preprocessing import (PreprocessParams, align_to_grid, crop_mask,
+                               preprocess_spectrum)
+
+    def _as_params(p):
+        return p if hasattr(p, "validate") else PreprocessParams(**p)
+
+    spectra = list(spectra)
+    refs = list(references) if references is not None \
+        else [None] * len(spectra)
+    grid = np.asarray(bundle["wavenumbers"], dtype=float)
+    params = _as_params(bundle["prep_params"])
+    m = crop_mask(grid, params)
+    exp = _expected_features(bundle)
+    groups: dict[int, list[tuple[int, np.ndarray]]] = {}
+    errors: dict[int, str] = {}
+    lo, hi = float(grid.min()), float(grid.max())
+    for i, ((wn, it), ref) in enumerate(zip(spectra, refs, strict=True)):
+        try:
+            order = np.argsort(wn)
+            w, x = np.asarray(wn)[order], np.asarray(it)[order]
+            if float(w[0]) > lo + 1.0 or float(w[-1]) < hi - 1.0:
+                raise ValueError(
+                    f"spectrum axis {float(w[0]):.1f}-{float(w[-1]):.1f} "
+                    f"cm-1 does not cover the model's wavenumber range "
+                    f"{lo:.1f}-{hi:.1f} — interpolation would fabricate "
+                    f"the missing region")
+            y = np.interp(grid, w, x)
+            if params.wn_calibrate:
+                y = align_to_grid(w, x, grid, params)
+            for vec in ((y[m], y) if int(m.sum()) != len(grid) else (y,)):
+                xc = preprocess_spectrum(vec, params)
+                if ref is not None:
+                    xc = _apply_reference(xc, ref, bundle)
+                if exp is None or len(xc) == exp:
+                    groups.setdefault(len(xc), []).append((i, xc))
+                    break
+            else:
+                raise ValueError(
+                    "Spectrum length does not match the saved model "
+                    f"(expected {exp or int(m.sum())} points).")
+        except ValueError as exc:
+            errors[i] = str(exc)
+    results: list = [None] * len(spectra)
+    for _n, items in groups.items():
+        X = np.vstack([xc for _i, xc in items])
+        _clf = getattr(bundle["pipeline"], "steps", None)
+        _clf = _clf[-1][1] if _clf else bundle["pipeline"]
+        try:
+            if hasattr(_clf, "predict_proba_tta"):
+                proba = np.vstack([
+                    _clf.predict_proba_tta(X[r:r + 1])[0]
+                    for r in range(len(X))])
+            else:
+                proba = bundle["pipeline"].predict_proba(X)
+        except ValueError:
+            # unexpected length: fall back to the proven single path
+            for i, _xc in items:
+                try:
+                    results[i] = predict_with_bundle(
+                        bundle, spectra[i][0], spectra[i][1],
+                        reference=refs[i])
+                except ValueError as exc:
+                    errors[i] = str(exc)
+            continue
+        for (i, _xc), p in zip(items, proba, strict=True):
+            results[i] = _postprocess_prediction(bundle, p)
+    return results, errors
 
 
 def roc_points(y_true_encoded: np.ndarray, proba_pos: np.ndarray):
@@ -2240,7 +2388,10 @@ def winner_importance(winner_pipeline, X, y=None, wn=None) -> np.ndarray:
     if HAS_TORCH and isinstance(clf, CNN1DClassifier):
         return clf.grad_cam(X).mean(axis=0)
     if y is not None and wn is not None:
-        _, signed, _ = region_importance_shap(X, y, wn)
+        # groups slot is unused inside region_importance_shap; it used
+        # to receive wn positionally -> "missing 1 required positional
+        # argument: 'wn'" killed every Band-agreement run (2026-09-06)
+        _, signed, _ = region_importance_shap(X, y, None, wn)
         return np.abs(signed)
     return np.abs(np.asarray(X, dtype=float)).mean(axis=0)
 
@@ -2360,11 +2511,15 @@ def band_stability(profiles: list[np.ndarray], top_k: int = 20
 # --------------------------------------------------------------------------
 def export_model_card(path: str, winner, params=None,
                       dataset_name: str = "", k_folds: int = 5,
-                      repeats: int = 1, grouped: bool = True) -> str:
+                      repeats: int = 1, grouped: bool = True,
+                      nested: tuple[float, float] | None = None) -> str:
     """
     Publication/report-ready model card: development data, full
     preprocessing, CV protocol, discrimination + calibration, AUC power
     and the limitations boilerplate a TRIPOD+AI reviewer expects.
+    `nested` (mean, std) is the honest nested-evaluation macro-F1 —
+    printed next to the selection-optimistic CV number so the card
+    cannot overstate expected performance.
     """
     from dataclasses import asdict as _asdict
     w = winner
@@ -2388,6 +2543,27 @@ def export_model_card(path: str, winner, params=None,
     lines += ["## Performance (out-of-fold, pooled)"]
     try:
         lines.append(f"- macro-F1: **{w.macro_f1():.3f}**")
+    except Exception:
+        pass
+    if nested is not None:
+        lines.append(
+            f"- Honest (nested) macro-F1: **{nested[0]:.3f} ± "
+            f"{nested[1]:.3f}** — the number above is selection-"
+            "optimistic (winner chosen on the same CV that scores it); "
+            "expect the nested estimate on unseen patients")
+    try:
+        per = getattr(w, "per_class", None)
+        if per:
+            lines.append("- Per-class (out-of-fold, mean ± std):")
+
+            def _ms(m, k):
+                v = m.get(k)
+                return f"{v[0]:.3f} ± {v[1]:.3f}" if v else "–"
+            for cls in w.classes:
+                m = per.get(cls) or {}
+                lines.append(
+                    f"  - **{cls}**: sens {_ms(m, 'sens')} · "
+                    f"spec {_ms(m, 'spec')} · F1 {_ms(m, 'f1')}")
     except Exception:
         pass
     try:

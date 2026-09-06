@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import traceback
 from dataclasses import asdict
 from math import log10
@@ -299,8 +300,14 @@ class SeqSearchWorker(QtCore.QThread):
                     sequential.persist_run(
                         os.path.dirname(self.resume_path), board,
                         validated, winner, significance=sig)
-                except OSError:
-                    pass
+                except Exception:
+                    # persistence must NEVER fail a COMPLETED search
+                    # (2026-09-06: an ndarray-in-JSON TypeError here
+                    # surfaced as "The architecture search failed"
+                    # after everything had already finished) — log it,
+                    # keep going, the checkpoint cleanup + done still
+                    # run below
+                    FILE_LOG.exception("3SSE result persistence failed")
             # a completed run clears its checkpoint: the next Run starts
             # fresh instead of resuming stale triples
             if self.resume_path and os.path.isfile(self.resume_path):
@@ -335,7 +342,8 @@ class PredictWorker(QtCore.QThread):
         self.bundle, self.files, self.root = bundle, files, root
         self.manual_ref_dir = manual_ref_dir
 
-    def _auto_reference(self, path: str, cache: dict):
+    def _auto_reference(self, path: str, cache: dict,
+                        errors: dict | None = None):
         """
         Margin mode: build the reference from the SAME patient's
         Normal-class folder in the surrounding clinical tree. The tree
@@ -343,12 +351,16 @@ class PredictWorker(QtCore.QThread):
         selection works — whole tree, class folder, single/multiple
         patient folders, mixed file lists, any nesting depth.
         Returns None when no tree with a Normal side is found.
+        Every failure path records a human reason into `errors`
+        (file basename -> why) — the old blanket `except: pass` hid a
+        broken reference path behind silent None for days (2026-09-06).
         """
         import paired as paired_mod
         f_abs = os.path.abspath(path)
+        reason: str | None = None
         try:
             d = os.path.dirname(f_abs)
-            for _ in range(6):                 # deep trees: <=5 levels above
+            for _ in range(6):             # deep trees: <=5 levels above
                 try:
                     subs = os.listdir(d)
                 except OSError:
@@ -359,33 +371,57 @@ class PredictWorker(QtCore.QThread):
                 if normal_dirs:
                     parts = os.path.relpath(f_abs, d).replace(
                         "\\", "/").split("/")
-                    if len(parts) >= 2:
+                    if len(parts) < 2:
+                        reason = ("file is directly inside a tree root "
+                                  "(no patient folder)")
+                    else:
                         patient = parts[1]
                         key = (d, patient)
                         if key in cache:
                             if cache[key] is not None:
                                 return cache[key]
-                        else:
-                            for cls_dir in normal_dirs:
-                                ref_dir = os.path.join(d, cls_dir, patient)
-                                if not os.path.isdir(ref_dir):
-                                    continue
-                                ref_files = []
-                                for dp, _dns, fns in os.walk(ref_dir):
-                                    ref_files += [
-                                        os.path.join(dp, fn)
-                                        for fn in sorted(fns)
-                                        if fn.lower().endswith(
-                                            (".txt", ".dat", ".csv"))]
-                                if ref_files:
-                                    vec = paired_mod.reference_vector(
-                                        self.bundle, ref_files)
-                                    cache[key] = vec
-                                    return vec
-                            cache[key] = None
+                            reason = (f"no loadable Normal reference for "
+                                      f"patient '{patient}'")
+                            break
+                        broken = False
+                        for cls_dir in normal_dirs:
+                            ref_dir = os.path.join(d, cls_dir, patient)
+                            if not os.path.isdir(ref_dir):
+                                continue
+                            ref_files = []
+                            for dp, _dns, fns in os.walk(ref_dir):
+                                ref_files += [
+                                    os.path.join(dp, fn)
+                                    for fn in sorted(fns)
+                                    if fn.lower().endswith(
+                                        (".txt", ".dat", ".csv"))]
+                            if not ref_files:
+                                continue
+                            try:
+                                vec = paired_mod.reference_vector(
+                                    self.bundle, ref_files)
+                            except Exception as exc:
+                                reason = (
+                                    f"building the reference for patient "
+                                    f"'{patient}' failed: "
+                                    f"{type(exc).__name__}: {exc}")
+                                cache[key] = None
+                                broken = True
+                                break
+                            cache[key] = vec
+                            return vec
+                        if broken:
+                            break
+                        cache[key] = None
+                        reason = (f"no Normal/{patient} folder in the "
+                                  "clinical tree")
                 d = os.path.dirname(d)
-        except Exception:
-            pass
+        except Exception as exc:
+            reason = f"unexpected error: {type(exc).__name__}: {exc}"
+        if reason is None:
+            reason = "no clinical tree with a Normal side above the file"
+        if errors is not None:
+            errors.setdefault(os.path.basename(path), reason)
         return None
 
     def run(self):
@@ -393,6 +429,7 @@ class PredictWorker(QtCore.QThread):
             import paired as paired_mod
             reference = None
             ref_map: dict[str, object] = {}
+            ref_errors: dict[str, str] = {}
             if self.bundle.get("paired"):
                 if self.manual_ref_dir and os.path.isdir(
                         self.manual_ref_dir):
@@ -400,28 +437,81 @@ class PredictWorker(QtCore.QThread):
                         os.path.join(self.manual_ref_dir, fn)
                         for fn in sorted(os.listdir(self.manual_ref_dir))
                         if fn.lower().endswith((".txt", ".dat", ".csv"))]
+                    if not ref_files and any(
+                            os.path.isdir(os.path.join(self.manual_ref_dir,
+                                                       e))
+                            for e in os.listdir(self.manual_ref_dir)):
+                        # UX trap (2026-09-06): picking the tree ROOT as
+                        # the reference folder died on a generic "No
+                        # reference spectra could be loaded"
+                        raise ValueError(
+                            "The reference folder contains no spectrum "
+                            "FILES directly — it looks like a clinical "
+                            "tree root. Pick the folder that directly "
+                            "holds the patient's NORMAL spectra, or "
+                            "clear it to auto-find per-patient "
+                            "references.")
                     reference = paired_mod.reference_vector(self.bundle,
                                                             ref_files)
                 # else: per-patient auto references resolved per file
             rows, prob_list, spec_list, logs = [], [], [], []
             spec_wn = None
             ok_paths = []
-            first = True
             n = len(self.files)
+            # ---- phase 1: read files + resolve references -------------
+            loaded: list[tuple[str, np.ndarray, np.ndarray, object]] = []
             for i, path in enumerate(self.files, start=1):
                 self.progress.emit(
-                    int(100 * i / n),
-                    f"Predicting {i}/{n}: {os.path.basename(path)}")
+                    int(50 * i / n),
+                    f"Reading {i}/{n}: {os.path.basename(path)}")
                 ref = reference
                 if (ref is None and self.bundle.get("paired")
-                        and self.manual_ref_dir is None):
-                    ref = self._auto_reference(path, ref_map)
+                        and not self.manual_ref_dir):
+                    # falsy (None or "") — an empty-string manual ref
+                    # used to disable BOTH paths: no auto references, so
+                    # EVERY file was skipped (2026-09-06)
+                    ref = self._auto_reference(path, ref_map, ref_errors)
+                if ref is None and self.bundle.get("paired"):
+                    # margin model + no resolvable normal reference:
+                    # predicting on the ABSOLUTE spectrum feeds the model
+                    # a feature type it never saw in training (deviations
+                    # only) — 2026-09-06: this used to run silently and
+                    # produced confident garbage for unpaired patients
+                    logs.append(
+                        f"SKIPPED {os.path.basename(path)}: no normal "
+                        "reference found for this patient — margin-mode "
+                        "models need the patient's own Normal spectra "
+                        "(select the whole clinical tree or set the "
+                        "reference folder)")
+                    continue
                 try:
                     wn, it = dataset.load_spectrum(path)
-                    out = modeling.predict_with_bundle(self.bundle, wn, it,
-                                                       reference=ref)
                 except Exception as exc:
                     logs.append(f"Prediction failed for {path}: {exc}")
+                    continue
+                loaded.append((path, wn, it, ref))
+            # ---- phase 2: ONE batched pipeline call -------------------
+            # per-CALL cost dominates for some voters (TabPFN ≈ seconds
+            # per call) — file-by-file predict made a folder take
+            # minutes; batched it is seconds (2026-09-06)
+            results: list = []
+            if loaded:
+                self.progress.emit(
+                    60, f"Predicting {len(loaded)} spectra (batched)…")
+                results, batch_err = modeling.predict_with_bundle_many(
+                    self.bundle,
+                    [(wn, it) for _p, wn, it, _r in loaded],
+                    [r for _p, _w, _i, r in loaded])
+            else:
+                batch_err = {}
+            # ---- phase 3: assemble rows + previews --------------------
+            first = True
+            for idx, (path, wn, it, ref) in enumerate(loaded):
+                out = results[idx] if idx < len(results) else None
+                if out is None:
+                    logs.append(
+                        f"Prediction failed for {path}: "
+                        f"{batch_err.get(idx, 'unknown error')}")
                     continue
                 pmax = max(out["probabilities"].values())
                 rows.append((os.path.basename(path), out["prediction"],
@@ -431,6 +521,7 @@ class PredictWorker(QtCore.QThread):
                 ok_paths.append(path)
                 logs.append(f"{os.path.basename(path)} → "
                             f"{out['prediction']} (p={pmax:.3f})")
+                yproc = None
                 try:
                     grid = self.bundle["wavenumbers"]
                     y = np.interp(grid, wn, it)
@@ -445,12 +536,19 @@ class PredictWorker(QtCore.QThread):
                                 f"{exc}")
                 if first:
                     first = False
-                    if spec_list and spec_wn is not None:
+                    if spec_list and spec_wn is not None and yproc is not None:
                         self.first_plot.emit({
                             "wn": spec_wn, "raw": y[m], "proc": yproc,
                             "pred": out["prediction"],
                             "probs": out["probabilities"],
                             "title": os.path.basename(path)})
+            if ref_errors:
+                # surfaced reasons (2026-09-06): reference failures were
+                # silently swallowed for days — always leave a trace
+                first_err = next(iter(ref_errors.items()))
+                logs.append(
+                    f"Margin references: {len(ref_errors)} file(s) "
+                    f"unresolved — first: {first_err[0]}: {first_err[1]}")
             self.done.emit({
                 "rows": rows, "probs": prob_list, "spectra": spec_list,
                 "wn": spec_wn, "reference": reference,
@@ -828,6 +926,14 @@ class ArchTableModel(QtCore.QAbstractTableModel):
 class SeqResultsDialog(QtWidgets.QDialog):
     """3SSE results: ranking tabs per level + the overall winner."""
 
+    @staticmethod
+    def _num(m, key, default=float("nan")):
+        """Numeric metric or default — persisted JSON turns NaN into
+        null, so a bare .get can yield None and crash both formatting
+        and max() comparisons (2026-09-06)."""
+        v = (m or {}).get(key, default)
+        return v if isinstance(v, (int, float)) else default
+
     def __init__(self, payload, parent=None):
         super().__init__(parent)
         self.payload = payload
@@ -872,14 +978,24 @@ class SeqResultsDialog(QtWidgets.QDialog):
     def _export_csv(self):
         import csv as _csv
         idx = self._tabs.currentIndex()
-        if idx < 0 or idx >= len(self._tab_models):
-            QtWidgets.QMessageBox.information(
-                self, "Nothing to export",
-                "Select a ranking tab (Single / 2-Model / 3-Model) "
-                "first.")
+        if idx < 0:
             return
-        title, model = self._tab_models[idx]
-        default = f"3sse_{title.lower().replace(' ', '_')}.csv"
+        if idx < len(self._tab_models):
+            title, model = self._tab_models[idx]
+            default = f"3sse_{title.lower().replace(' ', '_')}.csv"
+            rows = model._rows
+        else:
+            # Overall Winner tab (2026-09-06: used to be refused with
+            # "Select a ranking tab first") — export the winner summary
+            # plus the nested best-per-level rows
+            title = "Overall Winner"
+            default = "3sse_overall_winner.csv"
+            rows = self._winner_rows()
+            if not rows:
+                QtWidgets.QMessageBox.information(
+                    self, "Nothing to export",
+                    "The winner tab has no winner data to export.")
+                return
         path, _f = QtWidgets.QFileDialog.getSaveFileName(
             self, "Export ranking to CSV",
             os.path.join(os.path.expanduser("~"), "Desktop", default),
@@ -890,27 +1006,74 @@ class SeqResultsDialog(QtWidgets.QDialog):
             with open(path, "w", newline="", encoding="utf-8-sig") as fh:
                 w = _csv.writer(fh)
                 w.writerow(ArchTableModel.HEADERS)
-                w.writerows(model._rows)
-            self.parent().log(f"3SSE ranking exported: {path} "
-                              f"({len(model._rows)} rows)") \
-                if self.parent() else None
+                w.writerows(rows)
+            (self.parent().log(f"3SSE ranking exported: {path} "
+                               f"({len(rows)} rows)")
+             if self.parent() else None)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(
                 self, "Export failed", f"Could not write CSV:\n{exc}")
 
+    def _winner_rows(self):
+        """Winner-tab CSV rows in the ranking-table format: the overall
+        winner, then the nested-validation best per level, plus a
+        significance note row when available."""
+        payload = self.payload
+        winner = payload.get("winner")
+        rows = []
+
+        def _row(kind, arch, m):
+            return ["—", kind, " → ".join(arch),
+                    f"{self._num(m, 'f1'):.3f}",
+                    f"{self._num(m, 'sens'):.3f}",
+                    f"{self._num(m, 'spec'):.3f}",
+                    f"{self._num(m, 'auc'):.3f}",
+                    f"{self._num(m, 'acc'):.3f}"]
+        if winner and winner.get("arch"):
+            rows.append(_row(f"Winner ({len(winner['arch'])}-Model)",
+                             winner["arch"], winner.get("metrics")))
+        validated = payload.get("validated") or {}
+        for level in (1, 2, 3):
+            cands = validated.get(level, [])
+            if not cands:
+                continue
+            b = max(cands, key=lambda e: self._num(e.get("metrics"),
+                                                   "f1", -1.0))
+            rows.append(_row(f"Nested best {level}-Model", b["arch"],
+                             b.get("metrics")))
+        sig = payload.get("significance")
+        if sig:
+            verdict = ("SIGNIFICANT" if sig["mcnemar_p"] < 0.05
+                       else "NOT significant")
+            rows.append(["", "Significance",
+                         f"vs {sig['baseline']} (F1 "
+                         f"{sig['baseline_f1']:.3f}): McNemar "
+                         f"p={sig['mcnemar_p']:.3f} — {verdict}",
+                         "", "", "", "", ""])
+        return rows
+
     @staticmethod
     def _rows(entries, level):
-        scored = sorted((e for e in entries if "metrics" in e),
-                        key=lambda e: (-e["metrics"]["f1"],
-                                       -e["metrics"]["sens"],
-                                       -e["metrics"]["spec"]))
+        # 2026-09-06: error-tolerant screening records failed archs as
+        # {"arch", "level", "error"} WITHOUT metrics — sorting those by
+        # f1 crashed the dialog with KeyError('f1') on saved runs
+        scored = sorted(
+            (e for e in entries
+             if isinstance(e.get("metrics"), dict)
+             and isinstance(e["metrics"].get("f1"), (int, float))),
+            key=lambda e: (-e["metrics"].get("f1", -1.0),
+                           -e["metrics"].get("sens", -1.0),
+                           -e["metrics"].get("spec", -1.0)))
         label = {1: "Single", 2: "2-Model", 3: "3-Model"}[level]
+        nan = float("nan")
+
+        def _m(e, k):
+            v = e["metrics"].get(k, nan)
+            return v if isinstance(v, (int, float)) else nan
         return [[i + 1, label, " → ".join(e["arch"]),
-                 f"{e['metrics']['f1']:.3f}",
-                 f"{e['metrics']['sens']:.3f}",
-                 f"{e['metrics']['spec']:.3f}",
-                 f"{e['metrics'].get('auc', float('nan')):.3f}",
-                 f"{e['metrics']['acc']:.3f}"]
+                 f"{_m(e, 'f1'):.3f}", f"{_m(e, 'sens'):.3f}",
+                 f"{_m(e, 'spec'):.3f}", f"{_m(e, 'auc'):.3f}",
+                 f"{_m(e, 'acc'):.3f}"]
                 for i, e in enumerate(scored)]
 
     def _winner_tab(self, payload):
@@ -922,12 +1085,15 @@ class SeqResultsDialog(QtWidgets.QDialog):
             if winner.get("metrics"):
                 m = winner["metrics"]
                 pills = QtWidgets.QHBoxLayout()
-                for label, val, tone in (
-                        ("Macro-F1", m["f1"], "green" if m["f1"] >= .7
-                         else "amber"),
-                        ("Sensitivity", m["sens"], "indigo"),
-                        ("Specificity", m["spec"], "indigo"),
-                        ("ROC-AUC", m.get("auc", float("nan")), "slate")):
+                for label, key, tone in (
+                        ("Macro-F1", "f1", None),
+                        ("Sensitivity", "sens", "indigo"),
+                        ("Specificity", "spec", "indigo"),
+                        ("ROC-AUC", "auc", "slate")):
+                    val = self._num(m, key)
+                    if tone is None:       # f1 pill is tone-conditional
+                        tone = ("green" if val == val and val >= .7
+                                else "amber")
                     pills.addWidget(uh.pill(
                         f"{label}: {val:.3f}" if val == val
                         else f"{label}: n/a", tone))
@@ -938,26 +1104,28 @@ class SeqResultsDialog(QtWidgets.QDialog):
             for level in (1, 2, 3):
                 cands = validated.get(level, [])
                 if cands:
-                    b = max(cands, key=lambda e: e["metrics"]["f1"])
-                    m = b["metrics"]
+                    b = max(cands, key=lambda e: self._num(
+                        e.get("metrics"), "f1", -1.0))
+                    m = b.get("metrics") or {}
                     lines.append(f"{level}-Model:  "
                                  f"{' → '.join(b['arch'])}")
-                    lines.append(f"          F1 {m['f1']:.3f} · "
-                                 f"sens {m['sens']:.3f} · "
-                                 f"spec {m['spec']:.3f} · "
-                                 f"AUC {m.get('auc', float('nan')):.3f} ·"
-                                 f" acc {m['acc']:.3f}")
+                    lines.append(f"          F1 {self._num(m, 'f1'):.3f} · "
+                                 f"sens {self._num(m, 'sens'):.3f} · "
+                                 f"spec {self._num(m, 'spec'):.3f} · "
+                                 f"AUC {self._num(m, 'auc'):.3f} ·"
+                                 f" acc {self._num(m, 'acc'):.3f}")
                     lines.append("")
             if winner:
-                m = winner["metrics"]
+                m = winner.get("metrics") or {}
                 lines += ["=" * 56,
                           f"OVERALL WINNER ({len(winner['arch'])}-Model):"
                           f" {' → '.join(winner['arch'])}",
-                          f"  Macro-F1 {m['f1']:.3f} · sensitivity "
-                          f"{m['sens']:.3f} · specificity "
-                          f"{m['spec']:.3f}",
-                          f"  ROC-AUC {m.get('auc', float('nan')):.3f} · "
-                          f"accuracy {m['acc']:.3f}",
+                          f"  Macro-F1 {self._num(m, 'f1'):.3f} · "
+                          f"sensitivity "
+                          f"{self._num(m, 'sens'):.3f} · specificity "
+                          f"{self._num(m, 'spec'):.3f}",
+                          f"  ROC-AUC {self._num(m, 'auc'):.3f} · "
+                          f"accuracy {self._num(m, 'acc'):.3f}",
                           "  Baseline (paired Extra Trees): F1 0.702 · "
                           "AUC 0.788"]
             sig = payload.get("significance")
@@ -1044,6 +1212,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._local_bands: list | None = None    # per-prediction SHAP rows
         self._band_stats: list | None = None     # FDR band statistics
         self._paired_mode = False              # last training mode
+        self._pqn_mode = False                 # last training used PQN
         self._honest_worker = None
         self._honest_result: dict | None = None
         self._honest_btn = None
@@ -1057,6 +1226,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._seq_worker: SeqSearchWorker | None = None
         self._seq_payload: dict | None = None
         self._analysis_worker: FuncWorker | None = None
+        self._analysis_label: str | None = None    # running job (busy box)
+        self._analysis_t0: float | None = None     # when it started
+        # cooperative cancellation for the loop-based diagnostics
+        # (learning curve / seeds / noise / LOPO take LONG on chain
+        # winners — the busy box offers Cancel, 2026-09-06)
+        self._diag_cancel = threading.Event()
         self._diag_panels: dict[str, tuple] = {}   # key -> (frame,canvas,cap)
         self._winner_row = None                    # cm+roc side-by-side row
         self._diag_queue: list = []                # serial auto-run chain
@@ -1131,9 +1306,16 @@ class MainWindow(QtWidgets.QMainWindow):
             with open(wpath, encoding="utf-8") as fh:
                 data = _json.load(fh)
             m = data.get("metrics") or {}
-            if not m or "f1" not in m:
+            # null f1 (NaN sanitized to None at persist time) must bail
+            # BEFORE any formatting, not half-way through the restore
+            if not isinstance(m.get("f1"), (int, float)):
                 return
-            classes = sorted(set(self.labels)) or ["Normal", "Tumor"]
+            # persisted classes first: sorted(labels) is empty at
+            # startup before any dataset loads — a 3-class run then
+            # crashed the cm reshape (2026-09-06)
+            classes = (data.get("classes")
+                       or sorted(set(self.labels))
+                       or ["Normal", "Tumor"])
             n_cls = len(classes)
             winner = modeling.ModelResult(
                 name="3SSE: " + " → ".join(data["arch"]),
@@ -1160,13 +1342,32 @@ class MainWindow(QtWidgets.QMainWindow):
             winner.threshold = data.get("threshold")
             # the fitted SequentialChain from the run's bundle
             bpath = os.path.join(folder, "winner.joblib")
+            want_name = "3SSE: " + " → ".join(data["arch"])
             if os.path.isfile(bpath):
                 try:
                     bundle = modeling.load_bundle(bpath)
-                    winner.pipeline = bundle["pipeline"]
-                    self._paired_mode = bool(bundle.get("paired"))
-                except Exception:
-                    pass
+                    if bundle.get("model_name") != want_name:
+                        # provenance check (2026-09-06): GUI '3SSE search'
+                        # runs persisted winner.json WITHOUT winner.joblib
+                        # — restart silently paired the NEW metrics with
+                        # the PREVIOUS run's stale pipeline
+                        self.log(
+                            "3SSE restore: winner.joblib is from a "
+                            f"DIFFERENT run ({bundle.get('model_name')!r}"
+                            f" != {want_name!r}) — pipeline not restored; "
+                            "retrain or re-run the search to get a "
+                            "deployable model")
+                    else:
+                        winner.pipeline = bundle["pipeline"]
+                        self._paired_mode = bool(bundle.get("paired"))
+                        self._pqn_mode = bool(bundle.get("pqn"))
+                except Exception as exc:
+                    self.log(f"3SSE restore: winner.joblib failed to load "
+                             f"({exc}) — pipeline not restored")
+            else:
+                self.log("3SSE restore: winner.joblib missing — metrics "
+                         "restored but no deployable pipeline (Save "
+                         "stays disabled); retrain to get one")
             # comparison table: the run's validated single models
             results = []
             vpath = os.path.join(folder, "validated.json")
@@ -1190,6 +1391,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if not results:
                 results = [winner]
             self.on_train_done(results + [winner], winner)
+            if winner.pipeline is None:
+                # metrics-only restore: saving would pickle pipeline=None
+                # and surface later as a confusing predict error
+                self.b_save.setEnabled(False)
             self.chain_flow.set_arch(data["arch"])
             # keep the 3SSE payload alive for the results dialog
             spath = os.path.join(folder, "significance.json")
@@ -2321,8 +2526,32 @@ class MainWindow(QtWidgets.QMainWindow):
         b_all.setToolTip(
             "Runs every diagnostic one after another — each result "
             "appears in its own panel below. The same battery also runs "
-            "automatically after every training.")
+            "automatically after every training (when the checkbox is "
+            "ticked).")
+        self.chk_auto_diags = QtWidgets.QCheckBox("Auto-run after training")
+        self.chk_auto_diags.setChecked(True)
+        self.chk_auto_diags.setToolTip(
+            "Run the diagnostics battery automatically when a training "
+            "finishes.\nUntick to skip it — run individual diagnostics "
+            "(or all) manually below.\nFor 3SSE chain winners the heavy "
+            "items (learning curve, seeds, noise, locked, LOPO) are "
+            "skipped automatically either way — they multiply the "
+            "chain's inner fits and run very long.")
         lc_row.addWidget(diag(b_all, self.run_all_diagnostics))
+        lc_row.addWidget(self.chk_auto_diags)
+        # always-reachable cancel for the running analysis (2026-09-06:
+        # the busy box's Cancel only appeared when clicking ANOTHER
+        # analysis button — during a long chain-winner diagnostic there
+        # was no visible way out)
+        self.b_cancel_analysis = QtWidgets.QPushButton("⏹ Cancel analysis")
+        self.b_cancel_analysis.setToolTip(
+            "Cooperatively cancels the running diagnostic at its next "
+            "fold / patient / seed boundary (the current step finishes "
+            "first). Single-fit steps (e.g. locked evaluation) simply "
+            "run to completion.")
+        self.b_cancel_analysis.setVisible(False)
+        self.b_cancel_analysis.clicked.connect(self._cancel_analysis)
+        lc_row.addWidget(self.b_cancel_analysis)
         lc_row.addWidget(diag(b_lc, self.run_learning_curve))
         lc_row.addWidget(diag(b_regions, self.run_region_importance))
         lc_row.addWidget(diag(b_band, self.run_band_agreement))
@@ -3116,15 +3345,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if (self.winner is not None
                 and getattr(self.winner, "threshold", None) is not None):
             t = float(self.winner.threshold)
-        elif (self.bundle is not None
+            cal = (self.bundle or {}).get("calibrator")
+            if cal and self._n_classes() == 2:
+                t = clin.apply_platt(t, cal)
+            return t
+        if (self.bundle is not None
                 and self.bundle.get("threshold") is not None):
-            t = float(self.bundle["threshold"])
-        else:
-            return None
-        cal = (self.bundle or {}).get("calibrator")
-        if cal and self._n_classes() == 2:
-            t = clin.apply_platt(t, cal)
-        return t
+            # save_bundle stores this threshold ALREADY Platt-mapped —
+            # applying the calibrator again double-shifts the cutoff
+            # (2026-09-06: 0.7505 was being displayed as 0.826)
+            return float(self.bundle["threshold"])
+        return None
 
     def _fill_prediction_table(self, table):
         """Shared Predict/Result table: file, predicted class, clinical
@@ -4807,8 +5038,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     "data_report.txt")
                 clinical_data.write_report(rep_path, rep)
                 self.log(f"Data hygiene report: {rep_path}")
-            except Exception:
-                pass
+            except Exception as exc:
+                self.log(f"Data hygiene report NOT written: {exc}")
             self._install_dataset(cd.spectra, source_folder=folder,
                                   quiet=quiet, groups=cd.groups,
                                   spike_flags=cd.flagged)
@@ -5236,8 +5467,10 @@ class MainWindow(QtWidgets.QMainWindow):
                                              best["mean_f1"],
                                              best["model"])
             self.log(f"Saved best preprocessing: {path}")
-        except Exception:
-            pass
+        except Exception as exc:
+            # silent skip made users believe the tuned preprocessing
+            # was persisted when it wasn't (2026-09-06)
+            self.log(f"Best preprocessing NOT saved: {exc}")
 
     def on_optimize_failed(self, tb: str):
         self.optimize_status.setText("Optimization failed — see the log.")
@@ -5521,15 +5754,49 @@ class MainWindow(QtWidgets.QMainWindow):
                 # 3SSE winner" with mismatched artifacts.
                 out_dir = os.path.join(APP_DIR, "study_run_lab")
                 os.makedirs(out_dir, exist_ok=True)
+                # persist the rankings/winner too, so 'View saved 3SSE'
+                # can reopen this Lab run (2026-09-06)
+                self._persist_3sse_payload(out_dir, {
+                    "board": payload.get("board"),
+                    "validated": payload.get("validated"),
+                    "winner": fin})
                 modeling.save_bundle(
                     os.path.join(out_dir, "winner.joblib"), winner_ns,
                     self.grid, payload["params"], dataset_name="model-lab",
-                    paired=True,
+                    paired=True, pqn=bool(payload.get("use_pqn")),
                     **({"calibrator": fin["calibrator"]}
                        if fin["calibrator"] else {}))
                 self.log(f"Model Lab bundle: {out_dir}/winner.joblib")
             except Exception as exc:
                 self.log(f"Model Lab bundle not saved: {exc}")
+
+    def _is_chain_winner(self) -> bool:
+        """True when the installed winner is a 3SSE chain (Averaged /
+        Sequential) — every diagnostic that refits it multiplies the
+        chain's inner OOF fits (~45 pipeline fits per refit), which
+        makes the full battery take a very long time."""
+        try:
+            import sequential as _seq
+            return isinstance(self.winner.pipeline,
+                              (_seq.AveragedChain, _seq.SequentialChain))
+        except Exception:
+            return False
+
+    def _confirm_heavy_diag(self, name: str) -> bool:
+        """Heads-up before MANUALLY starting a refit-heavy diagnostic on
+        a chain winner (the auto-chain skips these; a manual click is
+        the user's call — just make the cost explicit). Returns True
+        when safe/fast OR the user confirmed."""
+        if not self._is_chain_winner():
+            return True
+        ret = QtWidgets.QMessageBox.question(
+            self, "Heavy diagnostic on a chain winner",
+            f"'{name}' refits the 3SSE chain winner many times "
+            f"(every refit rebuilds its inner stacking layers) and can "
+            f"take several minutes to much longer.\n\n"
+            f"Continue? You can cancel at any time with the "
+            f"'⏹ Cancel analysis' button.")
+        return ret == QtWidgets.QMessageBox.StandardButton.Yes
 
     def run_all_diagnostics(self):
         """
@@ -5538,6 +5805,9 @@ class MainWindow(QtWidgets.QMainWindow):
         concurrent worker pools from several QThreads are a native-
         crash race on Windows (gotcha #16).  Fast jobs first so cards
         appear quickly; the heaviest (LOPO, honest) run last.
+        For CHAIN winners the heavy refit-based items are skipped
+        automatically (they run VERY long — hours for LOPO); they stay
+        available as manual, cancelable buttons (2026-09-06).
         """
         if (self._diag_queue
                 or (self._analysis_worker is not None
@@ -5549,18 +5819,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Diagnostics are still running — they continue one by "
                 "one below.")
             return
-        self._diag_queue = [self.run_region_importance,
-                            self.run_band_agreement,
-                            self.run_learning_curve,
-                            self.run_seed_stability,
-                            self.run_noise_check,
-                            lambda: self.run_locked_eval(auto=True),
-                            self.run_lopo,
-                            self.run_honest_check]        # heaviest last
-        self.log("Auto-running all diagnostics (regions, learning "
-                 "curve, seeds, noise, locked, LOPO, honest) — results "
-                 "appear one by one below.")
-        self.train_status.setText("Running all diagnostics — results "
+        self._diag_cancel.clear()      # fresh chain: no stale cancels
+        queue = [self.run_region_importance,
+                 self.run_band_agreement]
+        if self._is_chain_winner():
+            self.log("Chain winner detected: learning curve / seeds / "
+                     "noise / locked / LOPO multiply the chain's inner "
+                     "fits and run very long — auto-run skips them. "
+                     "Start them manually when you have time (the busy "
+                     "dialog offers Cancel).")
+        else:
+            queue += [self.run_learning_curve,
+                      self.run_seed_stability,
+                      self.run_noise_check,
+                      lambda: self.run_locked_eval(auto=True),
+                      self.run_lopo]
+        queue.append(self.run_honest_check)   # winner-independent, ~20 s
+        self._diag_queue = queue
+        self.log("Auto-running diagnostics (regions, band agreement"
+                 + (", learning curve, seeds, noise, locked, LOPO"
+                    if len(queue) > 3 else "")
+                 + ", honest) — results appear one by one below.")
+        self.train_status.setText("Running diagnostics — results "
                                   "appear one by one below…")
         self._pop_diag_queue()
 
@@ -5578,30 +5858,99 @@ class MainWindow(QtWidgets.QMainWindow):
                      or not self._analysis_worker.isRunning())):
             self._pop_diag_queue()    # guard-dialog runner: next!
 
+    def _cancel_analysis(self):
+        """Visible ⏹ button: request cooperative cancellation of the
+        running analysis (loop-based diagnostics check it at their next
+        boundary)."""
+        self._diag_cancel.set()
+        msg = ("Cancellation requested — the current step finishes, "
+               "then the diagnostic stops.")
+        self.statusBar().showMessage(msg)
+        self.train_status.setText(msg)
+        self.log(f"Analysis cancellation requested by user (running: "
+                 f"{self._analysis_label}).")
+
+    def _analysis_busy_box(self):
+        """Busy dialog that NAMES the running analysis, shows elapsed
+        time and offers cooperative Cancel (2026-09-06: the old
+        information-only box left users stuck for the full length of
+        LOPO on 3-seed chain winners — potentially hours)."""
+        label = self._analysis_label or "An analysis"
+        mins = ((time.time() - self._analysis_t0) / 60
+                if self._analysis_t0 else 0.0)
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Information)
+        box.setWindowTitle("Busy")
+        box.setText(f"\"{label}\" is still running "
+                    f"({mins:.0f} min so far).")
+        box.setInformativeText(
+            "Wait for it, or cancel — cancellation takes effect at the "
+            "next fold / patient / seed boundary (the current step "
+            "finishes first).")
+        b_cancel = box.addButton("Cancel it",
+                                 QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Keep waiting",
+                      QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.exec()
+        if box.clickedButton() is b_cancel:
+            self._diag_cancel.set()
+            self.statusBar().showMessage(
+                "Cancellation requested — finishing the current step…")
+            self.log("Analysis cancellation requested by user "
+                     f"(running: {label}).")
+
+    def _analysis_progress(self, msg: str):
+        """GUI-thread sink for worker progress lines: name the running
+        analysis so long diagnostics (chain winners!) visibly move
+        instead of showing a frozen 'computing…' (2026-09-06)."""
+        label = self._analysis_label or "Analysis"
+        text = f"{label} — {msg}"
+        self.train_status.setText(text)
+        self.statusBar().showMessage(text)
+
+    def _emit_progress(self, msg: str):
+        """Worker-thread side: forward a progress line through the
+        current analysis worker's Qt signal (thread-safe emit)."""
+        w = self._analysis_worker
+        if w is not None:
+            w.progress.emit(str(msg))
+
     def _run_async(self, label: str, fn, on_done):
         """
         Run fn() on a worker thread; on_done(result) back on the UI
         thread. The triggering button (self.sender()) is disabled while
         running so a double-click cannot queue a second job behind a
-        frozen UI. Failures land in a dialog + session.log.
+        frozen UI. Failures land in a dialog + session.log; cooperative
+        cancellation (busy-box Cancel / the ⏹ button) aborts loop-based
+        diagnostics at their next boundary without an error dialog.
         """
         if (self._analysis_worker is not None
                 and self._analysis_worker.isRunning()):
-            QtWidgets.QMessageBox.information(
-                self, "Busy",
-                "Another analysis is still running — wait for it to "
-                "finish.")
+            self._analysis_busy_box()
             return
         btn = self.sender()
         has_btn = isinstance(btn, QtWidgets.QAbstractButton)
         if has_btn:
             btn.setEnabled(False)
         self.train_status.setText(f"{label}…")
+        self._analysis_label = label
+        self._analysis_t0 = time.time()
+        self._diag_cancel.clear()   # stale cancels must not kill new jobs
         worker = FuncWorker(fn)
+        worker.progress.connect(self._analysis_progress)
+        if getattr(self, "b_cancel_analysis", None) is not None:
+            self.b_cancel_analysis.setVisible(True)
+
+        def _idle():
+            self._analysis_label = None
+            self._analysis_t0 = None
+            if getattr(self, "b_cancel_analysis", None) is not None:
+                self.b_cancel_analysis.setVisible(False)
 
         def finish(result):
             worker.wait(10000)   # thread fully done before the chain
             self._analysis_worker = None   # reuses / GCs this worker
+            _idle()
             if has_btn:
                 btn.setEnabled(True)
             try:
@@ -5617,14 +5966,19 @@ class MainWindow(QtWidgets.QMainWindow):
         def fail(tb: str):
             worker.wait(10000)   # thread fully done before the chain
             self._analysis_worker = None
+            _idle()
             if has_btn:
                 btn.setEnabled(True)
-            self.train_status.setText(f"{label} failed.")
-            self.log(f"{label} failed:\n{tb}")
-            QtWidgets.QMessageBox.warning(
-                self, f"{label} failed",
-                f"{label} failed.\n\nTechnical details are in "
-                "session.log next to the app.")
+            if "cancelled by user" in tb:
+                self.train_status.setText(f"{label} cancelled.")
+                self.log(f"{label} cancelled by user.")
+            else:
+                self.train_status.setText(f"{label} failed.")
+                self.log(f"{label} failed:\n{tb}")
+                QtWidgets.QMessageBox.warning(
+                    self, f"{label} failed",
+                    f"{label} failed.\n\nTechnical details are in "
+                    "session.log next to the app.")
             self._pop_diag_queue()          # serial chain continues
 
         worker.done.connect(finish)
@@ -5639,6 +5993,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "Train first",
                 "Train a model first — the learning curve uses the "
                 "winning pipeline.")
+            return
+        if not self._confirm_heavy_diag("Learning curve"):
             return
         X, yy, gg = self._lc_data
         if gg is None:
@@ -5655,7 +6011,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def fn():
             return modeling.learning_curve_by_groups(
-                X, ye, gg, winner_pl, k=k, seed=seed)
+                X, ye, gg, winner_pl, k=k, seed=seed,
+                cancel_check=self._diag_cancel.is_set,
+                progress=self._emit_progress)
 
         def done(res):
             sizes, means, stds = res
@@ -6055,6 +6413,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.b_honest_btn.setEnabled(True)
         if self._honest_worker is not None:
             self._honest_worker.wait(10000)  # done before chain reuses it
+            self._honest_worker = None    # 2026-09-06: waited but never
+            #                             cleared — kept a dead QThread
+            #                             alive for the whole session
         try:
             optimistic = (self.winner.macro_f1() if self.winner
                           else float("nan"))
@@ -6089,6 +6450,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.b_honest_btn.setEnabled(True)
         if self._honest_worker is not None:
             self._honest_worker.wait(10000)  # done before chain reuses it
+            self._honest_worker = None       # clear on failure too
         self.log(f"Honest evaluation failed:\n{tb}")
         self.train_status.setText("Honest evaluation failed — see log.")
         QtWidgets.QMessageBox.warning(
@@ -6261,6 +6623,8 @@ class MainWindow(QtWidgets.QMainWindow):
         never saw them (fixed winner parameters, no re-tuning)."""
         if not self._deep_guard():
             return
+        if not self._confirm_heavy_diag("Leave-one-patient-out"):
+            return
         from sklearn.base import clone
         X, yy, gg = self._lc_data
         winner_pl, winner_classes, seed = (self.winner.pipeline,
@@ -6270,7 +6634,8 @@ class MainWindow(QtWidgets.QMainWindow):
         def fn():
             return sstats.lopo_evaluate(
                 X, yy, gg, clone(winner_pl), {}, winner_classes,
-                seed=seed)
+                seed=seed, cancel_check=self._diag_cancel.is_set,
+                progress=self._emit_progress)
 
         def done(out):
             self._lopo_result = out
@@ -6318,6 +6683,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """How much do the winner's numbers move just by re-running?"""
         if not self._deep_guard():
             return
+        if not self._confirm_heavy_diag("Seed stability"):
+            return
         from sklearn.base import clone
         X, yy, gg = self._lc_data
         winner_pl, winner_classes, k = (self.winner.pipeline,
@@ -6327,7 +6694,9 @@ class MainWindow(QtWidgets.QMainWindow):
         def fn():
             return sstats.seed_stability(
                 X, yy, gg, clone(winner_pl), {}, winner_classes,
-                seeds=(0, 1, 2, 3, 4), k=k)
+                seeds=(0, 1, 2, 3, 4), k=k,
+                cancel_check=self._diag_cancel.is_set,
+                progress=self._emit_progress)
 
         def done(f1s):
             self._seed_result = f1s
@@ -6367,6 +6736,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Calibrated measurement noise at inference: F1 degradation."""
         if not self._deep_guard():
             return
+        if not self._confirm_heavy_diag("Noise robustness"):
+            return
         from sklearn.base import clone
         X, yy, gg = self._lc_data
         winner_pl, winner_classes, k, seed = (
@@ -6376,7 +6747,9 @@ class MainWindow(QtWidgets.QMainWindow):
         def fn():
             return sstats.noise_robustness(
                 X, yy, gg, clone(winner_pl), {}, winner_classes,
-                levels=(0.0, 0.01, 0.02, 0.05), k=k, seed=seed)
+                levels=(0.0, 0.01, 0.02, 0.05), k=k, seed=seed,
+                cancel_check=self._diag_cancel.is_set,
+                progress=self._emit_progress)
 
         def done(curve):
             self._noise_result = curve
@@ -6615,6 +6988,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 X, yy, gg = pd_.X, pd_.y, pd_.groups
                 self._lc_wn = pd_.wn
                 self._paired_mode = True
+                # PQN must travel to the SAVED bundle: predict-time
+                # PQN-normalizes against the reference before the
+                # deviation (2026-09-06 — the flag never existed)
+                self._pqn_mode = (mode_kind == "paired-pqn")
                 self.log(
                     f"Paired-reference mode"
                     f"{' + PQN' if mode_kind == 'paired-pqn' else ''}: "
@@ -6626,6 +7003,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 X = self.get_processed_X()
                 X = X[keep]
                 self._paired_mode = False
+                self._pqn_mode = False
         except Exception as exc:
             self.b_train.setEnabled(True)
             self.b_model_lab.setEnabled(True)
@@ -6723,10 +7101,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_train_done_then_diags(self, results, winner):
         """Training finished → normal completion handling, then the
-        whole diagnostics battery runs automatically (each result in
-        its own panel — no clicking)."""
+        diagnostics battery runs automatically (each result in its own
+        panel — no clicking) unless the user opted out with the
+        'Auto-run after training' checkbox (2026-09-06)."""
         self.on_train_done(results, winner)
         self.report_uncertainty_stats()
+        if (getattr(self, "chk_auto_diags", None) is not None
+                and not self.chk_auto_diags.isChecked()):
+            self.log("Auto-diagnostics skipped (checkbox unticked) — "
+                     "run individual diagnostics or 'Run all "
+                     "diagnostics' manually below.")
+            return
         self.run_all_diagnostics()
 
     def on_train_progress(self, pct: int, msg: str):
@@ -6985,36 +7370,144 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seq_phase.setText(f"Phase: screening · ETA "
                                f"{eta / 60:.0f} min")
 
+    @staticmethod
+    def _json_safe(v):
+        """Recursively convert numpy/tuples into JSON-native types."""
+        if isinstance(v, dict):
+            return {str(k): MainWindow._json_safe(x)
+                    for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [MainWindow._json_safe(x) for x in v]
+        if isinstance(v, np.generic):
+            return v.item()
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        if isinstance(v, float) and v != v:
+            return None
+        return v
+
+    @classmethod
+    def _persist_3sse_payload(cls, out_dir: str, payload: dict):
+        """Write the 3SSE dialog payload (screening.jsonl / validated.json
+        / winner.json / significance.json) so 'View saved 3SSE' can
+        reopen this run after a restart.  GUI-driven searches never
+        persisted these artifacts (only the CLI did), so the viewer
+        always answered 'no completed search found' (2026-09-06).
+        Missing sections REMOVE their stale file — a no-winner run must
+        not leave the previous run's winner.json behind (mixed-
+        generation artifacts); failures are logged, never swallowed."""
+        import json as _json
+        import logging as _logging
+
+        def _remove(name):
+            try:
+                os.remove(os.path.join(out_dir, name))
+            except OSError:
+                pass
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            board = payload.get("board") or {}
+            with open(os.path.join(out_dir, "screening.jsonl"), "w",
+                      encoding="utf-8") as fh:
+                for key in ("singles", "pairs", "triples"):
+                    for e in board.get(key, []):
+                        rec = {"arch": list(e["arch"]),
+                               "level": e["level"]}
+                        rec.update(cls._json_safe(e.get("metrics") or {}))
+                        if "error" in e:      # failed arch (tolerant
+                            rec["error"] = str(e["error"])   # screening)
+                        fh.write(_json.dumps(rec) + "\n")
+            validated = payload.get("validated") or {}
+            if validated:
+                with open(os.path.join(out_dir, "validated.json"), "w",
+                          encoding="utf-8") as fh:
+                    _json.dump({str(k): cls._json_safe(v)
+                                for k, v in validated.items()}, fh)
+            else:
+                _remove("validated.json")
+            winner = payload.get("winner")
+            if winner:
+                wcopy = {k: cls._json_safe(v) for k, v in winner.items()
+                         if k not in ("chain", "calibrator")}
+                with open(os.path.join(out_dir, "winner.json"), "w",
+                          encoding="utf-8") as fh:
+                    _json.dump(wcopy, fh)
+            else:
+                _remove("winner.json")
+            sig = payload.get("significance")
+            if sig:
+                with open(os.path.join(out_dir, "significance.json"),
+                          "w", encoding="utf-8") as fh:
+                    _json.dump(cls._json_safe(sig), fh)
+            else:
+                _remove("significance.json")
+        except Exception:
+            # persistence must never break the result flow — but it
+            # must not be SILENT either (the _auto_reference lesson)
+            _logging.getLogger("raman_app.session").exception(
+                "3SSE payload persistence failed for %s", out_dir)
+
+    @staticmethod
+    def _latest_3sse_run_dir():
+        """Most recent 3SSE run directory (by artifact mtime) among
+        study_run_3sse ('3SSE search' mode + CLI) and study_run_lab
+        (Model Lab).  The viewer used to know only study_run_3sse, so
+        Lab runs were invisible to 'View saved 3SSE' (2026-09-06)."""
+        best, best_t = None, -1.0
+        for d in ("study_run_3sse", "study_run_lab"):
+            folder = os.path.join(APP_DIR, d)
+            for art in ("screening.jsonl", "winner.json"):
+                p = os.path.join(folder, art)
+                if os.path.isfile(p):
+                    t = os.path.getmtime(p)
+                    if t > best_t:
+                        best, best_t = folder, t
+                    break
+        return best
+
     def view_saved_3sse(self):
         """Open the last completed 3SSE run's rankings without re-running
-        (reads study_run_3sse: screening.jsonl + validated.json +
-        winner.json + report.txt)."""
+        (reads the most recent run dir: screening.jsonl + validated.json
+        + winner.json + report.txt)."""
         import json as _json
-        folder = os.path.join(APP_DIR, "study_run_3sse")
-        screening = os.path.join(folder, "screening.jsonl")
-        if not os.path.isfile(screening):
+        folder = self._latest_3sse_run_dir()
+        if folder is None:
             QtWidgets.QMessageBox.information(
                 self, "No saved 3SSE run",
                 "No completed architecture search found in "
-                "study_run_3sse/.\n\nPick a '3SSE search' training mode "
-                "and press Start training, or run sequential.py from "
-                "the command line first.")
+                "study_run_3sse/ or study_run_lab/.\n\nRun a '3SSE "
+                "search' / Model Lab training first (GUI runs now save "
+                "their results automatically), or run sequential.py "
+                "from the command line.")
             return
+        screening = os.path.join(folder, "screening.jsonl")
         board = {"singles": [], "pairs": [], "triples": [], "total": 0,
                  "pruned": 0}
         key = {1: "singles", 2: "pairs", 3: "triples"}
-        with open(screening, encoding="utf-8") as fh:
-            for line in fh:
-                try:
-                    rec = _json.loads(line)
-                except _json.JSONDecodeError:
-                    continue
-                board[key[rec["level"]]].append(
-                    {"arch": tuple(rec["arch"]), "level": rec["level"],
-                     "metrics": {k: v for k, v in rec.items()
-                                 if k not in ("arch", "level")}})
-        board["total"] = (len(board["singles"]) + len(board["pairs"])
-                          + len(board["triples"]))
+        if os.path.isfile(screening):
+            with open(screening, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        rec = _json.loads(line)
+                        level = rec["level"]
+                        arch = tuple(rec["arch"])
+                    except (_json.JSONDecodeError, KeyError,
+                            TypeError):
+                        continue      # malformed line: skip, never crash
+                    metrics = {k: v for k, v in rec.items()
+                               if k not in ("arch", "level", "error")}
+                    entry = {"arch": arch,
+                             "level": level,
+                             # error-tolerant screening stores failed
+                             # archs WITHOUT metrics — keep them out of
+                             # the ranking instead of crashing on f1
+                             # (2026-09-06), but surface the reason
+                             "metrics": metrics if "f1" in metrics else {},
+                             **({"error": rec["error"]}
+                                if "error" in rec else {})}
+                    board[key[level]].append(entry)
+            board["total"] = (len(board["singles"]) + len(board["pairs"])
+                              + len(board["triples"]))
         payload = {"board": board, "validated": {}, "winner": None}
         vpath = os.path.join(folder, "validated.json")
         if os.path.isfile(vpath):
@@ -7051,7 +7544,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.show()
         self.log("Opened saved 3SSE results "
                  f"({board['total']} architectures) from "
-                 "study_run_3sse/")
+                 f"{os.path.basename(folder)}/")
 
     def on_seq_progress(self, pct: int, msg: str):
         if pct >= 0:
@@ -7076,6 +7569,10 @@ class MainWindow(QtWidgets.QMainWindow):
         n_pruned = board.get("pruned", 0)
         self.log(f"3SSE search done: {board['total']} architectures "
                  f"({n_pruned} pruned by the sound early-abandon bound)")
+        # persist rankings/winner so 'View saved 3SSE' works after a
+        # restart (GUI runs never wrote these before — 2026-09-06)
+        self._persist_3sse_payload(os.path.join(APP_DIR, "study_run_3sse"),
+                                   payload)
         dlg = SeqResultsDialog(payload, parent=self)
         dlg.setModal(False)
         dlg.show()
@@ -7127,6 +7624,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 results.append(r)
         self.on_train_done(results + [winner], winner)
         self.chain_flow.set_arch(fin["arch"])
+        # persist the deployable pipeline next to the metrics so the
+        # startup restore pairs THIS run's winner.json with THIS run's
+        # chain (2026-09-06: json-only persistence made restarts load
+        # the PREVIOUS run's stale winner.joblib)
+        try:
+            out_dir = os.path.join(APP_DIR, "study_run_3sse")
+            os.makedirs(out_dir, exist_ok=True)
+            modeling.save_bundle(
+                os.path.join(out_dir, "winner.joblib"), winner,
+                self.grid,
+                self._params_at_train or self.read_params().validate(),
+                dataset_name=self._source_folder or "",
+                paired=self._paired_mode, pqn=self._pqn_mode,
+                **({"calibrator": fin["calibrator"]}
+                   if fin.get("calibrator") else {}))
+            self.log(f"3SSE winner bundle: {out_dir}/winner.joblib")
+        except Exception as exc:
+            self.log(f"3SSE winner bundle not saved: {exc}")
         self.train_status.setText(
             f"3SSE winner installed: {' → '.join(fin['arch'])} "
             f"(nested F1 {m['f1']:.3f}) — Save it, then go to Predict. "
@@ -7182,7 +7697,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 path, winner_ns, self.grid,
                 self.read_params().validate(),
                 dataset_name=self._source_folder or "",
-                paired=self._paired_mode, **extras)
+                paired=self._paired_mode, pqn=self._pqn_mode, **extras)
             self.settings["last_model"] = path
             uh.save_settings(self.settings)
             self._set_bundle(modeling.load_bundle(path), path)
@@ -7323,13 +7838,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 lo_o, hi_o = self._op_points_now()
             op_extra = ((lo_o, hi_o)
                         if lo_o is not None and hi_o is not None else None)
+            # honest nested estimate from the latest Honest-check run
+            # (mean, std) — persisted in the bundle and printed on the
+            # card next to the optimistic number
+            nested = None
+            if self._honest_result is not None:
+                try:
+                    nested = (float(self._honest_result["mean_f1"]),
+                              float(self._honest_result.get("std_f1", 0.0)))
+                except (KeyError, TypeError, ValueError):
+                    nested = None
             modeling.save_bundle(path, self.winner, self.grid,
                                  self.read_params().validate(),
                                  dataset_name=self.folder_edit.text(),
                                  paired=self._paired_mode,
+                                 pqn=self._pqn_mode,
                                  region_bands=self._region_bands,
                                  op_points=op_extra,
-                                 calibrator=calibrator)
+                                 calibrator=calibrator,
+                                 nested_honest_f1=nested)
             card = os.path.splitext(path)[0] + "_card.md"
             try:
                 # report the protocol that ACTUALLY ran (2026-09-05):
@@ -7343,7 +7870,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.read_params().validate(),
                     dataset_name=self.folder_edit.text(),
                     k_folds=self.spin_folds.value(),
-                    repeats=_reps, grouped=_grp)
+                    repeats=_reps, grouped=_grp,
+                    nested=nested)
                 self.log(f"Model card: {card}")
             except Exception:
                 self.log("Model card export failed:\n"
@@ -7496,7 +8024,10 @@ class MainWindow(QtWidgets.QMainWindow):
             files[0])
         manual_ref = None
         if self.bundle.get("paired"):
-            manual_ref = self.ref_path_edit.text().strip()
+            # empty edit must become None: the worker enables per-patient
+            # AUTO references only when manual_ref_dir is falsy — an ""
+            # used to disable BOTH paths and skip every file (2026-09-06)
+            manual_ref = self.ref_path_edit.text().strip() or None
             if manual_ref and not os.path.isdir(manual_ref):
                 manual_ref = None
             if not manual_ref:
@@ -7606,6 +8137,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_predict.setEnabled(True)
         for line in payload["logs"]:
             self.log(line)
+        n_skip = sum(1 for line in payload["logs"]
+                     if line.startswith("SKIPPED "))
         if payload["n_auto_refs"]:
             self.log(f"Margin mode: built {payload['n_auto_refs']} "
                      "per-patient normal references from the clinical "
@@ -7620,10 +8153,26 @@ class MainWindow(QtWidgets.QMainWindow):
             payload["ok_paths"], rows)
         self._fill_prediction_table(self.pred_table)
         if not rows:
-            QtWidgets.QMessageBox.warning(
-                self, "Nothing predicted",
-                "None of the selected files could be read as spectra.")
+            if n_skip:
+                QtWidgets.QMessageBox.warning(
+                    self, "No predictions — missing references",
+                    "None of the files could be predicted: this is a "
+                    "MARGIN-mode model and no patient-specific NORMAL "
+                    "reference was found.\n\nSelect the whole clinical "
+                    "tree (<root>/<class>/<patient>) or set the "
+                    "reference folder on the Predict page.")
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self, "Nothing predicted",
+                    "None of the selected files could be read as spectra.")
             return
+        if n_skip:
+            QtWidgets.QMessageBox.warning(
+                self, "Files skipped — no normal reference",
+                f"{n_skip} file(s) were skipped: margin-mode models "
+                "predict each patient's DEVIATION from their own NORMAL "
+                "spectra, and no reference could be found for those "
+                "patients.\n\nDetails are in the log.")
         self._set_predict_summary(rows)
         self._draw_prediction_overview()
         self.refresh_nav()
@@ -7670,6 +8219,14 @@ class MainWindow(QtWidgets.QMainWindow):
         pos = self._positive_class() or ""
         pred_probs = self._pred_probs if len(self._pred_probs) == len(rows) \
             else None
+        # validated operating point (calibrated space, same as the
+        # predict-time probabilities) — 2026-09-06: the verdict used to
+        # cut at a hardcoded 0.5 on CALIBRATED probabilities, which is a
+        # far more liberal rule than the tuned threshold the model was
+        # validated with
+        _thr = float(self.bundle["threshold"]) if (
+            self.bundle is not None
+            and self.bundle.get("threshold") is not None) else None
         out_rows = []
         for patient, idxs in sorted(groups.items()):
             votes: dict[str, int] = {}
@@ -7677,8 +8234,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 votes[rows[i][1]] = votes.get(rows[i][1], 0) + 1
             # probability-mean verdict (Jeng 2019: patient-wise
             # aggregation beats point-wise): mean P(positive) over ALL
-            # of the patient's spectra; majority vote stays visible as
-            # the vote counts
+            # of the patient's spectra, cut at the tuned threshold;
+            # majority vote stays visible as the vote counts
             mean_p = float("nan")
             if pos and pred_probs is not None:
                 p_list = [pred_probs[i].get(pos, float("nan"))
@@ -7689,8 +8246,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 called = [rows[i][2] for i in idxs
                           if rows[i][1] == pos]
                 mean_p = float(np.mean(called)) if called else 0.0
+                cut = 0.5      # fallback mean is call confidence, not
+                #                  P(positive): keep the legacy 0.5 rule
+            else:
+                cut = _thr if _thr is not None else 0.5
             if pos:
-                verdict = pos if mean_p >= 0.5 else next(
+                verdict = pos if mean_p >= cut else next(
                     (c for c in votes if c != pos), pos)
             else:
                 verdict = max(votes.items(), key=lambda kv: kv[1])[0]
@@ -7712,11 +8273,20 @@ class MainWindow(QtWidgets.QMainWindow):
             bool(self.spectra),
             f"Data loaded — {len(self.spectra)} spectra, {n_classes} classes",
             "Load your spectra folder"))
+        if self.winner is not None:
+            txt = (f"Model trained — best: {self.winner.name} "
+                   f"(F1 {self.winner.macro_f1():.3f}")
+            if self._honest_result is not None:
+                try:
+                    txt += (f", nested honest F1 "
+                            f"{self._honest_result['mean_f1']:.3f}")
+                except (KeyError, TypeError, ValueError):
+                    pass
+            txt += ")"
+        else:
+            txt = ""
         self.w_lbl_model.setText(line(
-            self.winner is not None,
-            (f"Model trained — best: {self.winner.name} "
-             f"(F1 {self.winner.macro_f1():.3f})") if self.winner else "",
-            "Train & compare models"))
+            self.winner is not None, txt, "Train & compare models"))
         self.w_lbl_saved.setText(line(
             self.bundle is not None,
             "Model ready — go to Predict",

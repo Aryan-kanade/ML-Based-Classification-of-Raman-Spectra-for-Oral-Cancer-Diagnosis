@@ -86,7 +86,7 @@ def _synthetic_ml(n=40, groups_n=10, seed=0):
 # ---------------------------------------------------------------- tests
 def test_subject_key():
     assert cdata.subject_key("Patient_15") == "S15"
-    assert cdata.subject_key("TDOC015") == "S15"
+    assert cdata.subject_key("TDOC123") == "S123"
     assert cdata.subject_key("Subject058 Spectra pro") == "S58"
     assert cdata.subject_key("no number") == "NO NUMBER"
 
@@ -1072,6 +1072,922 @@ def test_calibrated_bundle_roundtrip():
         assert abs(bc["threshold"]
                    - clin.apply_platt(winner.threshold,
                                      (1.4, -0.2))) < 1e-12
+
+
+def test_paired_deploy_parity_wn_calibrate():
+    """Deploy-time features/probabilities must MATCH the training-time
+    construction for bundles trained with wn_calibrate=True (2026-09-06
+    regression: the predict path skipped the Phe-1003 alignment entirely,
+    feeding paired models shifted out-of-distribution deviations — every
+    prediction saturated to one confident class)."""
+    import joblib
+    import paired as paired_mod
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    n_pts = 700
+    wn_full = np.linspace(500.0, 2000.0, n_pts)   # ~2.15 cm-1 spacing
+
+    def _spectrum(patient_seed: int, tumor: bool, drift: float):
+        rp = np.random.default_rng(patient_seed)
+        base = (rp.normal(0, 0.03, n_pts)
+                + 0.8 * np.exp(-((wn_full - 1003.0) ** 2) / (2 * 7.0 ** 2))
+                + 0.4 * np.exp(-((wn_full - 1450.0) ** 2) / (2 * 18.0 ** 2)))
+        if tumor:      # tumor-only band
+            base += 0.6 * np.exp(-((wn_full - 1340.0) ** 2)
+                                 / (2 * 9.0 ** 2))
+        # instrument drift: shift every feature by `drift` cm-1 on the
+        # axis (what calibrate_wn exists to undo; > grid spacing so the
+        # correction actually fires)
+        return np.interp(wn_full, wn_full - drift, base)
+
+    X, labels, groups = [], [], []
+    drifts = {}
+    for p in range(3):
+        for j, (tumor, d) in enumerate([(False, -5.0), (False, 5.0),
+                                        (True, 6.0), (True, -6.0)]):
+            X.append(_spectrum(100 + p, tumor, d))
+            labels.append("Tumor" if tumor else "Normal")
+            groups.append(f"P{p}")
+            drifts[(p, j)] = d
+    X = np.vstack(X)
+    params = pp.PreprocessParams(crop_min=600.0, crop_max=1800.0,
+                                 wavelet=False, detrend=True,
+                                 wn_calibrate=True)
+    # ---- training-side construction (the ground truth) ----------------
+    pdata = paired_mod.paired_features(X, labels, groups, wn_full, params)
+    pipe = Pipeline([("sc", StandardScaler()),
+                     ("lr", LogisticRegression(max_iter=2000))])
+    pipe.fit(pdata.X, pdata.y)
+    w = modeling.ModelResult(name="parity",
+                             classes=list(pipe.classes_))
+    w.pipeline = pipe
+    w.macro = {"f1": (1.0, 0.0)}
+    with tempfile.TemporaryDirectory() as td:
+        bpath = os.path.join(td, "parity.joblib")
+        modeling.save_bundle(bpath, w, wn_full, params, paired=True)
+        bundle = joblib.load(bpath)
+
+        def _write_full(path, wn, it):     # full precision, shuffled order
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                for a, b in zip(wn[::-1], it[::-1], strict=True):
+                    fh.write(f"{a:.10g},{b:.10g}\n")
+
+        files = {}
+        for p in range(3):
+            for j in range(4):
+                f = os.path.join(td, f"P{p}", f"s{j}.txt")
+                _write_full(f, wn_full, X[4 * p + j])
+                files[(p, j)] = f
+        grid = np.asarray(bundle["wavenumbers"], dtype=float)
+        m = pp.crop_mask(grid, params)
+        for p in range(3):
+            ref = paired_mod.reference_vector(
+                bundle, [files[(p, 0)], files[(p, 1)]])
+            for j in (2, 3):               # the patient's tumor spectra
+                wn_f, it_f = ds.load_spectrum(files[(p, j)])
+                # deploy deviation, built exactly like the predict path
+                y = pp.align_to_grid(wn_f, it_f, grid, params)
+                dev = (pp.preprocess_spectrum(y[m], params) - ref)
+                # training deviation: preprocess_matrix calibrated +
+                # cropped, minus the patient's calibrated normal mean
+                Xp = pp.preprocess_matrix(X[[4 * p + j, 4 * p, 4 * p + 1]],
+                                          params, wn=wn_full)
+                expect = Xp[0] - Xp[1:].mean(axis=0)
+                assert np.allclose(dev, expect, atol=1e-8), \
+                    f"deploy/training feature mismatch P{p} s{j}"
+                # negative control: WITHOUT calibration the deviation
+                # really is different (the drift is material, so the
+                # parity above is not vacuous)
+                from dataclasses import replace as _dc_replace
+                Xr = pp.preprocess_matrix(
+                    np.vstack([np.interp(grid, wn_full, X[4 * p + j]),
+                               np.interp(grid, wn_full, X[4 * p]),
+                               np.interp(grid, wn_full, X[4 * p + 1])]),
+                    _dc_replace(params, wn_calibrate=False),
+                    wn=grid)
+                assert not np.allclose(Xr[0] - Xr[1:].mean(axis=0),
+                                       expect, atol=1e-3), \
+                    "injected drift had no effect — parity test is vacuous"
+                # end-to-end: saved-bundle prediction == direct pipeline
+                # call on the training-side feature (no calibrator in
+                # this bundle -> probabilities are the raw ones)
+                out = modeling.predict_with_bundle(
+                    bundle, wn_f, it_f, reference=ref)
+                direct = pipe.predict_proba(expect.reshape(1, -1))[0]
+                for c, v in zip(pipe.classes_, direct, strict=True):
+                    assert abs(out["probabilities"][c] - v) < 1e-6
+
+
+def test_paired_predict_skips_without_reference():
+    """Margin-mode prediction without the patient's normal reference is
+    SKIPPED with an explicit log line — never silently predicted from an
+    absolute spectrum (2026-09-06 regression guard)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from qt_compat import QtWidgets
+    import ui_helpers as uh
+    import clinical_data as _cd
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyle("Fusion")
+    app.setStyleSheet(uh.STYLESHEET)
+    import gui                          # style before constructing
+    _saved_ls, _saved_fdr = uh.load_settings, _cd.find_data_root
+    uh.load_settings = lambda: {}
+    _cd.find_data_root = lambda: None
+    try:
+        wn = np.linspace(500.0, 2000.0, 60)
+        with tempfile.TemporaryDirectory() as td:
+            # a lone Tumor tree: no Normal side anywhere -> the paired
+            # reference cannot be resolved
+            f = os.path.join(td, "Tumor", "P1", "s0.txt")
+            _write_spectrum(f, wn, np.random.default_rng(3).normal(
+                0, 1, 60))
+            bundle = {"paired": True, "wavenumbers": wn,
+                      "prep_params": pp.PreprocessParams(),
+                      "classes": ["Normal", "Tumor"]}
+            worker = gui.PredictWorker(bundle, [f], td)
+            payload = {}
+            worker.done.connect(lambda p: payload.update(p))
+            worker.run()                # synchronous: no event loop
+            assert payload["rows"] == []
+            assert any(line.startswith("SKIPPED ")
+                       for line in payload["logs"]), payload["logs"]
+    finally:
+        uh.load_settings = _saved_ls
+        _cd.find_data_root = _saved_fdr
+
+
+def test_patient_verdict_uses_bundle_threshold():
+    """The per-patient verdict cuts at the bundle's tuned (calibrated)
+    threshold, not a hardcoded 0.5 — a mean P(Tumor) of 0.6 is Normal
+    when the validated operating point is 0.75.  Also: _threshold_now
+    must NOT Platt-map an already-calibrated stored threshold."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from qt_compat import QtWidgets
+    import ui_helpers as uh
+    import clinical_data as _cd
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyle("Fusion")
+    app.setStyleSheet(uh.STYLESHEET)
+    import gui
+    _saved_ls, _saved_fdr = uh.load_settings, _cd.find_data_root
+    uh.load_settings = lambda: {}
+    _cd.find_data_root = lambda: None
+    try:
+        win = gui.MainWindow()
+        # the startup 3SSE restore can install a real winner whenever
+        # study_run_3sse/winner.json exists (persisted since 2026-09-06)
+        # — this test needs the no-winner branch of _threshold_now
+        win.winner = None
+        win._positive_class = lambda: "Tumor"
+        win.bundle = {"threshold": 0.75, "classes": ["Normal", "Tumor"],
+                      "calibrator": (1.0705, 0.378)}
+        # stored threshold is already calibrated: no double Platt map
+        assert abs(win._threshold_now() - 0.75) < 1e-12
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "PA"), exist_ok=True)
+            os.makedirs(os.path.join(td, "PB"), exist_ok=True)
+            files = [os.path.join(td, "PA", "a.txt"),
+                     os.path.join(td, "PA", "b.txt"),
+                     os.path.join(td, "PB", "c.txt"),
+                     os.path.join(td, "PB", "d.txt")]
+            # PA: mean P(Tumor) = 0.60  (>0.5 but < 0.75 -> Normal)
+            # PB: mean P(Tumor) = 0.90  (>= 0.75 -> Tumor)
+            # per-spectrum labels use the SAME cut as the deploy path
+            # (predict_with_bundle applies the bundle threshold)
+            probs = [{"Normal": 0.4, "Tumor": 0.6},
+                     {"Normal": 0.4, "Tumor": 0.6},
+                     {"Normal": 0.1, "Tumor": 0.9},
+                     {"Normal": 0.1, "Tumor": 0.9}]
+            rows = [(os.path.basename(f),
+                     "Tumor" if p["Tumor"] >= 0.75 else "Normal",
+                     max(p.values())) for f, p in zip(files, probs,
+                                                     strict=True)]
+            win._pred_rows = rows
+            win._pred_probs = probs
+            win.spec_path_edit.setText(td)
+            agg = {r[0]: r for r in win._aggregate_patients(files, rows)}
+            assert agg["PA"][4] == "Normal", agg["PA"]
+            assert agg["PB"][4] == "Tumor", agg["PB"]
+            assert abs(agg["PA"][3] - 0.6) < 1e-9
+    finally:
+        uh.load_settings = _saved_ls
+        _cd.find_data_root = _saved_fdr
+
+
+def test_3sse_chain_cloneable():
+    """3SSE winner pipelines must satisfy sklearn's clone contract: the
+    five GUI diagnostics (learning curve, seed stability, noise, locked
+    eval, LOPO) all clone(winner.pipeline) and died on 'Cannot clone
+    object AveragedChain' before 2026-09-06 — list(estimators) in
+    __init__ breaks clone's post-init identity check."""
+    from sklearn.base import clone
+    from sklearn.decomposition import PCA
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    import sequential as seq
+
+    def _mk():
+        return Pipeline([("sc", StandardScaler()),
+                         ("pca", PCA(n_components=2)),
+                         ("lr", LogisticRegression())])
+
+    ac = seq.AveragedChain([_mk(), _mk()], k=3, seed=42, n_seeds=2)
+    sc = seq.SequentialChain([_mk(), _mk()], k=3, seed=42)
+    for obj in (ac, sc):
+        c = clone(obj)                      # RuntimeError before the fix
+        assert c is not obj and c.k == obj.k
+    rng = np.random.default_rng(2)
+    X = rng.normal(size=(40, 6))
+    # class-consistent per group; the curve runs on the full data only
+    # (tiny patient subsets can be single-class — not what we test here)
+    y = np.repeat([0, 1, 0, 1, 0, 1, 0, 1], 5)
+    g = np.repeat(np.arange(8), 5)
+    ac.fit(X, y)
+    sizes, means, _stds = modeling.learning_curve_by_groups(
+        X, y, g, ac, k=3, seed=42, fractions=(1.0,))   # failing diagnostic
+    assert sizes == [8] and len(means) == len(sizes)
+
+
+def test_auto_reference_real_layout():
+    """Real clinical layout (<root>/<class>/<patient>/*.csv) through the
+    actual PredictWorker: per-patient AUTO references resolve, patients
+    without a Normal side are skipped with a logged reason, an
+    empty-string manual reference behaves like None (2026-09-06: it
+    used to disable BOTH reference paths — every file skipped), and
+    picking the tree ROOT as the manual reference fails with an
+    actionable message instead of 'No reference spectra could be
+    loaded'."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from qt_compat import QtWidgets
+    import ui_helpers as uh
+    import clinical_data as _cd
+    import joblib
+    import paired as paired_mod
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyle("Fusion")
+    app.setStyleSheet(uh.STYLESHEET)
+    import gui
+    _saved_ls, _saved_fdr = uh.load_settings, _cd.find_data_root
+    uh.load_settings = lambda: {}
+    _cd.find_data_root = lambda: None
+    try:
+        wn = np.linspace(500.0, 2000.0, 400)   # ~3.75 cm-1 spacing
+
+        def spec(seed, tumor, drift):
+            r = np.random.default_rng(seed)
+            base = (0.8 * np.exp(-((wn - 1003.0) ** 2) / (2 * 6.0 ** 2))
+                    + 0.4 * np.exp(-((wn - 1450.0) ** 2) / (2 * 15.0 ** 2))
+                    + r.normal(0, 0.02, len(wn)))
+            if tumor:
+                base = base + 0.5 * np.exp(-((wn - 1340.0) ** 2)
+                                           / (2 * 8.0 ** 2))
+            return np.interp(wn, wn - drift, base)
+
+        sites = [(False, -7.0), (False, 7.0), (True, 8.0), (True, -8.0)]
+        patients = ("PA", "PB")
+        X = np.vstack([spec(100 * (p == "PB") + j, tu, d)
+                       for p in patients for j, (tu, d) in enumerate(sites)])
+        y = ["Tumor" if tu else "Normal"
+             for _p in patients for tu, _d in sites]
+        g = [p for p in patients for _s in sites]
+        params = pp.PreprocessParams(crop_min=600.0, crop_max=1800.0,
+                                     wavelet=False, wn_calibrate=True)
+        pdata = paired_mod.paired_features(X, y, g, wn, params)
+        pipe = Pipeline([("sc", StandardScaler()),
+                         ("lr", LogisticRegression(max_iter=1000))]
+                        ).fit(pdata.X, pdata.y)
+        w = modeling.ModelResult(name="autoref",
+                                 classes=list(pipe.classes_))
+        w.pipeline = pipe
+        w.macro = {"f1": (1.0, 0.0)}
+        with tempfile.TemporaryDirectory() as td:
+            bpath = os.path.join(td, "m.joblib")
+            modeling.save_bundle(bpath, w, wn, params, paired=True)
+            bundle = joblib.load(bpath)
+
+            def wr(rel, vec):
+                f = os.path.join(td, rel)
+                os.makedirs(os.path.dirname(f), exist_ok=True)
+                with open(f, "w", encoding="utf-8") as fh:
+                    for a, b in zip(wn, vec, strict=True):
+                        fh.write(f"{a:.10g},{b:.10g}\n")
+
+            files = []
+            for pi, p in enumerate(patients):
+                for j, (tu, d) in enumerate(sites):
+                    rel = f"{'Tumor' if tu else 'Normal'}/{p}/s{j}.csv"
+                    wr(rel, X[4 * pi + j])
+                    files.append(os.path.join(td, rel))
+            for j in range(2):        # PZ: tumor-only, no Normal side
+                rel = f"Tumor/PZ/z{j}.csv"
+                wr(rel, spec(900 + j, True, 3.0))
+                files.append(os.path.join(td, rel))
+
+            def _run(worker):
+                payload, failed = {}, []
+
+                def _done(d):
+                    payload.update(d)
+
+                worker.done.connect(_done)
+                worker.failed.connect(lambda tb: failed.append(tb))
+                worker.run()          # synchronous: no event loop needed
+                return payload, failed
+
+            # 1) auto references with NO manual folder
+            payload, failed = _run(gui.PredictWorker(bundle, files, td))
+            assert not failed, failed[0] if failed else ""
+            assert len(payload["rows"]) == 8, payload["logs"]
+            assert payload["n_auto_refs"] == 2
+            skipped = [l for l in payload["logs"]
+                       if l.startswith("SKIPPED")]
+            assert len(skipped) == 2, skipped
+            assert any("Margin references" in l
+                       for l in payload["logs"]), payload["logs"]
+            # tumor sites of paired patients come out Tumor (deviation
+            # carries the 1340 signature)
+            t_rows = [r for r in payload["rows"] if r[0].startswith("s2")
+                      or r[0].startswith("s3")]
+            assert len(t_rows) == 4
+            assert all(r[1] == "Tumor" for r in t_rows), payload["rows"]
+
+            # 2) empty-string manual reference behaves like None
+            payload2, failed2 = _run(gui.PredictWorker(
+                bundle, files, td, manual_ref_dir=""))
+            assert not failed2
+            assert len(payload2["rows"]) == 8, payload2["logs"]
+            assert payload2["n_auto_refs"] == 2
+
+            # 3) tree ROOT as the manual reference -> actionable error
+            _p3, failed3 = _run(gui.PredictWorker(
+                bundle, files, td, manual_ref_dir=td))
+            assert failed3 and "tree root" in failed3[0], failed3
+    finally:
+        uh.load_settings = _saved_ls
+        _cd.find_data_root = _saved_fdr
+
+
+def test_save_bundle_namespace_winner():
+    """save_bundle must tolerate SimpleNamespace winners (the 3SSE
+    results dialog and Model Lab build them) — 2026-09-06 regression:
+    bare winner.per_class made 'Saving 3SSE bundle' fail."""
+    import joblib
+    from types import SimpleNamespace
+    from sklearn.linear_model import LogisticRegression
+    Xs = np.random.default_rng(4).normal(size=(40, 6))
+    ys = ["A"] * 20 + ["B"] * 20
+    pipe = LogisticRegression().fit(Xs, ys)
+    w = SimpleNamespace(name="ns-winner", pipeline=pipe,
+                        classes=["A", "B"], threshold=None,
+                        macro={"f1": (0.9, 0.0)})
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "ns.joblib")
+        modeling.save_bundle(p, w, np.arange(6.0),
+                             pp.PreprocessParams(), paired=True)
+        b = joblib.load(p)
+        assert b["model_name"] == "ns-winner" and b["paired"] is True
+        assert b["per_class"] is None      # absent -> None, not a crash
+
+
+def test_3sse_dialog_winner_tab_csv():
+    """Exporting the Overall Winner tab writes a CSV (2026-09-06: the
+    button refused with 'Select a ranking tab first')."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from qt_compat import QtWidgets
+    import ui_helpers as uh
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    # Fusion + stylesheet BEFORE constructing widgets: windowsvista +
+    # this QSS-heavy UI fail-fasts natively (Brain gotcha, stage3 test
+    # pattern)
+    app.setStyle("Fusion")
+    app.setStyleSheet(uh.STYLESHEET)
+    import gui
+    payload = {
+        "board": {"singles": [
+            {"arch": ("PCA + SVM (RBF)",), "level": 1,
+             "metrics": {"f1": 0.70, "sens": 0.7, "spec": 0.7,
+                         "auc": 0.75, "acc": 0.7}},
+            # error-tolerant screening record: FAILED arch, no metrics
+            # (2026-09-06: this shape crashed the dialog with
+            # KeyError('f1') when viewing a saved run)
+            {"arch": ("Broken model",), "level": 1,
+             "metrics": {}, "error": "CatBoostError: bad allocation"}],
+            "pairs": [], "triples": [], "total": 2, "pruned": 0},
+        "validated": {1: [{"arch": ("PCA + SVM (RBF)",),
+                           "metrics": {"f1": 0.71, "sens": 0.7,
+                                       "spec": 0.7, "auc": 0.76,
+                                       "acc": 0.7}}]},
+        "winner": {"arch": ("Extra Trees", "Ensemble (top-3)"),
+                   "metrics": {"f1": 0.783, "sens": 0.786, "spec": 0.786,
+                               "auc": 0.821, "acc": 0.78}},
+        "significance": {"baseline": "PCA + SVM (RBF)",
+                         "baseline_f1": 0.70, "mcnemar_b": 10,
+                         "mcnemar_c": 7, "mcnemar_p": 0.629,
+                         "seed_f1s": [0.78, 0.78, 0.79]},
+    }
+    dlg = gui.SeqResultsDialog(payload)
+    # the failed arch is excluded from the ranking (only the good one)
+    singles_model = dlg._tab_models[0][1]
+    assert len(singles_model._rows) == 1
+    assert "PCA + SVM (RBF)" in singles_model._rows[0][2]
+    dlg._tabs.setCurrentIndex(3)          # Overall Winner
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "winner.csv")
+        _saved = QtWidgets.QFileDialog.getSaveFileName
+        QtWidgets.QFileDialog.getSaveFileName = lambda *a, **k: (out, "")
+        try:
+            dlg._export_csv()
+        finally:
+            QtWidgets.QFileDialog.getSaveFileName = _saved
+        text = open(out, encoding="utf-8-sig").read()
+        assert "Winner (2-Model)" in text and "Nested best 1-Model" in text
+        assert "Extra Trees → Ensemble (top-3)" in text
+        assert "NOT significant" in text and "0.629" in text
+
+
+def test_3sse_persist_and_latest_dir():
+    """GUI searches persist their payload (screening/validated/winner)
+    and the viewer picks the most recent run dir — 2026-09-06: GUI runs
+    never wrote these artifacts, so 'View saved 3SSE' always failed."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from qt_compat import QtWidgets
+    import ui_helpers as uh
+    import clinical_data as _cd
+    import json as _json
+    import time as _time
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyle("Fusion")
+    app.setStyleSheet(uh.STYLESHEET)
+    import gui
+    _saved_ls, _saved_fdr = uh.load_settings, _cd.find_data_root
+    uh.load_settings = lambda: {}
+    _cd.find_data_root = lambda: None
+    _saved_appdir = gui.APP_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            gui.APP_DIR = td
+            d_new = os.path.join(td, "study_run_lab")
+            gui.MainWindow._persist_3sse_payload(d_new, {
+                "board": {"singles": [
+                    {"arch": ("PCA + SVM (RBF)",), "level": 1,
+                     "metrics": {"f1": np.float32(0.7),
+                                 "auc": float("nan")}}],
+                    "pairs": [], "triples": []},
+                "validated": {2: [{"arch": ("A", "B"),
+                                   "metrics": {"f1": 0.6}}]},
+                "winner": {"arch": ("A",), "metrics": {"f1": 0.8,
+                                                       "cm": [[3, 1],
+                                                              [0, 4]]},
+                           "chain": object()}})
+            # artifacts written, chain object excluded, numpy sanitized
+            with open(os.path.join(d_new, "screening.jsonl"),
+                      encoding="utf-8") as fh:
+                rec = _json.loads(fh.readline())
+            assert rec["arch"] == ["PCA + SVM (RBF)"]
+            assert abs(rec["f1"] - 0.7) < 1e-6     # float32-rounded
+            assert rec["auc"] is None              # NaN sanitized out
+            with open(os.path.join(d_new, "winner.json"),
+                      encoding="utf-8") as fh:
+                wj = _json.load(fh)
+            assert "chain" not in wj and wj["metrics"]["cm"] == [[3, 1],
+                                                                 [0, 4]]
+            # an older 3sse dir exists; the newer lab dir must win
+            d_old = os.path.join(td, "study_run_3sse")
+            os.makedirs(d_old, exist_ok=True)
+            with open(os.path.join(d_old, "winner.json"), "w") as fh:
+                fh.write("{}")
+            old_t = _time.time() - 3600
+            os.utime(os.path.join(d_old, "winner.json"), (old_t, old_t))
+            assert gui.MainWindow._latest_3sse_run_dir() == d_new
+            os.remove(os.path.join(d_new, "screening.jsonl"))
+            os.remove(os.path.join(d_new, "winner.json"))
+            assert gui.MainWindow._latest_3sse_run_dir() == d_old
+            os.remove(os.path.join(d_old, "winner.json"))
+            assert gui.MainWindow._latest_3sse_run_dir() is None
+        # error records persist their failure reason (no metrics)
+        d_err = os.path.join(td, "err_run")
+        gui.MainWindow._persist_3sse_payload(d_err, {
+            "board": {"singles": [
+                {"arch": ("Broken model",), "level": 1,
+                 "error": "TerminatedWorkerError: boom"}],
+                "pairs": [], "triples": []}})
+        with open(os.path.join(d_err, "screening.jsonl"),
+                  encoding="utf-8") as fh:
+            rec = _json.loads(fh.readline())
+        assert rec["error"] == "TerminatedWorkerError: boom"
+        assert "f1" not in rec
+    finally:
+        gui.APP_DIR = _saved_appdir
+        uh.load_settings = _saved_ls
+        _cd.find_data_root = _saved_fdr
+
+
+def test_is_chain_winner_guard():
+    """Chain winners (AveragedChain/SequentialChain) make every refit-
+    based diagnostic multiply ~45 inner pipeline fits — the auto
+    battery must know it's dealing with one (2026-09-06)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from qt_compat import QtWidgets
+    import ui_helpers as uh
+    import clinical_data as _cd
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    import sequential as seq
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyle("Fusion")
+    app.setStyleSheet(uh.STYLESHEET)
+    import gui
+    _saved_ls, _saved_fdr = uh.load_settings, _cd.find_data_root
+    uh.load_settings = lambda: {}
+    _cd.find_data_root = lambda: None
+    try:
+        win = gui.MainWindow()
+        mk = lambda: Pipeline([("sc", StandardScaler()),
+                               ("lr", LogisticRegression())])
+        win.winner = modeling.ModelResult(name="plain",
+                                          classes=["A", "B"])
+        win.winner.pipeline = mk()
+        assert win._is_chain_winner() is False
+        win.winner = modeling.ModelResult(name="chain",
+                                          classes=["A", "B"])
+        win.winner.pipeline = seq.AveragedChain([mk(), mk()],
+                                                n_seeds=2)
+        assert win._is_chain_winner() is True
+        win.winner.pipeline = seq.SequentialChain([mk(), mk()])
+        assert win._is_chain_winner() is True
+        # no winner at all -> False (guards run before training too)
+        win.winner = None
+        assert win._is_chain_winner() is False
+    finally:
+        uh.load_settings = _saved_ls
+        _cd.find_data_root = _saved_fdr
+
+
+def test_batched_bundle_prediction_equivalence():
+    """predict_with_bundle_many gives the SAME per-spectrum results as
+    the single-spectrum path (it exists because TabPFN-class voters
+    cost seconds PER CALL — batched folders take seconds, not minutes;
+    measured batch-vs-single |Δp| ≈ 8e-8)."""
+    import joblib
+    import paired as paired_mod
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    wn = np.linspace(500.0, 2000.0, 200)
+    X, y, g = [], [], []
+    for p in ("PA", "PB"):
+        for j, tumor in enumerate([False, False, True, True]):
+            rp = np.random.default_rng(hash(p) % 500 + j)
+            base = (rp.normal(0, 0.03, 200)
+                    + 0.6 * np.exp(-((wn - 1003.0) ** 2) / (2 * 8.0 ** 2)))
+            if tumor:
+                base = base + 0.5 * np.exp(-((wn - 1340.0) ** 2)
+                                           / (2 * 9.0 ** 2))
+            X.append(base)
+            y.append("Tumor" if tumor else "Normal")
+            g.append(p)
+    params = pp.PreprocessParams(crop_min=600.0, crop_max=1800.0,
+                                 wavelet=False)
+    pdata = paired_mod.paired_features(np.vstack(X), y, g, wn, params)
+    pipe = Pipeline([("sc", StandardScaler()),
+                     ("lr", LogisticRegression(max_iter=500))]
+                    ).fit(pdata.X, pdata.y)
+    w = modeling.ModelResult(name="batch", classes=list(pipe.classes_))
+    w.pipeline = pipe
+    w.threshold = 0.55
+    w.macro = {"f1": (1.0, 0.0)}
+    with tempfile.TemporaryDirectory() as td:
+        bpath = os.path.join(td, "b.joblib")
+        modeling.save_bundle(bpath, w, wn, params, paired=True,
+                             calibrator=(1.2, -0.1))
+        bundle = joblib.load(bpath)
+        # references built directly from the training-side construction
+        Xp = pp.preprocess_matrix(np.vstack(X), params, wn=wn)
+        ref_PA = Xp[0:2].mean(axis=0)
+        ref_PB = Xp[4:6].mean(axis=0)
+        spectra = [(wn, row) for row in X]
+        references = [ref_PA, ref_PA, ref_PA, ref_PA,
+                      ref_PB, ref_PB, ref_PB, ref_PB]
+        results, errors = modeling.predict_with_bundle_many(
+            bundle, spectra, references)
+        assert not errors and all(r is not None for r in results)
+        for i, (w_n, it) in enumerate(spectra):
+            single = modeling.predict_with_bundle(
+                bundle, w_n, it, reference=references[i])
+            assert results[i]["prediction"] == single["prediction"]
+            for c, v in single["probabilities"].items():
+                assert abs(results[i]["probabilities"][c] - v) < 1e-9
+        # a row with a bad axis is reported per-row, others survive
+        bad = list(spectra)
+        bad[0] = (np.linspace(700.0, 900.0, 50), np.zeros(50))
+        res2, err2 = modeling.predict_with_bundle_many(
+            bundle, bad, references)
+        assert 0 in err2 and "does not cover" in err2[0]
+        assert all(res2[i] is not None for i in range(1, len(bad)))
+
+
+def test_diagnostics_cancel_check():
+    """The loop-based diagnostics abort promptly with the 'cancelled by
+    user' sentinel when cancel_check fires (2026-09-06: LOPO on chain
+    winners runs very long and the busy box now offers Cancel)."""
+    import study_stats as sstats
+    from sklearn.linear_model import LogisticRegression
+    rng = np.random.default_rng(6)
+    X = rng.normal(size=(40, 6))
+    y = np.repeat([0, 1], 20)
+    g = np.repeat(np.arange(8), 5)
+    est = LogisticRegression()
+    for helper, kwargs in (
+            (sstats.seed_stability, {"seeds": (0, 1, 2, 3, 4), "k": 3}),
+            (sstats.noise_robustness, {"k": 3}),
+            (sstats.lopo_evaluate, {})):
+        try:
+            helper(X, y, g, est, {}, [0, 1],
+                   cancel_check=lambda: True, **kwargs)
+        except RuntimeError as exc:
+            assert "cancelled by user" in str(exc), (helper, exc)
+        else:
+            raise AssertionError(f"{helper.__name__} ignored cancel")
+        # without cancel they run to completion
+        out = helper(X, y, g, est, {}, [0, 1], cancel_check=None,
+                     **kwargs)
+        assert out is not None
+        # learning_curve_by_groups has its own signature (no params/classes)
+        for cc in (lambda: True, None):
+            try:
+                modeling.learning_curve_by_groups(
+                    X, y, g, est, k=3, fractions=(1.0,), cancel_check=cc)
+                assert cc is None, "learning curve ignored cancel"
+            except RuntimeError as exc:
+                assert cc is not None and "cancelled by user" in str(exc)
+
+
+def test_diag_progress_streaming_and_cancel_button():
+    """Long diagnostics must STREAM progress (chain winners take
+    minutes — a frozen 'computing…' looks broken) and the Cancel
+    button must exist, start hidden, and be a no-op-safe flow
+    (2026-09-06)."""
+    import study_stats as sstats
+    from sklearn.linear_model import LogisticRegression
+    rng = np.random.default_rng(7)
+    X = rng.normal(size=(40, 6))
+    y = np.repeat([0, 1], 20)
+    g = np.repeat(np.arange(8), 5)
+    est = LogisticRegression()
+    msgs = []
+    sstats.seed_stability(X, y, g, est, {}, [0, 1], seeds=(0, 1, 2),
+                          k=3, progress=msgs.append)
+    assert len(msgs) == 3 and "seed 2/3" in msgs[1]
+    msgs.clear()
+    modeling.learning_curve_by_groups(X, y, g, est, k=3,
+                                      fractions=(0.5, 1.0),
+                                      progress=msgs.append)
+    assert any("patients" in m for m in msgs)
+    msgs.clear()
+    sstats.noise_robustness(X, y, g, est, {}, [0, 1], k=3,
+                            progress=msgs.append)
+    assert msgs and msgs[0].startswith("fold 1/")
+    msgs.clear()
+    sstats.lopo_evaluate(X, y, g, est, {}, [0, 1],
+                         progress=msgs.append)
+    assert msgs[0].startswith("patient 1/")
+    # GUI bookkeeping: cancel button hidden by default, progress sink
+    # names the analysis, worker-thread emit is safe without a worker
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from qt_compat import QtWidgets
+    import ui_helpers as uh
+    import clinical_data as _cd
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyle("Fusion")
+    app.setStyleSheet(uh.STYLESHEET)
+    import gui
+    _saved_ls, _saved_fdr = uh.load_settings, _cd.find_data_root
+    uh.load_settings = lambda: {}
+    _cd.find_data_root = lambda: None
+    try:
+        win = gui.MainWindow()
+        win.winner = None
+        assert not win.b_cancel_analysis.isVisibleTo(win)
+        win._analysis_label = "Seed stability"
+        win._analysis_progress("seed 2/5: F1 0.61")
+        assert "seed 2/5" in win.train_status.text()
+        win._analysis_label = None
+        win._emit_progress("from worker thread")     # must not raise
+        # non-chain winner: heavy-diag confirm passes without a dialog
+        assert win._confirm_heavy_diag("Anything") is True
+    finally:
+        uh.load_settings = _saved_ls
+        _cd.find_data_root = _saved_fdr
+
+
+def test_winner_importance_runs():
+    """winner_importance must pass (X, y, None, wn) to
+    region_importance_shap — the old 3-positional-arg call bound wn to
+    groups and crashed EVERY 'Band agreement' diagnostic with
+    TypeError: missing 'wn' (live since days, 2026-09-06)."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    rng = np.random.default_rng(8)
+    X = rng.normal(size=(40, 30))
+    y = (X[:, 0] > 0).astype(int)
+    wn = np.arange(30, dtype=float)
+    pipe = Pipeline([("sc", StandardScaler()),
+                     ("lr", LogisticRegression())]).fit(X, y)
+    imp = modeling.winner_importance(pipe, X, y, wn)
+    assert imp is not None and len(imp) == 30
+
+
+def test_pqn_deploy_parity():
+    """Margin+PQN bundles train on pqn_normalize(spectrum, ref) - ref;
+    the deploy path must apply the SAME PQN step (bundle flag 'pqn',
+    2026-09-06: the flag never existed and every deploy path skipped
+    PQN — the same failure class as the wn_calibrate mismatch)."""
+    import joblib
+    import paired as paired_mod
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    wn = np.linspace(500.0, 2000.0, 250)
+
+    def spec(seed, tumor, scale):
+        r = np.random.default_rng(seed)
+        base = (0.7 * np.exp(-((wn - 1003.0) ** 2) / (2 * 7.0 ** 2))
+                + 0.3 * np.exp(-((wn - 1450.0) ** 2) / (2 * 15.0 ** 2))
+                + r.normal(0, 0.01, len(wn)))
+        if tumor:
+            base = base + 0.6 * np.exp(-((wn - 1340.0) ** 2)
+                                       / (2 * 8.0 ** 2))
+        return base * scale          # per-spectrum intensity (PQN's job)
+
+    X, y, g = [], [], []
+    for p in ("PA", "PB"):
+        for j, (tu, sc) in enumerate([(False, 1.0), (False, 1.4),
+                                      (True, 2.0), (True, 0.7)]):
+            X.append(spec(100 * (p == "PB") + j, tu, sc))
+            y.append("Tumor" if tu else "Normal")
+            g.append(p)
+    X = np.vstack(X)
+    params = pp.PreprocessParams(crop_min=600.0, crop_max=1800.0,
+                                 wavelet=False)
+    pdata = paired_mod.paired_features(X, y, g, wn, params, use_pqn=True)
+    pipe = Pipeline([("sc", StandardScaler()),
+                     ("lr", LogisticRegression(max_iter=1000))]
+                    ).fit(pdata.X, pdata.y)
+    w = modeling.ModelResult(name="pqn", classes=list(pipe.classes_))
+    w.pipeline = pipe
+    w.macro = {"f1": (1.0, 0.0)}
+    with tempfile.TemporaryDirectory() as td:
+        paths = {}
+        for flag in (True, False):
+            b = os.path.join(td, f"pqn_{flag}.joblib")
+            modeling.save_bundle(b, w, wn, params, paired=True, pqn=flag)
+            paths[flag] = b
+        # deploy-side reference (raw mean of preprocessed normals)
+        ref = (pp.preprocess_matrix(np.vstack([X[0], X[1]]), params,
+                                    wn=wn)).mean(axis=0)
+        tumor_row = 2                       # PA's first tumor spectrum
+        wn_f, it_f = wn, X[tumor_row]
+        # training-side feature for the same spectrum
+        Xp = pp.preprocess_matrix(
+            np.vstack([X[tumor_row], X[0], X[1]]), params, wn=wn)
+        pq = pp.pqn_normalize(Xp[0], Xp[1:].mean(axis=0))
+        expect = pq - Xp[1:].mean(axis=0)
+        direct = pipe.predict_proba(expect.reshape(1, -1))[0]
+        # flagged bundle: deploy == training construction
+        out = modeling.predict_with_bundle(
+            joblib.load(paths[True]), wn_f, it_f, reference=ref)
+        for c, v in zip(pipe.classes_, direct, strict=True):
+            assert abs(out["probabilities"][c] - v) < 1e-6
+        out_many, errs = modeling.predict_with_bundle_many(
+            joblib.load(paths[True]), [(wn_f, it_f)], [ref])
+        assert not errs and abs(
+            out_many[0]["probabilities"]["Tumor"]
+            - out["probabilities"]["Tumor"]) < 1e-9
+        # unflagged bundle: PQN skipped -> materially different
+        # prediction (proves the parity test is not vacuous)
+        out_noflag = modeling.predict_with_bundle(
+            joblib.load(paths[False]), wn_f, it_f, reference=ref)
+        assert abs(out_noflag["probabilities"]["Tumor"]
+                   - out["probabilities"]["Tumor"]) > 1e-3
+
+
+def test_persist_run_handles_ndarrays():
+    """persist_run must sanitize the GUI worker's validated/winner
+    dicts whose metrics carry oof_proba / cm / y_true as ndarrays —
+    an ndarray-in-JSON TypeError here surfaced as 'The architecture
+    search failed' AFTER the search had finished (2026-09-06)."""
+    import json as _json
+    import sequential as seq
+    validated = {1: [{"arch": ("PCA + SVM (RBF)",),
+                      "metrics": {"f1": np.float32(0.72), "sens": 0.7,
+                                  "spec": 0.7, "acc": 0.7,
+                                  "oof_proba": np.asarray(
+                                      [[0.6, 0.4], [0.3, 0.7]])}}]}
+    winner = {"arch": ("A", "B"),
+              "metrics": {"f1": 0.8, "sens": 0.8, "spec": 0.8,
+                          "cm": np.asarray([[3, 1], [0, 4]]),
+                          "y_true": np.asarray([0, 1, 1, 0]),
+                          "auc": float("nan")},
+              "threshold": 0.6, "calibrator": None}
+    with tempfile.TemporaryDirectory() as td:
+        seq.persist_run(td, {"singles": []}, validated, winner,
+                        significance={"mcnemar_p": 0.5})
+        with open(os.path.join(td, "validated.json"),
+                  encoding="utf-8") as fh:
+            v = _json.load(fh)
+        assert v["1"][0]["metrics"]["oof_proba"] == [[0.6, 0.4],
+                                                     [0.3, 0.7]]
+        with open(os.path.join(td, "winner.json"), encoding="utf-8") as fh:
+            wj = _json.load(fh)
+        assert wj["metrics"]["cm"] == [[3, 1], [0, 4]]
+        assert wj["metrics"]["auc"] is None          # NaN -> null
+        assert "calibrator" not in wj
+
+
+def test_dialog_none_metrics_and_stale_clearing():
+    """Persisted JSON turns NaN into null: the results dialog, its CSV
+    export and the persistence itself (stale-artifact clearing) must
+    all tolerate None metrics (2026-09-06)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from qt_compat import QtWidgets
+    import ui_helpers as uh
+    import clinical_data as _cd
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyle("Fusion")
+    app.setStyleSheet(uh.STYLESHEET)
+    import gui
+    _saved_ls, _saved_fdr = uh.load_settings, _cd.find_data_root
+    uh.load_settings = lambda: {}
+    _cd.find_data_root = lambda: None
+    _saved_appdir = gui.APP_DIR
+    try:
+        # auc is None (multi-class runs always NaN->null) — used to
+        # crash pill formatting, max() keys and CSV export
+        payload = {
+            "board": {"singles": [], "pairs": [], "triples": []},
+            "validated": {1: [{"arch": ("A",),
+                               "metrics": {"f1": 0.7, "auc": None}}]},
+            "winner": {"arch": ("A", "B"),
+                       "metrics": {"f1": 0.8, "sens": 0.8, "spec": 0.8,
+                                   "auc": None, "acc": None}},
+        }
+        dlg = gui.SeqResultsDialog(payload)
+        rows = dlg._winner_rows()
+        assert any("Winner (2-Model)" in r[1] for r in rows)
+        dlg._tabs.setCurrentIndex(3)
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "w.csv")
+            _saved = QtWidgets.QFileDialog.getSaveFileName
+            QtWidgets.QFileDialog.getSaveFileName = lambda *a, **k: (out,
+                                                                     "")
+            try:
+                dlg._export_csv()
+            finally:
+                QtWidgets.QFileDialog.getSaveFileName = _saved
+            text = open(out, encoding="utf-8-sig").read()
+            assert "Winner (2-Model)" in text and "nan" in text
+        # stale-artifact clearing: a no-winner run removes winner.json
+        gui.APP_DIR = td
+        d = os.path.join(td, "run")
+        gui.MainWindow._persist_3sse_payload(d, payload)
+        assert os.path.isfile(os.path.join(d, "winner.json"))
+        gui.MainWindow._persist_3sse_payload(
+            d, {"board": payload["board"]})     # no validated/winner
+        assert not os.path.isfile(os.path.join(d, "winner.json"))
+        assert not os.path.isfile(os.path.join(d, "validated.json"))
+        with open(os.path.join(d, "winner.json"), "w") as fh:
+            fh.write("stale")                   # jsonl record safety
+        with open(os.path.join(d, "screening.jsonl"), "w") as fh:
+            fh.write('{"garbage": true}\n{"arch": ["A"], "level": 1, '
+                     '"metrics": {"f1": 0.5}}\n')
+        board, key = {"singles": [], "pairs": [], "triples": [],
+                      "total": 0, "pruned": 0}, {1: "singles",
+                                                 2: "pairs", 3: "triples"}
+        import json as _j2
+        with open(os.path.join(d, "screening.jsonl"),
+                  encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = _j2.loads(line)
+                    _lvl, _arch = rec["level"], tuple(rec["arch"])
+                except (_j2.JSONDecodeError, KeyError, TypeError):
+                    continue
+                board[key[_lvl]].append({"arch": _arch, "level": _lvl,
+                                         "metrics": rec})
+        assert len(board["singles"]) == 1
+    finally:
+        gui.APP_DIR = _saved_appdir
+        uh.load_settings = _saved_ls
+        _cd.find_data_root = _saved_fdr
 
 
 def test_bh_fdr():

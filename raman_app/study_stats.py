@@ -69,7 +69,7 @@ def _lopo_fit_predict(X, ye, tr, te, estimator, params):
 
 def lopo_evaluate(X, y, groups, estimator, params: dict,
                   classes: list[str], seed: int = 0,
-                  jobs: int = 1) -> dict:
+                  jobs: int = 1, cancel_check=None, progress=None) -> dict:
     """
     Refit `estimator` (with fixed `params`, no re-tuning) once per
     left-out PATIENT and evaluate every patient unseen.  Returns pooled
@@ -79,7 +79,10 @@ def lopo_evaluate(X, y, groups, estimator, params: dict,
     `jobs` > 1 validates folds in a joblib process pool — DEFAULT 1
     (serial): the measured rejection stands (tree winners refit with
     n_jobs=-1 internally; process × thread oversubscription lost more
-    than the parallelism won, §16b-A4).
+    than the parallelism won, §16b-A4).  `cancel_check` (callable ->
+    bool) aborts between patients with RuntimeError('diagnostics
+    cancelled by user') — long chain winners make LOPO run for a long
+    time and users need a way out (2026-09-06).
     """
     from sklearn.metrics import (confusion_matrix, f1_score,
                                  roc_auc_score)
@@ -96,9 +99,18 @@ def lopo_evaluate(X, y, groups, estimator, params: dict,
         if len(tr) == 0 or len(set(ye[tr].tolist())) < 2:
             continue
         tasks.append((X, ye, tr, te, estimator, params))
-    from joblib import Parallel, delayed
-    results = Parallel(n_jobs=jobs)(
-        delayed(_lopo_fit_predict)(*t) for t in tasks)
+    if cancel_check is not None or progress is not None:
+        results = []
+        for i, t in enumerate(tasks):
+            if cancel_check is not None and cancel_check():
+                raise RuntimeError("diagnostics cancelled by user")
+            if progress is not None:
+                progress(f"patient {i + 1}/{len(tasks)}")
+            results.append(_lopo_fit_predict(*t))
+    else:
+        from joblib import Parallel, delayed
+        results = Parallel(n_jobs=jobs)(
+            delayed(_lopo_fit_predict)(*t) for t in tasks)
     per_patient = []
     y_true, y_pred, y_score = [], [], []
     for (te, proba) in results:
@@ -243,21 +255,36 @@ def _grouped_f1(X, ye, groups, estimator, params, k: int, seed: int,
 
 
 def seed_stability(X, y, groups, estimator, params, classes: list[str],
-                   seeds=(0, 1, 2, 3, 4), k: int = 5) -> list[float]:
-    """Macro-F1 of the fixed winner across several CV seeds."""
+                   seeds=(0, 1, 2, 3, 4), k: int = 5,
+                   cancel_check=None, progress=None) -> list[float]:
+    """Macro-F1 of the fixed winner across several CV seeds.
+    `cancel_check` (callable -> bool) aborts between seeds with
+    RuntimeError('diagnostics cancelled by user').  `progress(msg)`
+    is called after every seed (2026-09-06: chain winners make this
+    take minutes — the user must SEE movement)."""
     lut = {c: i for i, c in enumerate(classes)}
     ye = np.array([lut[v] for v in y], dtype=int)
-    return [_grouped_f1(X, ye, groups, estimator, params, k, s)
-            for s in seeds]
+    out = []
+    for i, s in enumerate(seeds):
+        if cancel_check is not None and cancel_check():
+            raise RuntimeError("diagnostics cancelled by user")
+        f1 = _grouped_f1(X, ye, groups, estimator, params, k, s)
+        out.append(f1)
+        if progress is not None:
+            progress(f"seed {i + 1}/{len(seeds)}: F1 {f1:.3f}")
+    return out
 
 
 def noise_robustness(X, y, groups, estimator, params, classes: list[str],
                      levels=(0.0, 0.01, 0.02, 0.05), k: int = 5,
-                     seed: int = 0) -> list[tuple[float, float]]:
+                     seed: int = 0, cancel_check=None, progress=None
+                     ) -> list[tuple[float, float]]:
     """
     Fit on clean training folds, predict test folds with calibrated
     Gaussian noise added at inference (per-spectrum scale).  Returns
     [(noise_fraction, macro_f1)] — the degradation curve.
+    `cancel_check` aborts between folds with RuntimeError('diagnostics
+    cancelled by user'); `progress(msg)` fires per fold.
 
     Every level shares the SAME folds and the SAME clean fits — each
     fold is fit ONCE and only re-predicted per noise level (the naive
@@ -284,6 +311,10 @@ def noise_robustness(X, y, groups, estimator, params, classes: list[str],
     preds = {lv: [] for lv in levels}
     y_true: list = []
     for i, (tr, te) in enumerate(folds):
+        if cancel_check is not None and cancel_check():
+            raise RuntimeError("diagnostics cancelled by user")
+        if progress is not None:
+            progress(f"fold {i + 1}/{len(folds)}")
         est = clone(estimator)
         if params:
             est = est.set_params(**params)

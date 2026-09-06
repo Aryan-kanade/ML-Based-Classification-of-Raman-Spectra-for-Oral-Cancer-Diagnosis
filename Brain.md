@@ -194,7 +194,7 @@ GUI `PredictWorker._auto_reference` (`<root>/Normal/<patient>/`).
 - `REFERENCE_MARKERS` (lowercase substrings of filename): white, black,
   dark, bkg, background, ref, reference, blank, calib.
 - `subject_key(folder)`: first number in folder name → `S{int}` (so
-  `Patient_15`, `TDOC015`, `TDOC015 Spectra pro` → `S15`); no digit →
+  `Patient_15`, `TDOC123`, `TDOC123 Spectra pro` → `S123`); no digit →
   `folder.strip().upper()`.
 - Duplicates: SHA-1 over float64 raw bytes of (wn, it) — immune to
   line endings. Same-class dup → keep first; hash in >1 class → **all
@@ -202,11 +202,11 @@ GUI `PredictWorker._auto_reference` (`<root>/Normal/<patient>/`).
 - **Site-token check (2026-09-06 audit)**: `TH\d` token inside
   `Normal/` (or `NH\d` inside `Tumor/`) contradicts the folder label →
   dropped as `site_token_dropped` (unambiguous files only). Real-data
-  effect: `TDOC067…TH01` — a UNIQUE mislabeled tumor spectrum in
-  Normal (no byte-twin, so SHA-1 could never catch it) — dropped;
-  `TDOC058…TH0` Normal copy dropped by token and its genuine Tumor
-  copy now KEPT (the cross-class rule used to destroy BOTH). n stays
-  317 but healthier (Normal 142 / Tumor 175).
+  effect: ONE patient's `TH01` spectrum — a UNIQUE mislabeled tumor
+  spectrum in Normal (no byte-twin, so SHA-1 could never catch it) —
+  dropped; ANOTHER patient's `TH0` Normal copy dropped by token and its
+  genuine Tumor copy now KEPT (the cross-class rule used to destroy
+  BOTH). n stays 317 but healthier (Normal 142 / Tumor 175).
 - `SPIKE_FLAG_THRESHOLD = 300.0` (median spike score of this dataset
   ~60; clean ≈5–30). `spike_score(y) = max|diff| / median|diff|`.
 - `is_clinical_layout`: ≥2 subfolders containing spectra one OR two
@@ -970,7 +970,20 @@ with default hyperparameters (identical for all 4,369 — fair).
     SyntaxErrors on older Pythons (copied project to a 3.11 device
     2026-09-04, hand-edit needed in `format_report`). Keep the
     expression on one line or hoist it into a parenthesized variable.
-    `test_all.test_fstring_device_portability` source-scans every .py
+`test_all.test_fstring_device_portability` source-scans every .py
+24. **Deploy-side preprocessing must go through `preprocessing.align_to_grid`**
+    (2026-09-06, CRITICAL fix). `preprocess_matrix` (training) applies
+    `calibrate_wn` BEFORE crop when `wn_calibrate=True`, but
+    `predict_with_bundle`/`paired.reference_vector` used to skip it —
+    bundles trained with calibration were fed shifted, out-of-distribution
+    features at predict time and the deployed 3SSE winner called EVERY
+    spectrum Tumor p≈0.94–0.97 (normal patients included). The Phe-1003
+    anchor was already fixed/predict-time-safe (§20 fix 6); the predict
+    path just never invoked it. `align_to_grid` (interp + calibrate) is
+    the single shared entry point now; `test_paired_deploy_parity_wn_calibrate`
+    pins train/deploy FEATURE parity + end-to-end probability parity
+    (with a non-vacuous negative control). Any new predict path must use
+    it, never raw `np.interp + crop + preprocess_spectrum`.
     so it cannot come back.
 23. **GPU acceleration semantics (2026-09-04)** — works on ANY CUDA
     GPU, detection never by card name: `modeling.gpu_ok()` (cached;
@@ -1174,6 +1187,13 @@ Repo `D:\BARC`, branch `main`, init 2026-08-30; per-commit history:
    full re-run needed; bench re-baseline too.
 8. Known-remaining audit lows deferred deliberately (see §20 "not
    fixed" list).
+9. 3SSE winner's honest nested F1 ≈ 0.56 vs optimistic 0.839 (§21):
+   deployed as-is per user decision (both numbers shown on card +
+   welcome banner); re-run Honest check after any retrain so the saved
+   `nested_honest_f1` matches the saved winner. GUI patient banner
+   verdict for MARGIN bundles still mixes a patient's normal+tumor
+   sites into one mean (§21 verification note) — margin-mode patient
+   rollup semantics deserve their own pass someday.
 
 ## 19. Research roadmap changelog (see raman_app/RESEARCH.md)
 
@@ -1367,9 +1387,11 @@ Three-agent adversarial audit + line verification: **~190 findings**
    blends + gain/tilt, NO Lorentzian fitting (never was).
 
 ### Data hygiene
-`site_token_dropped` (§5) — TDOC067 TH-in-Normal mislabel was live in
-training. Patient-spectrum history PURGED 2026-09-06 (filter-repo); ID
-strings scrubbed from README/docstrings/tooltips/tests.
+`site_token_dropped` (§5) — the site-token TH-in-Normal mislabel was
+live in training. Patient-spectrum history PURGED 2026-09-06
+(filter-repo); ID strings scrubbed from README/docstrings/tooltips/
+tests (a light re-scrub of Brain.md §5 examples ran before the first
+GitHub push, 2026-09-06).
 
 ### GUI fixes
 on_train_failed re-enables ALL buttons; `_pop_diag_queue` in
@@ -1408,3 +1430,283 @@ deep_test tempdir leakage; single-group SGKF crashes (raise cleanly
 now but no friendly dialog). Gotcha numbering has legacy duplicates
 (#21/#22/#23 reused) — NOT renumbered to keep old references stable;
 new entries continue at #24.
+
+## 21. 2026-09-06 DEPLOY-PATH HOTFIX — "3SSE calls every Normal patient Tumor"
+
+User report: the saved 3SSE winner (PCA+XGBoost → Ensemble top-3, paired,
+card `model_3SSE__PCA___XGBoost___Ensemble__top-3__card.md`) predicted
+Tumor p≈0.94–0.97 for EVERY file incl. all NH (session.log 11:54/11:56).
+Root cause was NOT statistical overfitting alone — the deploy path was
+broken. Four fixes, no retraining (bundle unchanged):
+
+1. **wn_calibrate train/deploy mismatch (root cause)**: training ran
+   `calibrate_wn` (Phe-1003) before crop; `predict_with_bundle` +
+   `paired.reference_vector` never did → all deploy features OOD →
+   saturated single-class output. Fixed via new shared
+   `preprocessing.align_to_grid` used by both call sites (gotcha #24).
+2. **Silent absolute-spectrum predictions in margin mode**:
+   PredictWorker now SKIPS files whose patient has no Normal reference
+   (log line "SKIPPED …" + message box); never feeds a margin model an
+   absolute spectrum silently.
+3. **Patient verdict rule**: `_aggregate_patients` cut at hardcoded 0.5
+   on CALIBRATED probabilities (≡ raw 0.41 — far more liberal than the
+   validated 0.663-raw/0.7505-calibrated operating point). Now uses the
+   bundle's stored calibrated threshold (fallback 0.5 only without one;
+   the pmax-based fallback branch keeps legacy 0.5).
+4. **Double-Platt in `_threshold_now`**: loaded bundles' threshold is
+   already calibrated (`save_bundle` maps it) but was Platt-mapped again
+   for display (0.7505 → 0.826). Winner branch still maps (its
+   threshold is raw). `_op_points_now` audited: correct as-is.
+
+Tests (59/59 pass, ruff clean): `test_paired_deploy_parity_wn_calibrate`
+(feature + probability parity, negative control proves non-vacuous),
+`test_paired_predict_skips_without_reference`,
+`test_patient_verdict_uses_bundle_threshold` (also pins no-double-Platt).
+
+Honesty upgrades (user decision "show both numbers"): model card gains
+per-class sens/spec/F1 + the honest (nested) macro-F1 next to the
+optimistic one; `save_bundle` persists `per_class` + `nested_honest_f1`;
+welcome banner shows nested F1 when the Honest check ran. The EXISTING
+3SSE card got a hand-written "Honest performance context" + "Deploy-path
+fix verification" addendum (its per-class CV numbers were never
+persisted; bundle now stores them for future saves).
+
+Verification (`raman_app/verify_deploy_fix.py`, dev tree 341 files,
+5 tumor spectra correctly skipped for missing reference):
+spectrum-level sens 0.749 / spec 0.941 / acc 0.836 (was: everything
+Tumor, spec≈0); margin rollup at 0.750-calibrated cut: 58/74 patients
+with ≥1 tumor site flagged, 5/75 with a normal site flagged. Residual
+imperfection = the model's honest quality (nested F1 ≈ 0.564, McNemar
+p=0.629 vs paired PCA+SVM), not the deploy path. NOTE: the verification
+includes hygiene-excluded files (spike-flagged etc.), and the GUI
+banner's one-class-per-patient verdict is a poor yardstick for margin
+data (patients have BOTH site types) — open item 9.
+
+## 22. 2026-09-06 (evening) — 3SSE diagnostics crash + margin auto-reference never worked
+
+User report after the §21 fixes: (a) no 3SSE learning-curve graph —
+learning curve / seed stability / noise robustness / locked eval / LOPO
+ALL failed; (b) predict now said "None of the files could be predicted:
+… no patient-specific NORMAL reference was found" (my §21 guard doing
+its job — but for EVERY file).
+
+### (a) sklearn clone contract (5 diagnostics dead)
+All five diagnostics `clone(winner.pipeline)`; `SequentialChain` /
+`AveragedChain.__init__` did `self.estimators = list(estimators)` —
+sklearn requires __init__ to store params VERBATIM (clone's post-init
+identity check fails on the copied list → "Cannot clone object
+AveragedChain"). Fixed: verbatim storage, `get_params` returns the same
+object. `test_3sse_chain_cloneable` pins clone + learning_curve on a
+chain. NOTE: diagnostics fit clones WITHOUT groups (ungrouped chain-OOF
+inside) — pre-existing behavior, unchanged deliberately.
+
+### (b) auto-reference NEVER ran in the GUI — the "" manual ref
+`start_predict`: `manual_ref = ref_path_edit.text().strip()` — an EMPTY
+edit stays `""`, and PredictWorker enabled per-patient auto references
+only `if manual_ref_dir is None`. `""` disabled BOTH paths →
+`_auto_reference` never called → ref=None for every file. Combined with
+§21's discovery: EVERY past GUI paired-mode prediction ran on ABSOLUTE
+spectra (proof: "Margin mode: built N…" never appears in any
+session.log; yesterday's all-Tumor p≈0.95 garbage). Fixes:
+`text.strip() or None` in start_predict + worker checks `not
+self.manual_ref_dir` (falsy, belt-and-braces).
+
+### Hardening shipped with it
+- `_auto_reference` no longer swallows exceptions (`except: pass` →
+  per-file reason dict; run log prints "Margin references: N unresolved
+  — first: <file>: <reason>"): no-tree / no Normal/<patient> folder /
+  reference-build exception are all visible now.
+- Manual reference = tree ROOT (user hit this 11:59: "No reference
+  spectra could be loaded") → actionable ValueError ("…looks like a
+  clinical tree root — pick the patient's NORMAL folder or clear it").
+- `test_auto_reference_real_layout`: real layout through the real
+  PredictWorker — paired patients predict with auto refs (n_auto_refs
+  counted), tumor-only patients skip with logged reason, "" behaves as
+  None, tree-root manual ref fails with the actionable message.
+
+### Verification (real tree, saved Extra Trees winner, Tumor-only
+selection — the exact 13:32 failing run): 180/185 predicted, 73 auto
+references built, 5 skipped with "no Normal/Patient_{21,28,34} folder",
+tumor-site probabilities 0.53–0.62 (healthy, unsaturated).
+`verify_worker_refs.py` replays it headless. Suite 61/61, ruff clean.
+
+## 23. 2026-09-06 (night) — wave 3: save crash, winner CSV, view-saved, batched predict, cancelable diagnostics
+
+User reports after wave 2 (app NOT yet restarted in between — several
+symptoms were pre-fix code): 3SSE bundle save crash, winner-tab CSV
+export refused, "View saved 3SSE" found nothing, prediction "too much
+slower", and every click answered "Another analysis is still running".
+
+1. **save_bundle SimpleNamespace crash** (wave-2 regression): bare
+   `winner.per_class` — the 3SSE dialog (gui:7243) and Model Lab
+   (gui:5580, sequential:1465) build namespace winners without it.
+   Fixed: `getattr(winner, "per_class", None)`
+   (`test_save_bundle_namespace_winner`).
+2. **Winner-tab CSV export**: `_export_csv` refused the Overall Winner
+   tab; now exports winner + nested-best-per-level rows + significance
+   note in the ranking-table format (`test_3sse_dialog_winner_tab_csv`).
+3. **View saved 3SSE found nothing**: GUI searches never persisted
+   screening.jsonl/validated.json/winner.json (CLI-only), and Model Lab
+   writes study_run_lab. Fixed: `MainWindow._persist_3sse_payload`
+   (numpy/tuple/NaN-sanitized; chain object excluded) on every GUI
+   search/Model-Lab completion; `_latest_3sse_run_dir()` picks the most
+   recent of study_run_3sse/study_run_lab by artifact mtime;
+   view_saved_3sse degrades gracefully to winner-only and the message
+   names both dirs. NOTE: the CURRENT study_run_3sse (significance.json
+   + winner.joblib only) still yields "no run" until the next GUI
+   search — restore_last_3sse deliberately still reads only
+   study_run_3sse (Lab provenance protection, 2026-09-05).
+   (`test_3sse_persist_and_latest_dir`.)
+4. **Prediction 20 min → 16 s**: profiling showed the Extra Trees
+   winner's Ensemble contains a TabPFN voter costing ≈6.5 s PER
+   predict_proba CALL on CPU (references/preprocess were already
+   negligible: 14-20 ms/patient, <1 ms/spectrum warm). New
+   `modeling.predict_with_bundle_many` batches the whole folder into
+   ONE call per feature-length group (PredictWorker: read → batch →
+   assemble phases). Measured batch-vs-single equivalence: max |Δp|
+   ≈ 8e-8 (float noise); replay of the 185-file Tumor run: identical
+   predictions, 180 predicted / 5 skipped / 73 refs, 16 s wall.
+   (`test_batched_bundle_prediction_equivalence`, incl. per-row error
+   isolation for bad axes.)
+5. **Cancelable diagnostics**: the wave-2 clone fix made the
+   auto-diagnostic chain (…→LOPO→honest) genuinely run — LOPO on an
+   AveragedChain winner is hours and the busy box was information-only.
+   Now: `_analysis_busy_box` names the job + elapsed and offers Cancel;
+   `cancel_check` (cooperative, boundary-granular) added to
+   learning_curve_by_groups / seed_stability / noise_robustness /
+   lopo_evaluate (raises "diagnostics cancelled by user"; `_run_async`
+   treats it as a quiet cancel, chain keeps draining);
+   `_diag_cancel.clear()` on every chain/_run_async start (stale
+   cancels can't kill new jobs); `_honest_worker` cleared in
+   done+failed (`test_diagnostics_cancel_check`). Restart required for
+   all of this to load.
+
+Suite 66/66, ruff clean. GOTCHA: restart the app before retesting —
+three waves of fixes today are on disk but an old process keeps old
+code.
+
+## 24. 2026-09-06 (late) — wave 4: view-saved KeyError('f1') + auto-diagnostics too slow on chain winners
+
+1. **KeyError('f1') viewing a saved 3SSE run** (gui traceback at
+   SeqResultsDialog._rows): the error-tolerant search records FAILED
+   archs as {"arch","level","error"} with NO metrics; my wave-3
+   persistence wrote them to screening.jsonl and the reload gave every
+   record a metrics key (possibly empty), so the ranking sort crashed.
+   Fixed at three layers: _rows only ranks entries whose metrics dict
+   has a numeric f1 (.get defaults everywhere incl. the row formatter);
+   view_saved carries the "error" through instead of fabricating
+   metrics; _persist_3sse_payload writes the error field. Winner pills
+   / summary lines / winner-tab CSV all use .get(NaN) now — a partial
+   winner.json can no longer crash the dialog.
+2. **"Training and graph showing slow"**: post-clone-fix the auto
+   diagnostics battery genuinely runs; on CHAIN winners every refit
+   multiplies the inner fits (~45 pipeline fits per refit → learning
+   curve ≈ 900 fits, LOPO potentially hours; plain winners: whole
+   battery ≈ 2 min, measured 16:49 session). Fixes: (a) Train-page
+   checkbox "Auto-run after training" (default ON) — untick to skip the
+   post-training battery entirely; (b) `_is_chain_winner()` guard in
+   run_all_diagnostics: for Averaged/Sequential chain winners the AUTO
+   chain runs only regions + band agreement + honest (winner-
+   independent ~20 s) and logs which heavy items were skipped (manual
+   buttons + busy-box Cancel remain); the manual "Run all diagnostics"
+   button still runs the FULL battery for any winner.
+3. Test-isolation lessons: (a) every Qt-widget test must set Fusion +
+   STYLESHEET before constructing (vista+QSS fail-fast — the dialog
+   test segfaulted 127/139 without it); (b) isolated MainWindow tests
+   must clear `win.winner` — the startup restore now finds
+   study_run_3sse/winner.json (persisted by wave 3) and installs a real
+   winner (broke the no-winner branch of a threshold test).
+
+Suite 67/67, ruff clean. Side-proof in test output: the startup restore
+loaded the persisted 3SSE winner from the user's 16:49 session — the
+wave-3 persistence works end-to-end.
+
+## 25. 2026-09-06 (final) — wave 5: proactive audit (3 Explore agents) fixes
+
+User asked to hunt remaining issues before calling it solved. Findings
++ fixes (70/70 tests, ruff clean; old-bundle verify numbers UNCHANGED
+after the predict refactor — sens 0.749/spec 0.941/acc 0.836):
+
+1. **Band agreement dead since days** (live TypeError in every
+   diagnostics run): `modeling.winner_importance` called
+   `region_importance_shap(X, y, wn)` — wn bound to the groups slot.
+   Fixed: `(X, y, None, wn)`. `test_winner_importance_runs` pins it.
+2. **PQN deploy parity (same class as the wn_calibrate bug)**:
+   Margin+PQN trains on `pqn_normalize(s, ref) − ref`; every deploy
+   path computed `s − ref` and NO bundle flag recorded PQN. Fixed:
+   `save_bundle(pqn=)` stores the flag; new shared
+   `modeling._apply_reference` (length check + optional
+   `pqn_normalize` + subtract) used by BOTH predict paths; flag passed
+   at Model Lab (`payload["use_pqn"]`), GUI saves (`self._pqn_mode`
+   captured when mode_kind == "paired-pqn"), seq CLI, reproduce_study;
+   startup restore reads it. `test_pqn_deploy_parity` proves deploy ==
+   training construction for flagged bundles AND that unflagged
+   bundles differ (non-vacuous).
+3. **Saved-run viewer None-metrics crashes** (NaN→null after JSON):
+   new `SeqResultsDialog._num` (isinstance numeric else NaN) used in
+   pills / nested max / winner text / CSV; view_saved's per-line try
+   now also covers the level/arch access (malformed jsonl lines skip).
+4. **Persistence/restore provenance**: GUI '3SSE search' now also
+   saves study_run_3sse/winner.joblib (restarts used to pair the NEW
+   winner.json with the PREVIOUS run's stale pipeline silently);
+   restore verifies bundle model_name == winner arch (skip + log on
+   mismatch), warns visibly when winner.joblib is missing/unloadable
+   and disables Save (metrics-only restore used to pickle
+   pipeline=None); `_persist_3sse_payload` CLEARS stale
+   validated/winner/significance files for absent sections and logs
+   failures (no more silent except); restore uses persisted `classes`
+   (3-class reshape crash) and bails on null f1 BEFORE formatting;
+   sequential.py `persist_run` actually writes validated.json/
+   winner.json now (dead code before — CLI runs left the previous
+   run's artifacts behind).
+5. **Log-less failures**: data_report.txt write failure and
+   optimize.save_best_params failure now log a line each.
+
+GOTCHA: PQN bundles saved BEFORE this wave have no `pqn` flag — if a
+Margin+PQN winner was saved earlier, re-save it (or retrain) so the
+flag travels; prediction of an old PQN bundle silently skips PQN.
+
+## 26. 2026-09-06 (wave 6) — regression: persist_run ndarray TypeError failed COMPLETED searches
+
+session.log 18:02:28: "3SSE search failed: TypeError: Object of type
+ndarray is not JSON serializable (oof_proba in validated metrics)".
+Wave-5's persist_run started writing validated.json/winner.json, but
+the GUI worker's (and CLI's) validated/winner metrics carry
+oof_proba/cm/y_true as ndarrays — `_num` handled np scalars and
+lists, NOT ndarrays. The worker's guard caught only OSError, so a
+PERSISTENCE error aborted the search AFTER screening+validation+
+finalize+significance had all finished (and skipped the checkpoint
+cleanup + done.emit).
+
+Fixes: (1) `_num` converts ndarray → tolist; (2) SeqSearchWorker's
+persist guard broadened to Exception + FILE_LOG.exception —
+persistence NEVER fails a completed run; (3) CLI main() wraps
+persist_run the same way (report/meta/winner.joblib still written).
+`test_persist_run_handles_ndarrays` pins oof/cm/y_true + NaN→null.
+71/71, ruff clean. LESSON (same as _auto_reference/_persist): any
+post-result persistence step must degrade with a log line, never
+propagate — a finished computation's value must not be hostage to its
+bookkeeping.
+
+## 27. 2026-09-06 (wave 7) — chain-winner diagnostics UX: frozen "computing…" graphs
+
+User report: Seed stability + Noise graphs "not showing after waiting
+too long" on the Extra Trees → PCA+SVM chain winner. Log proof: on the
+previous PLAIN winner both completed in seconds (18:12); the chain
+guard correctly skipped them in the auto-chain (18:18:32 log line);
+the user then started Seed stability MANUALLY — 25 chain refits
+(≈900 inner pipeline fits) with ZERO feedback: panel stuck on
+"computing…", Cancel unreachable (busy box only appears when clicking
+ANOTHER analysis button).
+
+Fixes: (1) `progress` callbacks in seed_stability (per seed),
+noise_robustness (per fold), learning_curve_by_groups (per fraction),
+lopo_evaluate (per patient — also in the serial branch); GUI runners
+pass `self._emit_progress` (worker-thread → FuncWorker.progress →
+`_analysis_progress` on the GUI thread: "Seed stability — seed 2/5:
+F1 0.61" in train_status + statusBar). (2) Always-visible-while-
+running "⏹ Cancel analysis" button in the diagnostics row (shown at
+_run_async start, hidden in finish/fail; sets _diag_cancel). (3)
+`_confirm_heavy_diag`: manual clicks of LC/seeds/noise/LOPO on a
+chain winner get a cost heads-up (Yes/No; auto-chain behavior
+unchanged). 72/72, ruff clean.
