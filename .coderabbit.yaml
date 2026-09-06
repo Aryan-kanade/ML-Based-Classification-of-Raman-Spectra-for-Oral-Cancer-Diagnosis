@@ -1,6 +1,5 @@
-# CodeRabbit configuration — ML-Based-Classification-of-Raman-Spectra
-# Docs: https://docs.coderabbit.ai/reference/configuration
-language: en-US
+# CodeRabbit configuration — https://docs.coderabbit.ai/reference/configuration
+language: "en-US"
 tone_instructions: >-
   Clinical-research codebase (PyQt Raman spectroscopy classifier for
   oral cancer screening). Patient privacy is paramount: never suggest
@@ -10,18 +9,25 @@ tone_instructions: >-
 early_access: false
 
 reviews:
-  profile: chill
+  # balanced feedback; use "quiet" for critical-only, "assertive" for more
+  profile: "chill"
   request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  review_details: false
   # Privacy / generated artifacts: never review, quote, or learn from
   # these (most are gitignored — belt and braces in case they appear)
   path_filters:
-    - "!Data/**"
+    - "!Data/**"                        # patient data — never
     - "!Documatation/**"
     - "!_external/**"
     - "!renders/**"
     - "!.zcode/**"
     - "!**/__pycache__/**"
     - "!**/*.joblib"
+    - "!**/*.lock"
+    - "!raman_app/model_*_card.md"      # auto-generated model cards
     - "!raman_app/session.log*"
     - "!raman_app/data_report.txt"
     - "!raman_app/result_report.*"
@@ -32,6 +38,7 @@ reviews:
     - "!*.zip"
   auto_review:
     enabled: true
+    auto_incremental_review: true   # re-run the review on each push
     drafts: false
     base_branches:
       - "main"
