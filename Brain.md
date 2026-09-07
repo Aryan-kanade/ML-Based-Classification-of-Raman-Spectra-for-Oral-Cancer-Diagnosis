@@ -9,7 +9,8 @@
 > the matching section below. Keep the "Last updated" stamp current.
 > Keep it dense — tables and one-liners, no prose padding.
 
-Last updated: 2026-09-06 (WHOLE-PROJECT DEEP AUDIT + REMEDIATION — ~190
+Last updated: 2026-09-07 (WORKSPACE CLEANUP for a portable copy — §32;
+previously 2026-09-06: WHOLE-PROJECT DEEP AUDIT + REMEDIATION — ~190
 findings, fixed in batches B0–B4, §20 lists the number-changing
 semantics; previously 2026-09-05: WHOLE-PROJECT ERROR HANDLING, see gotcha #23;
 2026-09-04: COMPLETE UI/UX modernization: Preprocess page
@@ -460,9 +461,11 @@ threshold; tolerates legacy uncropped bundles (feature-length guessing).
 Hygiene per run: 317 spectra / 72 patients → 18 spike-flagged excluded
 (despike off). **v1 artifacts (study_run_standard/paired/3sse) deleted
 2026-09-02** — all stale-pipeline; §13/§15 numbers below predate the
-trimmed-loader pipeline (see gotcha #18). v2 runs:
+trimmed-loader pipeline (see gotcha #18). v2 runs
 `raman_app/study_run_paired_v2/` (winner Extra Trees 0.766/0.827) and
-`study_run_standard_v2/` (see below).
+`study_run_standard_v2/` — **artifact folders DELETED 2026-09-07 (§32);
+the numbers in this file are the record — re-run reproduce_study to
+regenerate them**.
 
 | Mode | Winner | macro-F1 (95% CI) | AUC (DeLong) | LOPO |
 |---|---|---|---|---|
@@ -782,7 +785,9 @@ are possible and documented.
   boundaries), **checkpoint resume** (worker passes
   `study_run_3sse/archs.jsonl`, deletes on success, keeps on
   cancel/crash — Run resumes; replay filters to the current model
-  subset). After validation the worker auto-runs **significance**:
+  subset; the 7.2 MB archs.jsonl from the completed 2026-09-06 run
+  was DELETED 2026-09-07 §32 — new searches start fresh, the
+  winner/validated restore path never reads it). After validation the worker auto-runs **significance**:
   exact McNemar (winner OOF vs best-single OOF, identical folds) +
   3-seed stability; shown in the winner tab ("SIGNIFICANCE (auto)").
   Dialog: **"Export this tab to CSV…"** (active ranking tab →
@@ -1824,3 +1829,41 @@ Final: 86/86 unit + gui_test PASSED + 19/19 deep + ruff clean.
 
 Suite now 87/87 + GUI PASSED + 19/19 deep + ruff clean + coverage
 65%/floor 60.
+
+## 32. 2026-09-07 — workspace cleanup (portable-copy ready)
+
+User goal: slim D:\BARC to exactly what the project needs to RUN on
+another device. Reclaimed ~12.6 MB (34 → ~21 MB). App behavior is
+unchanged — everything deleted is either auto-regenerated or was
+never read at runtime.
+
+DELETED:
+- Caches/scratch: `__pycache__/`, `.ruff_cache/`, `_i.txt`,
+  `report_replication.md`, empty `study_run/` dir,
+  `study_standard_v2.log` (0 B), `session.log.1` (session.log itself
+  was locked by a running app instance — delete after close; the app
+  recreates it anyway), `settings.json` (local UI state, regenerates
+  with defaults — but the running app rewrites it on close; delete
+  again before copying).
+- Stale artifacts (numbers live here §13/§16): `study_run_paired_v2/`
+  (2.5 MB incl. old winner.joblib), `study_run_standard_v2/`,
+  `data_report.txt` (rewritten per data load), `study_manifest.json`
+  (patient IDs — privacy, regenerated on demand),
+  `vit_outputs/vit_test_confusion_matrix.png` + `vit_test_report.txt`
+  (kept `preprocess_best.json` — vit_train --preset best reads it),
+  `study_run_3sse/archs.jsonl` (7.2 MB resume checkpoint, §15),
+  `Data/*/split_log.txt` (test junk, skipped by all loaders).
+- Git-tracked junk (one commit, history preserved): `err2.log` (empty,
+  accidental), `walkthrough-raman-data-pipeline.html` (generated),
+  the 4 `model_*_card.md` files (unstaged deletions finalized — the
+  §21 card addendum text survives in git history).
+
+KEPT (runtime-required): all source, `Data/` (auto-found by
+find_data_root), `study_run_3sse/` winner.json + winner.joblib +
+validated.json + screening.jsonl (the on-disk set; startup
+restore_last_3sse + view-saved read them — deleting = blank Train
+page + Save disabled), `bench/latest.json`
+(scorecard), `.git/`, `.github/` CI, docs.
+
+Verification: import smoke test passed; 3SSE winner files present;
+git clean after commit.
