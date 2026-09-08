@@ -114,6 +114,18 @@ def reference_vector(bundle: dict, paths: list[str]) -> np.ndarray:
             # failed the entire run)
             skipped.append(f"{os.path.basename(p)} ({exc})")
             continue
+        if not np.all(np.isfinite(it)):
+            # 2026-09-08 audit BUG-1: a NaN reference spectrum would be
+            # silently zero-filled by nan_to_num and poison EVERY
+            # prediction built from it — skip with a reason instead
+            skipped.append(f"{os.path.basename(p)} (NaN/Inf values)")
+            continue
+        if float(np.max(np.abs(it), initial=0.0)) < 1e-9:
+            # round 3: an all-zero (or subnormal) reference file WARPS
+            # the reference mean instead of contributing signal
+            skipped.append(f"{os.path.basename(p)} (no signal — "
+                           "all-zero/near-zero)")
+            continue
         # align_to_grid (2026-09-06): apply the Phe-1003 calibration the
         # model was trained with — training averages CALIBRATED normals
         # (preprocess_matrix), so the deploy reference must match or every

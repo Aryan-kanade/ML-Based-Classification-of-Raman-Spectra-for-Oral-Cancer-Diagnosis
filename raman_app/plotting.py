@@ -481,6 +481,9 @@ def plot_count_bars(ax, labels, counts, title="Class counts",
                     positive=None):
     """Vertical class-count bars; the positive class gets the result
     red, the rest follow the palette."""
+    # 2026-09-08 audit: a NaN count crashed bar_label/ylim (int(NaN));
+    # counts are integers in practice — sanitize defensively anyway
+    counts = [int(v) if np.isfinite(v) else 0 for v in counts]
     cols = [COL_RESULT if lab == positive else class_color(i)
             for i, lab in enumerate(labels)]
     bars = ax.bar(labels, counts, color=cols, edgecolor="white",

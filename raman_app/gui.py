@@ -2574,10 +2574,12 @@ class MainWindow(QtWidgets.QMainWindow):
         bv.addWidget(self.chain_flow)
         rv.addWidget(banner)
 
-        cmp_card, cpv = self.card("Model comparison",
-                                  "Mean ± std across CV folds; cells are "
-                                  "color-coded (green ≥ 0.90, amber ≥ 0.70, "
-                                  "red < 0.70). ★ = winner.")
+        cmp_card, cpv = self.card(
+            "Model comparison",
+            "SELECTION ranking (internal CV, used to PICK the winner). "
+            "The performance to report is the NESTED HONEST estimate in "
+            "the banner above. Cells color-coded (green ≥ 0.90, amber ≥ "
+            "0.70, red < 0.70). ★ = winner.")
         self.compare_table = QtWidgets.QTableWidget(0, 4)
         self.compare_table.setHorizontalHeaderLabels(
             ["Model", "Sensitivity (macro)", "Specificity (macro)",
@@ -2659,12 +2661,10 @@ class MainWindow(QtWidgets.QMainWindow):
         chv.addLayout(lc_row)
         chv.addWidget(self.section_label("HONEST EVALUATION & STABILITY"))
         lc2_row = QtWidgets.QHBoxLayout()
-        b_honest = QtWidgets.QPushButton("Honest check (nested)")
-        b_honest.setToolTip(
-            "Re-chooses the preprocessing INSIDE every CV fold (training "
-            "patients only) and reports the unbiased macro-F1 — removes "
-            "the optimism from having tuned preprocessing on the same "
-            "data. Takes a couple of minutes.")
+        # (2026-09-08) the "Honest check" BUTTON is gone: the honest
+        # estimate is the number the app SHOWS — it runs automatically
+        # right after every training (and after a restore), first in
+        # the diagnostics queue
         b_locked = QtWidgets.QPushButton("Locked test-set eval")
         b_locked.setToolTip(
             "TRIPOD-style final exam: splits the PATIENTS 70/15/15 "
@@ -2673,7 +2673,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "test patients. Honest but noisy — run it once per "
             "configuration, not repeatedly. Needs clinical data (7+ "
             "patients).")
-        lc2_row.addWidget(diag(b_honest, self.run_honest_check))
+        lc2_row.addWidget(diag(b_locked, self.run_locked_eval))
         b_perm = QtWidgets.QPushButton("Permutation AUC")
         b_perm.setToolTip(
             "Shuffles PATIENT-level labels and re-runs the grouped CV "
@@ -3067,6 +3067,30 @@ class MainWindow(QtWidgets.QMainWindow):
         deepv.addWidget(self.r_deep_label)
         self.r_deep_card = deep
         v.addWidget(deep)
+        # supplementary scientific metrics (2026-09-08 formula audit):
+        # balanced accuracy / MCC / PR-AUC / Brier / explicit TP-TN-FP-FN
+        # + threshold stability — PATIENT and SPECTRUM levels labeled,
+        # never mixed.  Additive display only; nothing above changes.
+        supp, suppv = self.card(
+            "Supplementary scientific metrics",
+            "Balanced accuracy, MCC, PR-AUC (positive class = Tumor), "
+            "Brier, ECE and explicit confusion counts. Spectrum level = "
+            "the honest nested estimate; patient level = per-patient "
+            "mean probability at the deployed threshold.")
+        self.r_supp_spec_lbl = QtWidgets.QLabel("Not run yet.")
+        self.r_supp_spec_lbl.setObjectName("CardHint")
+        self.r_supp_spec_lbl.setWordWrap(True)
+        suppv.addWidget(self.r_supp_spec_lbl)
+        self.r_supp_pat_lbl = QtWidgets.QLabel("")
+        self.r_supp_pat_lbl.setObjectName("CardHint")
+        self.r_supp_pat_lbl.setWordWrap(True)
+        suppv.addWidget(self.r_supp_pat_lbl)
+        self.r_supp_thr_lbl = QtWidgets.QLabel("")
+        self.r_supp_thr_lbl.setObjectName("CardHint")
+        self.r_supp_thr_lbl.setWordWrap(True)
+        suppv.addWidget(self.r_supp_thr_lbl)
+        self.r_supp_card = supp
+        v.addWidget(supp)
         # per-patient out-of-fold performance (hard-patient analysis)
         pmap, pmapv = self.card("Per-patient performance (out-of-fold)",
                                 "Which patients does the model actually "
@@ -3387,6 +3411,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._honest_result is not None:
             manifest["nested_honest_f1"] = round(
                 self._honest_result["mean_f1"], 4)
+            # machine-readable supplementary metrics (2026-09-08) —
+            # additive keys; spectrum level = honest pooled estimate
+            h = self._honest_result
+            cm = h.get("cm")
+            entry = {"evaluation_unit": "spectrum",
+                     "protocol": "nested honest (preprocessing re-chosen "
+                                 "per fold), pooled confusion matrix",
+                     "f1": round(float(h.get("mean_f1", float("nan"))), 4),
+                     "balanced_accuracy": round(
+                         float(h.get("balanced_accuracy", float("nan"))), 4),
+                     "mcc": round(float(h.get("mcc", float("nan"))), 4),
+                     "roc_auc": round(float(h.get("auc", float("nan"))), 4),
+                     "pr_auc": round(float(h.get("pr_auc", float("nan"))), 4),
+                     "brier_score": round(
+                         float(h.get("brier", float("nan"))), 4)}
+            if cm is not None:
+                cm = np.asarray(cm)
+                entry.update({"tp": int(cm[1, 1]), "tn": int(cm[0, 0]),
+                              "fp": int(cm[0, 1]), "fn": int(cm[1, 0]),
+                              "n": int(cm.sum())})
+            if self.winner is not None and getattr(
+                    self.winner, "thresholds", None):
+                ts = modeling.threshold_stats(self.winner.thresholds)
+                entry["threshold"] = self.winner.threshold
+                entry["threshold_min"] = ts["min"]
+                entry["threshold_max"] = ts["max"]
+                entry["threshold_mean"] = ts["mean"]
+                entry["threshold_median"] = ts["median"]
+                entry["threshold_sd"] = ts["sd"]
+                entry["threshold_iqr"] = ts["iqr"]
+            manifest["honest_metrics"] = entry
         if self._pred_rows:
             manifest["predictions"] = [
                 {"file": f, "class": c, "p": round(p, 4)}
@@ -3992,78 +4047,101 @@ class MainWindow(QtWidgets.QMainWindow):
         w = self.winner
         if w is not None:
             self.r_model_title.setText(f"Winner: {w.name}")
+            # ONE number on screen (2026-09-08): the nested honest
+            # estimate; selection-CV values only as a tagged fallback
+            hs, hp, hf1, hnote = self._honest_display_numbers()
+            honest = hnote.startswith(("NESTED", "Nested"))
             auc_val = None
-            try:
-                if (len(w.classes) == 2
-                        and getattr(w, "oof_proba", None) is not None
-                        and getattr(w, "y_true_encoded", None) is not None):
-                    valid = ~np.isnan(w.oof_proba[:, 1])
-                    if valid.any():
-                        _fpr, _tpr, auc_val = modeling.roc_points(
-                            w.y_true_encoded[valid], w.oof_proba[valid, 1])
-            except Exception:
-                auc_val = None
-            for key, val in (("sens", w.macro.get("sens", (None, 0))[0]),
-                             ("spec", w.macro.get("spec", (None, 0))[0]),
-                             ("f1", w.macro_f1()),
+            if honest and isinstance(self._honest_result, dict):
+                h_auc = self._honest_result.get("auc")
+                if isinstance(h_auc, (int, float)) and np.isfinite(h_auc):
+                    auc_val = float(h_auc)
+            if auc_val is None:
+                try:
+                    if (len(w.classes) == 2
+                            and getattr(w, "oof_proba", None) is not None
+                            and getattr(w, "y_true_encoded", None)
+                            is not None):
+                        valid = ~np.isnan(w.oof_proba[:, 1])
+                        if valid.any():
+                            _fpr, _tpr, auc_val = modeling.roc_points(
+                                w.y_true_encoded[valid],
+                                w.oof_proba[valid, 1])
+                except Exception:
+                    auc_val = None
+            for key, val in (("sens", hs), ("spec", hp), ("f1", hf1),
                              ("auc", auc_val)):
                 lbl = self.r_stats[key]
-                lbl.setText(f"{val:.3f}" if val is not None else "–")
-                if val is not None:
+                lbl.setText(f"{val:.3f}"
+                            if val is not None and np.isfinite(val)
+                            else "–")
+                if val is not None and np.isfinite(val):
                     lbl.setStyleSheet(f"color:{uh.metric_fg(val)};")
-            bits = [f"{self.spin_folds.value()}-fold CV"]
-            if self.chk_repeat.isChecked():
-                bits.append("repeated x3")
-            if self.groups:
-                bits.append(f"grouped by {len(set(self.groups))} patients")
-            if w.threshold is not None:
-                _cal = bool((self.bundle or {}).get("calibrator"))
-                bits.append(f"decision threshold {w.threshold:.3f}"
-                            + (" (calibrated)" if _cal else ""))
-            if lo is not None and hi is not None:
-                bits.append(f"rule-out p≤{lo:.2f} (sens ≥90%) · "
-                            f"rule-in p≥{hi:.2f} (spec ≥90%)")
-            # Wilson CIs from the pooled confusion matrix (binary)
-            try:
-                if w.cm is not None and len(w.classes) == 2:
-                    tp = int(w.cm[1, 1])
-                    fn_ = int(w.cm[1].sum()) - tp
-                    tn = int(w.cm[0, 0])
-                    fp_ = int(w.cm[0].sum()) - tn
-                    s_lo_, s_hi_ = clin.wilson_ci(tp, tp + fn_)
-                    p_lo_, p_hi_ = clin.wilson_ci(tn, tn + fp_)
-                    bits.append(f"sens {tp / (tp + fn_):.2f} "
-                                f"[{s_lo_:.2f}–{s_hi_:.2f}] · "
-                                f"spec {tn / (tn + fp_):.2f} "
-                                f"[{p_lo_:.2f}–{p_hi_:.2f}] (Wilson)")
-            except Exception:
-                pass
-            if auc_val is not None:
+            bits = [hnote] if hnote else []
+            if not honest:
+                bits.append(f"{self.spin_folds.value()}-fold CV")
+                if self.chk_repeat.isChecked():
+                    bits.append("repeated x3")
+                if self.groups:
+                    bits.append(
+                        f"grouped by {len(set(self.groups))} patients")
+                if w.threshold is not None:
+                    _cal = bool((self.bundle or {}).get("calibrator"))
+                    bits.append(f"decision threshold {w.threshold:.3f}"
+                                + (" (calibrated)" if _cal else ""))
+                if lo is not None and hi is not None:
+                    bits.append(f"rule-out p≤{lo:.2f} (sens ≥90%) · "
+                                f"rule-in p≥{hi:.2f} (spec ≥90%)")
+                # Wilson CIs from the pooled confusion matrix (binary)
                 try:
-                    _a, _se, d_lo, d_hi = clin.delong_auc_ci(
-                        (np.asarray(w.y_true_encoded[valid]) == 1),
-                        w.oof_proba[valid, 1])
-                    if np.isfinite(d_lo):
-                        bits.append(f"AUC {auc_val:.3f} "
-                                    f"(DeLong 95% CI "
-                                    f"{d_lo:.2f}–{d_hi:.2f})")
+                    if w.cm is not None and len(w.classes) == 2:
+                        tp = int(w.cm[1, 1])
+                        fn_ = int(w.cm[1].sum()) - tp
+                        tn = int(w.cm[0, 0])
+                        fp_ = int(w.cm[0].sum()) - tn
+                        s_lo_, s_hi_ = clin.wilson_ci(tp, tp + fn_)
+                        p_lo_, p_hi_ = clin.wilson_ci(tn, tn + fp_)
+                        bits.append(f"sens {tp / (tp + fn_):.2f} "
+                                    f"[{s_lo_:.2f}–{s_hi_:.2f}] · "
+                                    f"spec {tn / (tn + fp_):.2f} "
+                                    f"[{p_lo_:.2f}–{p_hi_:.2f}] (Wilson)")
                 except Exception:
                     pass
-            # 95% bootstrap CI for the pooled out-of-fold macro-F1
-            try:
-                if (getattr(w, "oof_proba", None) is not None
-                        and getattr(w, "y_true_encoded", None) is not None):
-                    valid = ~np.isnan(w.oof_proba).any(axis=1)
-                    pred_oof = np.argmax(w.oof_proba[valid], axis=1)
-                    w_groups = (np.asarray(w.groups)[valid]
-                                if getattr(w, "groups", None) else None)
-                    ci_lo, ci_hi = modeling.bootstrap_ci(
-                        w.y_true_encoded[valid], pred_oof,
-                        groups=w_groups)
-                    bits.append(f"macro-F1 95% CI "
-                                f"[{ci_lo:.2f}–{ci_hi:.2f}]")
-            except Exception:
-                pass
+                if auc_val is not None:
+                    try:
+                        _a, _se, d_lo, d_hi = clin.delong_auc_ci(
+                            (np.asarray(w.y_true_encoded[valid]) == 1),
+                            w.oof_proba[valid, 1])
+                        if np.isfinite(d_lo):
+                            bits.append(f"AUC {auc_val:.3f} "
+                                        f"(DeLong 95% CI "
+                                        f"{d_lo:.2f}–{d_hi:.2f})")
+                    except Exception:
+                        pass
+                # 95% bootstrap CI for the pooled out-of-fold macro-F1
+                try:
+                    if (getattr(w, "oof_proba", None) is not None
+                            and getattr(w, "y_true_encoded", None)
+                            is not None):
+                        valid = ~np.isnan(w.oof_proba).any(axis=1)
+                        pred_oof = np.argmax(w.oof_proba[valid], axis=1)
+                        w_groups = (np.asarray(w.groups)[valid]
+                                    if getattr(w, "groups", None) else None)
+                        ci_lo, ci_hi = modeling.bootstrap_ci(
+                            w.y_true_encoded[valid], pred_oof,
+                            groups=w_groups)
+                        bits.append(f"macro-F1 95% CI "
+                                    f"[{ci_lo:.2f}–{ci_hi:.2f}]")
+                except Exception:
+                    pass
+            else:
+                if isinstance(self._honest_result, dict):
+                    std = self._honest_result.get("std_f1")
+                    if isinstance(std, (int, float)) and np.isfinite(std):
+                        bits.append(f"fold spread ±{std:.3f}")
+                if lo is not None and hi is not None:
+                    bits.append(f"rule-out p≤{lo:.2f} (sens ≥90%) · "
+                                f"rule-in p≥{hi:.2f} (spec ≥90%)")
             self.r_model_note.setText(" · ".join(bits))
         else:
             self.r_model_title.setText("No model trained yet")
@@ -4161,6 +4239,99 @@ class MainWindow(QtWidgets.QMainWindow):
             [self._lopo_result, self._seed_result, self._noise_result,
              self._friedman_result and
              self._friedman_result.get("ok")]))
+
+        # ---- supplementary scientific metrics (2026-09-08) ----------------
+        # SPECTRUM level from the honest nested estimate; PATIENT level
+        # from per-patient mean probability at the deployed threshold;
+        # threshold stability from the stored per-fold list.  All purely
+        # additive — no existing number above is touched.
+        h = self._honest_result if isinstance(self._honest_result, dict) \
+            else None
+        spec_txt = pat_txt = thr_txt = ""
+        supp_visible = False
+        if h is not None and np.isfinite(h.get("mean_f1", float("nan"))):
+            cm = h.get("cm")
+            tnfp = ""
+            if cm is not None:
+                cm = np.asarray(cm)
+                tn_, fp_, fn_, tp_ = (int(cm[0, 0]), int(cm[0, 1]),
+                                      int(cm[1, 0]), int(cm[1, 1]))
+                n_ok = (tn_ + fp_ + fn_ + tp_) == int(cm.sum())
+                tnfp = (f" · TP={tp_} TN={tn_} FP={fp_} FN={fn_} "
+                        f"N={tn_+fp_+fn_+tp_}"
+                        + ("" if n_ok else "  [N-CHECK FAILED!]"))
+            def _f(key):
+                v = h.get(key, float("nan"))
+                return f"{v:.3f}" if np.isfinite(v) else "n/a"
+            ece_txt = ""
+            try:
+                import clinical as _clin
+                if (w is not None and w.oof_proba is not None
+                        and w.y_true_encoded is not None
+                        and len(w.classes) == 2):
+                    _pv = ~np.isnan(w.oof_proba[:, 1])
+                    _e = _clin.ece(w.y_true_encoded[_pv],
+                                   w.oof_proba[_pv, 1], n_bins=10)
+                    ece_txt = f" · ECE {_e:.3f} (10 equal-count bins)"
+            except Exception:
+                pass
+            pls_note = (" · Brier n/a — PLS-DA outputs are "
+                        "PSEUDO-probabilities"
+                        if w is not None and "PLS-DA" in w.name else "")
+            spec_txt = (f"SPECTRUM LEVEL (honest nested): "
+                        f"sens {_f('sens')} · spec {_f('spec')} · "
+                        f"balanced acc {_f('balanced_accuracy')} · "
+                        f"MCC {_f('mcc')} · ROC-AUC {_f('auc')} · "
+                        f"PR-AUC {_f('pr_auc')} · Brier {_f('brier')}"
+                        + pls_note + ece_txt + tnfp)
+            supp_visible = True
+        if w is not None and getattr(w, "groups", None) is not None \
+                and getattr(w, "oof_proba", None) is not None:
+            try:
+                pe = modeling.patient_level_evaluation(
+                    w.y_true_encoded, w.groups, w.oof_proba,
+                    getattr(w, "threshold", None))
+                if pe is not None:
+                    def _g(k):
+                        v = pe.get(k, float("nan"))
+                        return f"{v:.3f}" if np.isfinite(v) else "n/a"
+                    pat_txt = (f"PATIENT LEVEL (mean probability at "
+                               f"threshold {pe['threshold']:.3f}): "
+                               f"sens {_g('sens')} · spec {_g('spec')} · "
+                               f"balanced acc {_g('balanced_accuracy')} · "
+                               f"MCC {_g('mcc')} · ROC-AUC {_g('roc_auc')} "
+                               f"· PR-AUC {_g('pr_auc')} · Brier "
+                               f"{_g('brier')} · TP={pe['tp']} "
+                               f"TN={pe['tn']} FP={pe['fp']} "
+                               f"FN={pe['fn']} N={pe['n']}")
+                    supp_visible = True
+            except Exception:
+                self.log("patient-level supplement failed:\n"
+                         + traceback.format_exc())
+        if w is not None and getattr(w, "thresholds", None):
+            ts = modeling.threshold_stats(w.thresholds)
+            vals = ", ".join("—" if t is None else f"{t:.3f}"
+                             for t in w.thresholds)
+            if ts["n_kept"]:
+                warn = ("  ⚠ WARNING: outer-fold thresholds vary "
+                        "substantially — interpret threshold-dependent "
+                        "metrics with caution."
+                        if ts["unstable"] else "")
+                thr_txt = (f"Threshold stability (per-fold: {vals}; "
+                           f"median {ts['median']:.3f}, min {ts['min']:.3f}, "
+                           f"max {ts['max']:.3f}, SD {ts['sd']:.3f}, "
+                           f"IQR {ts['iqr']:.3f}, max/min "
+                           f"{ts['spread_ratio']:.1f}×; "
+                           f"{ts['n_folds'] - ts['n_kept']} fold(s) kept "
+                           f"the 0.5 rule)" + warn)
+                supp_visible = True
+            else:
+                thr_txt = (f"Threshold stability: all {ts['n_folds']} "
+                           "folds kept the 0.5 rule (no tuned threshold).")
+        self.r_supp_spec_lbl.setText(spec_txt or "Honest estimate not run.")
+        self.r_supp_pat_lbl.setText(pat_txt)
+        self.r_supp_thr_lbl.setText(thr_txt)
+        self.r_supp_card.setVisible(supp_visible)
 
         # ---- per-patient out-of-fold performance map -----------------------
         if (w is not None and getattr(w, "oof_proba", None) is not None
@@ -4551,6 +4722,66 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 f"Saved {len(saved)} figures to {folder}")
 
+    def _supplement_report_lines(self) -> list[str]:
+        """Plain-text supplementary-metrics block shared by the txt and
+        HTML report writers (2026-09-08 formula audit).  PATIENT and
+        SPECTRUM levels explicitly labeled; threshold stability from
+        the stored per-fold values."""
+        h = self._honest_result if isinstance(self._honest_result, dict) \
+            else None
+        w = self.winner
+        lines = []
+        if h is not None and np.isfinite(h.get("mean_f1", float("nan"))):
+            cm = h.get("cm")
+            lines.append("Supplementary metrics — SPECTRUM LEVEL "
+                         "(honest nested, pooled):")
+            lines.append(f"  balanced accuracy "
+                         f"{h.get('balanced_accuracy', float('nan')):.3f} · "
+                         f"MCC {h.get('mcc', float('nan')):.3f} · "
+                         f"PR-AUC {h.get('pr_auc', float('nan')):.3f} · "
+                         f"Brier {h.get('brier', float('nan')):.3f}")
+            if cm is not None:
+                cm = np.asarray(cm)
+                lines.append(f"  TP={int(cm[1,1])} TN={int(cm[0,0])} "
+                             f"FP={int(cm[0,1])} FN={int(cm[1,0])} "
+                             f"N={int(cm.sum())}")
+        if w is not None and getattr(w, "groups", None) is not None \
+                and getattr(w, "oof_proba", None) is not None:
+            try:
+                pe = modeling.patient_level_evaluation(
+                    w.y_true_encoded, w.groups, w.oof_proba,
+                    getattr(w, "threshold", None))
+                if pe is not None:
+                    lines.append("Supplementary metrics — PATIENT LEVEL "
+                                 "(mean probability at the deployed "
+                                 "threshold):")
+                    lines.append(
+                        f"  N={pe['n']} TP={pe['tp']} TN={pe['tn']} "
+                        f"FP={pe['fp']} FN={pe['fn']} · sens "
+                        f"{pe['sens']:.3f} · spec {pe['spec']:.3f} · "
+                        f"balanced acc {pe['balanced_accuracy']:.3f} · "
+                        f"MCC {pe['mcc']:.3f} · AUC {pe['roc_auc']:.3f} · "
+                        f"PR-AUC {pe['pr_auc']:.3f} · Brier "
+                        f"{pe['brier']:.3f}")
+            except Exception:
+                pass
+        if w is not None and getattr(w, "thresholds", None):
+            ts = modeling.threshold_stats(w.thresholds)
+            if ts["n_kept"]:
+                lines.append(
+                    "Threshold stability: per-fold "
+                    + ", ".join("—" if t is None else f"{t:.3f}"
+                                for t in w.thresholds)
+                    + (f" — min {ts['min']:.3f} max {ts['max']:.3f} "
+                       f"SD {ts['sd']:.3f} IQR {ts['iqr']:.3f} "
+                       f"(max/min {ts['spread_ratio']:.1f}x)"))
+                if ts["unstable"]:
+                    lines.append(
+                        "  WARNING: outer-fold thresholds vary "
+                        "substantially — interpret threshold-dependent "
+                        "metrics with caution.")
+        return lines
+
     def save_result_report(self):
         """Write everything on the Result page to result_report.txt."""
         from datetime import datetime
@@ -4572,10 +4803,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if w is not None:
             lines.append("")
             lines.append(f"Winning model: {w.name}")
-            lines.append(f"  sensitivity {w.macro.get('sens', (0,))[0]:.3f}"
-                         f" · specificity "
-                         f"{w.macro.get('spec', (0,))[0]:.3f}"
-                         f" · macro-F1 {w.macro_f1():.3f}")
+            # ONE number (2026-09-08): the nested honest estimate; the
+            # selection-CV ranking below is labeled as what picked the
+            # winner, never as reported performance
+            hs, hp, hf1, hnote = self._honest_display_numbers()
+
+            def _n(v):
+                return f"{v:.3f}" if np.isfinite(v) else "n/a"
+            lines.append(f"  sensitivity {_n(hs)} · specificity {_n(hp)}"
+                         f" · macro-F1 {_n(hf1)}")
+            lines.append(f"  {hnote}")
             if w.threshold is not None:
                 lines.append(f"  decision threshold {w.threshold:.3f}")
             if self._region_bands:
@@ -4584,11 +4821,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 lines.append(f"  top discriminative bands: {tops}")
             if self.results:
                 lines.append("")
-                lines.append("Model comparison (macro-F1):")
+                lines.append("Model comparison — SELECTION ranking "
+                             "(internal CV, used to pick the winner; not "
+                             "the reported performance):")
                 for r in sorted((x for x in self.results
                                  if x.error is None),
                                 key=lambda x: -x.macro_f1()):
                     lines.append(f"  {r.name:<32} {r.macro_f1():.3f}")
+            supp = self._supplement_report_lines()
+            if supp:
+                lines.append("")
+                lines.extend(supp)
         lines.append("")
         if self._pred_rows:
             pos = self._positive_class()
@@ -4845,14 +5088,20 @@ class MainWindow(QtWidgets.QMainWindow):
                          if n_pat else ""))
                 + "</p>")
         if w is not None:
-            sens = w.macro.get("sens", (0,))[0]
-            spec = w.macro.get("spec", (0,))[0]
+            # ONE number (2026-09-08): the nested honest estimate; a
+            # visible warning replaces it only if it never ran
+            hs, hp, hf1, hnote = self._honest_display_numbers()
+            honest = hnote.startswith(("NESTED", "Nested"))
+
+            def _n(v):
+                return f"{v:.3f}" if np.isfinite(v) else "n/a"
             parts.append(
                 "<h2>Winning model</h2><table><tr><th>Model</th>"
                 f"<td><b>{esc(w.name)}</b></td></tr>"
                 f"<tr><th>Sensitivity / Specificity / macro-F1</th>"
-                f"<td>{sens:.3f} / {spec:.3f} / {w.macro_f1():.3f}"
-                "</td></tr>")
+                f"<td>{_n(hs)} / {_n(hp)} / {_n(hf1)}"
+                "</td></tr>"
+                f"<tr><th>Protocol</th><td>{esc(hnote)}</td></tr>")
             lo_r, hi_r = self._op_points_now()
             if lo_r is not None and hi_r is not None:
                 parts.append(
@@ -4863,13 +5112,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 parts.append("<tr><th>Probabilities</th><td>Platt-"
                              "calibrated (out-of-fold fit)</td></tr>")
             parts.append("</table>")
-            # predictive values
-            if sens is not None and spec is not None:
+            if not honest:
+                parts.append(
+                    "<p class='warn'><b>Honest estimate pending:</b> the "
+                    "numbers above are the PRELIMINARY selection-CV "
+                    "values. Run the diagnostics on the Train page (or "
+                    "retrain) so the nested honest estimate replaces "
+                    "them before citing this report.</p>")
+            # predictive values (deployment calibration; need finite
+            # honest sens/spec or they are meaningless)
+            if np.isfinite(hs) and np.isfinite(hp):
                 rows_ppv = "".join(
                     f"<tr><td>{esc(s_)}</td><td>{pv_:.0%}</td>"
                     f"<td>{ppv_:.0%}</td><td>{npv_:.0%}</td></tr>"
                     for s_, pv_ in clin.PREVALENCE_SCENARIOS
-                    for ppv_, npv_ in [clin.ppv_npv(sens, spec, pv_)])
+                    for ppv_, npv_ in [clin.ppv_npv(hs, hp, pv_)])
                 parts.append(
                     "<h2>Predictive values by clinical setting</h2>"
                     "<table><tr><th>Setting</th><th>Prevalence</th>"
@@ -4911,6 +5168,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if deep_bits:
             parts.append("<h2>Deep evaluation</h2><p>"
                          + "<br>".join(esc(b) for b in deep_bits)
+                         + "</p>")
+        supp = self._supplement_report_lines()
+        if supp:
+            parts.append("<h2>Supplementary scientific metrics</h2><p>"
+                         + "<br>".join(esc(s) for s in supp)
                          + "</p>")
         if self._pred_rows:
             pos = self._positive_class()
@@ -6035,7 +6297,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 "one below.")
             return
         self._diag_cancel.clear()      # fresh chain: no stale cancels
-        queue = [self.run_region_importance,
+        # HONEST FIRST (2026-09-08): its result is the number the
+        # banner shows — land it within seconds of training, before
+        # the slower supplementary diagnostics
+        queue = [self.run_honest_check,
+                 self.run_region_importance,
                  self.run_band_agreement]
         if self._is_chain_winner():
             self.log("Chain winner detected: learning curve / seeds / "
@@ -6049,12 +6315,12 @@ class MainWindow(QtWidgets.QMainWindow):
                       self.run_noise_check,
                       lambda: self.run_locked_eval(auto=True),
                       self.run_lopo]
-        queue.append(self.run_honest_check)   # winner-independent, ~20 s
         self._diag_queue = queue
-        self.log("Auto-running diagnostics (regions, band agreement"
+        self.log("Auto-running diagnostics (honest estimate first, "
+                 "then regions, band agreement"
                  + (", learning curve, seeds, noise, locked, LOPO"
-                    if len(queue) > 3 else "")
-                 + ", honest) — results appear one by one below.")
+                    if len(queue) > 4 else "")
+                 + ") — results appear one by one below.")
         self.train_status.setText("Running diagnostics — results "
                                   "appear one by one below…")
         self._pop_diag_queue()
@@ -6062,15 +6328,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _pop_diag_queue(self):
         """Start the next queued diagnostic once the previous finished
         (and step past runners that only showed a guard dialog)."""
-        if (self._analysis_worker is not None
-                and self._analysis_worker.isRunning()):
-            return                    # _run_async calls us when done
-        if not self._diag_queue:
+        if ((self._analysis_worker is not None
+                and self._analysis_worker.isRunning())
+                or (self._honest_worker is not None
+                    and self._honest_worker.isRunning())):
+            return                    # honest first => its worker gates
+        if not self._diag_queue:      # the chain too (gotcha #16)
             return
         self._diag_queue.pop(0)()
         if (self._diag_queue
                 and (self._analysis_worker is None
-                     or not self._analysis_worker.isRunning())):
+                     or not self._analysis_worker.isRunning())
+                and (self._honest_worker is None
+                     or not self._honest_worker.isRunning())):
             self._pop_diag_queue()    # guard-dialog runner: next!
 
     def _cancel_analysis(self):
@@ -6646,6 +6916,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Honest macro-F1 {out['mean_f1']:.3f} ± "
                 f"{out['std_f1']:.3f} (vs optimistic {optimistic:.3f}) — "
                 "see log.")
+            # the banner now shows the honest numbers (2026-09-08: the
+            # honest estimate IS the displayed performance)
+            self._set_result_banner()
+            self.update_welcome()
             panel = self._diag_panel("honest", "Honest (nested) evaluation",
                                      chart=False)
             self._diag_caption(
@@ -7337,6 +7611,84 @@ class MainWindow(QtWidgets.QMainWindow):
         self.train_status.setText(msg)
         self.statusBar().showMessage(msg)
 
+    def _honest_display_numbers(self):
+        """(sens, spec, f1, note) — the ONLY performance numbers the
+        screen shows (2026-09-08 user decision: one honest number).
+        Priority: 1) live nested-honest result (auto-runs first after
+        every training) 2) the honest F1 persisted in the saved bundle
+        (after a restore) 3) selection-CV numbers tagged PRELIMINARY
+        until the honest estimate lands."""
+        h = self._honest_result
+        if isinstance(h, dict) and np.isfinite(h.get("mean_f1",
+                                                     float("nan"))):
+            return (h.get("sens", float("nan")),
+                    h.get("spec", float("nan")),
+                    float(h["mean_f1"]),
+                    "NESTED HONEST ESTIMATE — preprocessing re-chosen "
+                    "inside every CV fold. This is the number to "
+                    "report.")
+        saved = (self.bundle or {}).get("nested_honest_f1")
+        if isinstance(saved, tuple):
+            saved = saved[0] if saved else None
+        if isinstance(saved, (int, float)) and np.isfinite(saved):
+            return (float("nan"), float("nan"), float(saved),
+                    "Nested honest F1 from the SAVED model — sens/spec "
+                    "were not persisted; re-run diagnostics to refresh.")
+        w = self.winner
+        if w is None:
+            return (float("nan"), float("nan"), float("nan"), "")
+        return (w.macro["sens"][0], w.macro["spec"][0], w.macro_f1(),
+                "PRELIMINARY (selection CV) — the nested honest estimate "
+                "is computing (or press 'Run all diagnostics') and will "
+                "replace these numbers.")
+
+    def _set_result_banner(self):
+        """(Re)build the Train result banner from the honest numbers.
+        Called by on_train_done AND when the honest check completes —
+        the preliminary values are replaced in place."""
+        w = self.winner
+        if w is None:
+            return
+        sens, spec, f1, note = self._honest_display_numbers()
+
+        def _txt(v):
+            return f"{v:.3f}" if np.isfinite(v) else "–"
+        self.banner_title.setText(f"Winner: {w.name}")
+        for key, v in (("sens", sens), ("spec", spec), ("f1", f1)):
+            lbl = self.stat_values[key]
+            lbl.setText(_txt(v))
+            lbl.setStyleSheet(f"color:{uh.metric_fg(v)};"
+                              if np.isfinite(v) else "")
+        extra = (f" Decision threshold tuned to maximize F1: "
+                 f"{w.threshold:.3f}." if w.threshold is not None
+                 else "")
+        mid = (f"Detects {sens:.0%} of true positive cases · correctly "
+               f"rules out {spec:.0%} of negatives"
+               if np.isfinite(sens) and np.isfinite(spec) else "")
+        self.banner_plain.setText(
+            f"{note}" + (f"\n{mid}" if mid else "")
+            + f"\n{self.spin_folds.value()}-fold patient-grouped CV · "
+              "save the model to start predicting."
+            + extra)
+        # B6 patient-level reading belongs to the selection-CV protocol
+        # — only shown while the banner is still preliminary
+        if note.startswith("PRELIMINARY") \
+                and w.groups is not None and w.oof_proba is not None \
+                and w.y_true_encoded is not None:
+            try:
+                pm = sstats.patient_level_metrics(
+                    w.y_true_encoded, w.groups, w.oof_proba)
+                if pm is not None:
+                    self.banner_plain.setText(
+                        self.banner_plain.text()
+                        + f"  ·  Patient-level (mean P, n={pm['n_patients']}):"
+                        f" F1 {pm['f1']:.3f}"
+                        + (f", AUC {pm['auc']:.3f}"
+                           if "auc" in pm else ""))
+            except Exception:
+                self.log("Patient-level metrics failed:\n"
+                         + traceback.format_exc())
+
     def on_train_done(self, results, winner):
         self.results, self.winner = results, winner
         # charts from a previous winner must not linger next to a new one
@@ -7353,41 +7705,12 @@ class MainWindow(QtWidgets.QMainWindow):
         sens = winner.macro["sens"][0]
         spec = winner.macro["spec"][0]
         f1 = winner.macro_f1()
-        # big result banner
-        self.banner_title.setText(f"Winner: {winner.name}")
-        for key, v in (("sens", sens), ("spec", spec), ("f1", f1)):
-            lbl = self.stat_values[key]
-            lbl.setText(f"{v:.3f}")
-            lbl.setStyleSheet(f"color:{uh.metric_fg(v)};")
-        extra = (f" Decision threshold tuned to maximize F1: "
-                 f"{winner.threshold:.3f}." if winner.threshold is not None
-                 else "")
-        self.banner_plain.setText(
-            f"Detects {sens:.0%} of true positive cases · correctly rules "
-            f"out {spec:.0%} of negatives · {self.spin_folds.value()}-fold "
-            "cross-validated. Save the model to start predicting."
-            f"{extra}")
-        # B6: the patient-level (mean-probability) reading next to the
-        # spectrum-level numbers — the operating level the field reports
-        if (winner.groups is not None and winner.oof_proba is not None
-                and winner.y_true_encoded is not None):
-            try:
-                pm = sstats.patient_level_metrics(
-                    winner.y_true_encoded, winner.groups,
-                    winner.oof_proba)
-                if pm is not None:
-                    self.banner_plain.setText(
-                        self.banner_plain.text()
-                        + f"  ·  Patient-level (mean P, n={pm['n_patients']}):"
-                        f" F1 {pm['f1']:.3f}"
-                        + (f", AUC {pm['auc']:.3f}"
-                           if "auc" in pm else ""))
-            except Exception:
-                self.log("Patient-level metrics failed:\n"
-                         + traceback.format_exc())
+        # ONE number on screen: the honest estimate (helper falls back
+        # to a PRELIMINARY tag until the auto honest check lands)
+        self._set_result_banner()
         self.train_status.setText(
-            f"Done — best: {winner.name} (macro-F1 {f1:.3f}). Save it, "
-            "then go to Predict.")
+            f"Done — best: {winner.name} (selection-CV macro-F1 "
+            f"{f1:.3f}); honest estimate next…")
         self.log(f"Training complete. Winner: {winner.name} "
                  f"(macro sens {sens:.3f} / spec {spec:.3f} / F1 {f1:.3f})"
                  + (f", threshold={winner.threshold:.3f}"

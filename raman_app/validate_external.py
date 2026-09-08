@@ -109,6 +109,26 @@ def main(argv=None) -> int:
         print(f"[external] external labels {sorted(set(y))} must be a "
               f"subset of the model's {classes}")
         return 2
+    # 2026-09-08 release gate: junk spectra (NaN/Inf or no signal) would
+    # silently distort every printed metric — the same rule the deploy
+    # guards enforce; skip with a reason instead
+    keep = []
+    for i, row in enumerate(X):
+        if (not np.all(np.isfinite(row))
+                or int(np.count_nonzero(np.abs(row) > 1e-9))
+                < max(3, len(row) // 100)):
+            print(f"[external] skipping spectrum {i} "
+                  f"({y[i]}): NaN/Inf or no usable signal")
+            continue
+        keep.append(i)
+    if len(keep) < len(X):
+        if len(keep) < 2 * len(set(y)):
+            print("[external] too few valid spectra remain — refusing")
+            return 2
+        X = X[keep]
+        y = [y[i] for i in keep]
+        if groups:
+            groups = [groups[i] for i in keep]
     print(f"[external] {len(y)} spectra / "
           f"{len(set(groups)) if groups else 0} patients")
 

@@ -237,6 +237,17 @@ def _metrics_from_oof(y, proba, classes, groups) -> dict:
         out["auc"] = float(roc_auc_score(ye, np.nan_to_num(proba[:, 1])))
     else:
         out["auc"] = float("nan")
+    # supplementary metrics (2026-09-08 formula audit) — ADDITIVE keys
+    # on the same pooled OOF; old screening.jsonl rows simply lack them
+    if len(classes) == 2 and 0 < ye.sum() < len(ye):
+        p1 = np.nan_to_num(proba[:, 1])
+        out["bal_acc"] = modeling.balanced_accuracy_from_cm(cm)
+        out["mcc"] = modeling.mcc_from_cm(cm)
+        out["brier"] = modeling.brier_score(ye, p1)
+        out["pr_auc"] = float(modeling.pr_points(ye, p1)[2])
+    else:
+        out["bal_acc"] = float("nan")
+        out["mcc"] = float("nan")
     if groups is not None:                       # patient-level rollup
         g = np.asarray(groups)
         # patient truth = DOMINANT class of their spectra (not the first

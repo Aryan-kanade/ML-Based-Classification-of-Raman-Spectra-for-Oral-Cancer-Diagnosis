@@ -9,7 +9,9 @@
 > the matching section below. Keep the "Last updated" stamp current.
 > Keep it dense — tables and one-liners, no prose padding.
 
-Last updated: 2026-09-08 (3SSE FAIR SINGLES + mode honesty — §34;
+Last updated: 2026-09-08 (ONE HONEST NUMBER on screen — §36;
+explicit Paired/Unpaired dropdowns — §35;
+3SSE FAIR SINGLES + mode honesty — §34;
 2026-09-07: FILE > CLEAR TRAINING menu action — §33;
 WORKSPACE CLEANUP for a portable copy — §32;
 previously 2026-09-06: WHOLE-PROJECT DEEP AUDIT + REMEDIATION — ~190
@@ -1175,7 +1177,7 @@ snapshot ensembles (cyclic LR not worth tuning).
 
 | Suite | What it proves | Runtime |
 |---|---|---|
-| `test_all.py` (90) | loader hygiene (incl. site-token), preprocessing, grouped+repeated CV/ensembles, bundle roundtrip, optimize, ViT forward/checkpoint, clinical stats, biochem, FDR/Friedman + regressions (clinical reproduce path, paired single-preprocess, OOF repeat pooling, patient bootstrap, data-root discovery, device-portability scan; 2026-09-06: CONTIGUOUS calibration-bins regression, auc_power formula regression; 2026-09-07: clear-training menu action; 2026-09-08: 3SSE fair singles, mode roundtrip) | ~2 min |
+| `test_all.py` (93) | loader hygiene (incl. site-token), preprocessing, grouped+repeated CV/ensembles, bundle roundtrip, optimize, ViT forward/checkpoint, clinical stats, biochem, FDR/Friedman + regressions (clinical reproduce path, paired single-preprocess, OOF repeat pooling, patient bootstrap, data-root discovery, device-portability scan; 2026-09-06: CONTIGUOUS calibration-bins regression, auc_power formula regression; 2026-09-07: clear-training menu action; 2026-09-08: 3SSE fair singles, mode roundtrip, honest-number display, 3SSE-mode respect, pqn bundle flags) | ~2 min |
 | `deep_test.py` (19) | blank-GUI guards, one-class train, predict edge paths, legacy bundles, clinical auto refs, locked eval (+`_lc_data_key` tag in hand-built scenarios), HTML report, deep diagnostics, reset-session, train-tabs layout, CLI roundtrip (cwd-safe since 2026-09-06) | ~60 s |
 | `gui_test.py` (8 steps) | 6-page walk: load→preprocess→train→save→predict→result→report (report asserted in the TEMP APP_DIR since 2026-09-06, not in-tree) | ~20 s |
 
@@ -1997,3 +1999,225 @@ migration, seq-paired-pqn), new `test_run_3sse_now_respects_data_mode`
 (groups present + Data=standard → NOT switched) and
 `test_reproduce_paired_pqn_bundle_flags` (CLI bundle carries
 paired=True, pqn=True).
+
+## 36. 2026-09-08 (afternoon) — ONE HONEST NUMBER on screen
+
+User decision after the reports showed only the optimistic 0.830:
+"show what is correct, why show any other number". The nested honest
+estimate is now THE displayed performance everywhere; the fast
+selection-CV numbers are never presented as performance.
+
+- `evaluate_pipeline` completed: pools ALL outer-fold test
+  predictions → result gains `sens, spec, acc, auc, cm` (macro
+  sens/spec from one pooled confusion matrix; AUC binary, falls back
+  to `decision_function` scores — plain SVC has no predict_proba and
+  every fold picked PCA+SVM on the synthetic test).
+- Diagnostics queue: HONEST FIRST (winner-independent, ~20 s); its
+  worker now GATES the serial chain in `_pop_diag_queue` (moving it
+  first without the gate would overlap two pool-spawning QThreads —
+  gotcha #16). The "Honest check (nested)" BUTTON is REMOVED —
+  automatic now.
+- `_honest_display_numbers()` priority: live `_honest_result` →
+  saved-bundle `nested_honest_f1` (restores; sens/spec not persisted)
+  → selection-CV values tagged "PRELIMINARY … will replace these".
+  `_set_result_banner()` (called by on_train_done AND the honest-done
+  handler — banner swaps in place) renders SENS/SPEC/F1 + note; the
+  B6 patient-level line only shows in the preliminary branch (it is
+  selection-CV protocol).
+- Result page `r_stats` + `r_model_note`: honest values (honest pooled
+  AUC preferred); Wilson/DeLong/bootstrap selection-CI bits only in
+  the preliminary branch.
+- Reports (txt + HTML): "Winning model" = honest sens/spec/F1 +
+  Protocol row; PPV/NPV table only when honest sens/spec finite;
+  HTML `.warn` box when honest never ran; the model list is labeled
+  "SELECTION ranking (internal CV… not the reported performance)".
+  Compare-table card relabeled the same way.
+- DEVIATION from plan: no auto honest-run at restore (would spawn a
+  compute worker inside every isolated-MainWindow test); restore
+  shows the persisted honest F1 from the bundle or the PRELIMINARY
+  tag with the "Run all diagnostics" hint.
+- NUMBER-CHANGING DISPLAY SEMANTICS: every headline number on screen
+  will DROP to the honest protocol (that is the intent). Suite 93/93,
+  gui_test PASS, ruff clean
+  (`test_honest_numbers_are_the_displayed_numbers` pins the swap +
+  reports; the diag-queue order test updated honest-first).
+
+## 37. 2026-09-08 (evening) — EXECUTION AUDIT (user's master QA prompt)
+
+Full execution audit, independent recomputation, no code changes
+needed. Evidence in `.zcode/audit_*.log`. Verdicts:
+- Suites: 93/93 unit + 19/19 deep + gui_test + ruff clean (exit 0 each).
+- Dataset: independent scan 341 files (153/188) / 72 normalized
+  subjects / all 341 files exactly 2271 rows / 0 NaN / 21 byte-dup
+  groups; loader arithmetic EXACT (339 scanned − 4 refs − 18 dups =
+  317 kept; 68 usable pairs; flagged 18/317). LOW: app scans 339 vs
+  my 341 (2-file count gap, zero training impact, unexplained).
+- Leakage: StratifiedGroupKFold rosters 0 patient overlap ×5 folds;
+  60-patient fingerprint probe mean OOF acc 0.488 (≈chance —
+  fingerprints unlearnable); project leakage tests pass live.
+- Metrics: INDEPENDENT recompute (numpy + same splitter + per-fold
+  thresholds) reproduces winner CMs BIT-EXACT (standard + paired);
+  app "macro" = documented mean-of-folds aggregation (≤0.008 pooled
+  delta). Honest-check pooled sens/spec/acc EXACT. Audit lesson: the
+  app's binary preds use per-fold tuned thresholds (None→0.5 rows).
+- Parity: train vs deploy features for the SAME files MAX ABS DIFF
+  0.000e+00; end-to-end predict_with_bundle on 6 real files sane;
+  the full-range-axis guard correctly refuses pre-cropped input.
+- 3SSE: saved-run artifacts internally consistent (24-model run:
+  pairs 552=24·23, triples 1100=50-pair beam·22 ✓; winner.json ↔
+  winner.joblib names match normalized); fresh CLI run on real data
+  exit 0 (15 archs, 3 sound-bound prunes, nested winner F1 0.772,
+  all 5 artifacts). Old screening.jsonl lacks metrics_fair (legacy
+  fallback path — by design).
+- Fake/dead: pattern scan clean (hits = Qt placeholders/docs/torch
+  eval()); dead-code scan clean (Qt/torch overrides + test-runner
+  functions). Security: no secrets; one joblib.load trust boundary
+  (user-picked bundles — acceptable local-research threat model).
+- Perf (real data): load 0.4 s / paired prep 1.7 s / 1-model nested
+  train 1.2 s / predict 0.02 ms per spectrum. Reproducibility: RF
+  trained in two separate processes → identical CM.
+
+## 38. 2026-09-08 (evening 2) — audit round 2 ("11/10"): 2 REAL bugs
+found & fixed, full registry executed (MASTER_AUDIT_REPORT.md)
+
+Audit-1 claims re-verified independently + new attack surface:
+- **Full registry EXECUTED**: 25/25 models train+predict on real
+  paired data, 0 failures (winner Extra Trees 0.760, k=3 seed 42).
+- **Scientific traps** (real path): perfect-sep → F1 1.0; noise /
+  shuffled-labels / constant → chance (0.45/0.47/0.33); one-class →
+  clean ValueError; tiny(≤3 pat) → loud "All models failed" (msg
+  quality LOW note).
+- **Adversarial files** (12 cases): unparseable → clean per-file
+  skips w/ reasons; NaN/Inf/unsorted/unicode/extra-col load (quality
+  handled downstream); extension filter works; zero crashes.
+- **Persistence cross-process**: train→save→NEW process→predict,
+  8 files, MAX |Δp| = 0.0. **CLI↔direct parity**: reproduce_study
+  --mini seed 42 = PCA+LDA F1 0.510/sens 0.516, IDENTICAL to direct
+  evaluate_models. Invariants (prob range/sum/shape/CM-total) hold.
+- **BUG-1 (HIGH, fixed)**: predict_with_bundle(_many) accepted
+  all-NaN / all-zero spectra and returned MAXIMALLY confident
+  predictions (Tumor p=1.0; normalize()'s zero-guard keeps zeros
+  finite so nothing downstream errored). Fix: non-finite input →
+  ValueError with count; zero-signal features → ValueError;
+  paired.reference_vector SKIPS non-finite reference files with a
+  reason (was silently poisoning every paired prediction).
+  Regression: test_predict_rejects_nonfinite_and_degenerate (single
+  + batched + reference paths). NOTE: test_bundle_roundtrip_with_crop
+  used a zeros() DUMMY spectrum — updated to ones() (assertions
+  unchanged; the input is now correctly rejected by design).
+- **BUG-2 (LOW, fixed)**: plotting.plot_count_bars crashed on NaN
+  counts (int(NaN)) — callers pass ints (defensive gap); sanitized.
+- Memory loop: _STAGE_CACHE flat at 598 across cycles (bounded);
+  Win32 working-set RSS unreadable from this host (NOT TESTED,
+  stated honestly).
+- Final regression after fixes: **94/94 + 19/19 deep + gui_test +
+  ruff clean**. Full evidence: .zcode/audit_*.log, final_*.log;
+  MASTER_AUDIT_REPORT.md in repo root (uncommitted).
+
+## 39. 2026-09-08 (night) — ROUND 3 release audit: BUG-1 had 3
+residuals (fixed); valid-data equivalence PROVEN; 🟡 release-ready
+
+Round-3 attacked the Round-2 fixes instead of trusting them:
+- **BUG-1 residuals found + fixed** (same silent-confident-garbage
+  class): one-hot spectrum p=1.0 (wavelet SMEARS a single spike —
+  post-preprocess checks can't see it), subnormal inputs ×1e-300
+  p=1.0 (normalize()'s nrm<1e-12 passthrough → PCA float-underflow),
+  all-zero REFERENCE file warping the paired mean (0.057). Fix:
+  `_reject_raw_degenerate` (raw sparsity/scale, BEFORE preprocess,
+  AFTER the axis guard to keep the documented batch error) +
+  `_reject_degenerate` (post-preprocess finite/scale) in both deploy
+  paths; `reference_vector` skips no-signal files. Battery: 20 input
+  classes × 3 paths — 16 must-reject all rejected; regression test
+  extended (one-hot/subnormal/zero-ref + constants still accepted).
+- **Valid-data equivalence PROVEN:** paired RF cm, GNB fold-means,
+  standard-mode 3-model table, honest-check numbers, and the full
+  registry winner (ET 0.760) all reproduce EXACTLY vs Round-1/2
+  baselines → the guards changed nothing for real data.
+- 3-process persistence 0.0 ×2 more; GUI PredictWorker stale-state
+  (valid→NaN-mixed→valid) recovers identically, NaN file yields NO
+  row; fresh-seed leakage probe 0.485; git diff audit clean.
+- Clean-state suite: **94/94 + 19/19 + GUI + ruff, exit 0**.
+- Accepted limitations (documented): finite-signal GOOD inputs can be
+  confident (recommend deploy spike-flagging someday); tiny-data
+  failure msg is a traceback blob; loader count note A-1; RSS proxy
+  only; no human-eye GUI pass; no external cohort.
+- **Verdict: 🟡 RELEASE READY WITH LIMITATIONS — 97/100**
+  (MASTER_AUDIT_REPORT.md round-3 section).
+
+## 40. 2026-09-08 (final) — ROUND 4 release gate: 2 LOW gate fixes,
+all invariance exact, LEFT UNCOMMITTED
+
+Gate re-verified everything fresh on the working tree (no commit, per
+rule). Found + fixed:
+1. `validate_external.py` predicted on NaN/no-signal spectra directly
+   (the ONE unguarded prediction path) → now skips junk with printed
+   reasons; executed against a cohort containing NaN + zero files.
+2. Length-mismatched arrays (empty intensities) crashed with
+   **IndexError** at the sort step BEFORE any guard (both deploy
+   paths) → clean ValueError placed before the indexing; pinned in
+   test_predict_rejects_nonfinite_and_degenerate.
+Diff audit: 7 files +717/−142 (gate's assumed 5/+221/−37 was wrong),
+--check clean, zero secrets/debug/prints. All invariance baselines
+reproduced EXACTLY again (RF cm, GNB, honest, ET 0.760 registry 25/25
+with per-model probability invariants). Persistence A/B/C 0.0; GUI
+valid→NaN→valid identical recovery; CLI parity exact (0.510/0.516);
+plotting 10 cases; perf no regression (load 0.5 s / train 1.3 s /
+0.021 ms). Suite: **94/94 + 19/19 + GUI + ruff exit 0**. Score
+97/100, verdict 🟡 RELEASE READY WITH LIMITATIONS — recommended
+commit message prepared in MASTER_AUDIT_REPORT.md round-4; repo left
+uncommitted for the user.
+
+## 41. 2026-09-08 (night 2) — formula audit trilogy executed;
+supplementary metrics IMPLEMENTED (invariance proven)
+
+Stage 2/3 of the metric program (docs at repo root):
+CURRENT_FORMULA_AUDIT.md (forensic extraction) →
+audit_metrics_independent.py (ALL PASS: synthetic exact incl. MCC
+50/√9900=.5025, real-data project==independent on every overlapping
+metric) → FORMULA_COMPARISON/RECOMMENDATIONS (KEEP all core formulas;
+REPLACE none; SUPPLEMENT bacc/MCC/PR-AP/Brier/threshold-stability/
+patient-level; KEEP-WITH-LIMITATION threshold instability — measured
+GNB spread 0.010–0.884 = 91×!, PLS-DA pseudo-probs, ddof=0 fold SD,
+spectrum-level DeLong).
+
+IMPLEMENTED (reporting-only, additive):
+- modeling: balanced_accuracy_from_cm, mcc_from_cm (binary, 0 on
+  zero-den), brier_score (probabilities only), threshold_stats
+  (per-fold min/max/mean/median/SD/IQR/spread; unstable => >10x or
+  SD>.2, computed), patient_level_evaluation (mean-P at the EXISTING
+  deployed threshold; dominant-class truth). evaluate_pipeline +
+  sequential._metrics_from_oof gain additive keys (bacc/mcc/brier/
+  pr_auc).
+- GUI: new Result card "Supplementary scientific metrics" — SPECTRUM
+  LEVEL (honest + ECE + TP/TN/FP/FN/N invariant check) and PATIENT
+  LEVEL labeled separately; threshold stability + ⚠ warning; PLS-DA
+  Brier → "n/a — pseudo-probabilities". txt/HTML reports + freeze
+  manifest honest_metrics block (evaluation_unit, tp/tn/fp/fn/n,
+  threshold_*). ECE documented: 10 equal-count contiguous bins,
+  mass-weighted.
+- KNOWN LIMITATION SURFACED: patient-level on PAIRED winners
+  (dominant-tie→Normal + spectrum threshold not transferring to
+  mean-P; GNB: sens .77/spec .15/MCC −.10) — visible now, tied to
+  open item 9 (margin patient semantics pass someday).
+- Tests +2 (formula battery TP8/TN7/FP2/FN=3 exact; report/manifest)
+  → suite **96/96 + 19/19 + GUI + ruff, exit 0**.
+- SCIENTIFIC INVARIANCE PROVEN after implementation: RF cm/thresholds/
+  threshold, GNB cm/fold-means, honest keys, ET 0.760 — ALL
+  bit-identical (one false alarm during verification was a rounding
+  bug in my comparison constants, not a behavior change).
+  METRIC_IMPROVEMENT_IMPLEMENTATION.md holds the full record.
+
+## 42. 2026-09-08 (final) — 5th round: FINAL RELEASE AUDIT → 🟢 RELEASE
+
+Fresh validation-only pass on the current tree (FINAL_RELEASE_AUDIT.md).
+- Suites: **96/96 + 19/19 + GUI + ruff, exit 0**; registry 25/25
+  (3rd independent run, ET 0.760, prob invariants clean, 232 s).
+- Invariance ALL IDENTICAL (RF cm/thresholds, GNB cm/fold-means,
+  honest keys, ET, 3SSE artifacts, persistence 0.0e+00) — zero
+  regressions to classify.
+- Leakage fresh: folds 0-overlap; probe seeds 101/202/303 mean 0.443;
+  3SSE OOF + paired leakage tests live PASS.
+- Error battery fresh: nonexistent/corrupt/non-bundle/length-mismatch
+  models all fail-safe.
+- Verdict **🟢 RELEASE** — limitations documented (§18 of the audit),
+  repo left uncommitted with the prepared commit message.

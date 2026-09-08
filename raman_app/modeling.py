@@ -1185,6 +1185,125 @@ def class_metrics_from_cm(cm: np.ndarray) -> dict[str, dict[str, float]]:
     return out
 
 
+def balanced_accuracy_from_cm(cm: np.ndarray) -> float:
+    """Balanced accuracy = mean per-class recall (= (sens+spec)/2 for
+    binary).  Supplementary metric (2026-09-08 formula audit): keep
+    Accuracy alongside — this only ADDS information."""
+    cm = np.asarray(cm)
+    recalls = []
+    for i in range(cm.shape[0]):
+        denom = cm[i].sum()
+        recalls.append(cm[i, i] / denom if denom > 0 else 0.0)
+    return float(np.mean(recalls)) if recalls else float("nan")
+
+
+def mcc_from_cm(cm: np.ndarray) -> float:
+    """Matthews correlation coefficient from a BINARY confusion
+    matrix [[TN,FP],[FN,TP]]:
+        (TP*TN - FP*FN) / sqrt((TP+FP)(TP+FN)(TN+FP)(TN+FN))
+    Zero denominator -> 0.0 (safe).  Non-binary -> NaN (the binary
+    formula does not generalize; documented limitation)."""
+    cm = np.asarray(cm)
+    if cm.shape != (2, 2):
+        return float("nan")
+    tn, fp, fn, tp = (float(cm[0, 0]), float(cm[0, 1]),
+                      float(cm[1, 0]), float(cm[1, 1]))
+    den = np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    if den <= 0:
+        return 0.0
+    return float((tp * tn - fp * fn) / den)
+
+
+def brier_score(y_true01, p_pos) -> float:
+    """Brier score for the positive-class probability:
+    mean((p_i - y_i)^2) over rows with finite p.  Probabilities only —
+    never hard labels.  Lower is better (0 = perfect)."""
+    y = np.asarray(y_true01, dtype=float)
+    p = np.asarray(p_pos, dtype=float)
+    ok = np.isfinite(p)
+    if not ok.any():
+        return float("nan")
+    return float(np.mean((p[ok] - y[ok]) ** 2))
+
+
+def threshold_stats(thresholds) -> dict:
+    """Spread of the per-fold binary thresholds (stored in
+    ModelResult.thresholds; None = that fold kept the 0.5/argmax
+    rule).  ADDITIVE reporting (2026-09-08): the deployment threshold
+    itself never changes — this only makes its stability visible.
+    `unstable` fires on a >10x max/min spread OR SD > 0.2, computed
+    from the data (never hardcoded)."""
+    vals = [float(t) for t in (thresholds or []) if t is not None]
+    out = {"n_folds": len(list(thresholds or [])), "n_kept": len(vals),
+           "min": None, "max": None, "mean": None, "median": None,
+           "sd": None, "iqr": None, "spread_ratio": None,
+           "unstable": False, "values": vals}
+    if not vals:
+        return out
+    v = np.asarray(vals)
+    q1, q3 = np.percentile(v, [25, 75])
+    out.update({"min": float(v.min()), "max": float(v.max()),
+                "mean": float(v.mean()), "median": float(np.median(v)),
+                "sd": float(v.std()), "iqr": float(q3 - q1)})
+    vmin = max(v.min(), 1e-6)
+    out["spread_ratio"] = float(v.max() / vmin)
+    out["unstable"] = bool(out["spread_ratio"] > 10.0 or out["sd"] > 0.2)
+    return out
+
+
+def patient_level_evaluation(y_encoded, groups, oof_proba,
+                             threshold: float | None = None
+                             ) -> dict | None:
+    """Patient-level evaluation (supplementary, 2026-09-08).
+
+    Aggregation is UNCHANGED from the deployed rule: each patient's
+    probability = MEAN of their spectrum probabilities; the patient is
+    positive when that mean >= the given (existing) threshold (0.5
+    fallback).  Returns the full metric set on the patient confusion
+    matrix + rank metrics on the patient mean-probabilities, or None
+    when grouping is unavailable."""
+    if groups is None or oof_proba is None or y_encoded is None:
+        return None
+    ye = np.asarray(y_encoded)
+    g = np.asarray(groups)
+    P = np.asarray(oof_proba)
+    ok = ~np.isnan(P).any(axis=1)
+    ye, g, P = ye[ok], g[ok], P[ok]
+    if len(P) == 0 or P.shape[1] != 2:
+        return None
+    thr = float(threshold) if threshold is not None else 0.5
+    pats = []
+    for gu in np.unique(g):
+        m = g == gu
+        p_mean = float(P[m, 1].mean())
+        # patient truth = DOMINANT class among their spectra (paired
+        # patients contribute both classes; same rule as the existing
+        # per-patient rollup)
+        vals, cnts = np.unique(ye[m], return_counts=True)
+        pats.append((int(vals[np.argmax(cnts)]), p_mean))
+    y_pat = np.array([p[0] for p in pats])
+    p_pat = np.array([p[1] for p in pats])
+    pred = (p_pat >= thr).astype(int)
+    cm = np.zeros((2, 2), int)
+    for t, q in zip(y_pat, pred):
+        cm[t, q] += 1
+    per = class_metrics_from_cm(cm)
+    return {
+        "n": int(len(pats)),
+        "tp": int(cm[1, 1]), "tn": int(cm[0, 0]),
+        "fp": int(cm[0, 1]), "fn": int(cm[1, 0]),
+        "sens": per["1"]["sens"], "spec": per["0"]["sens"],
+        "precision": per["1"]["prec"], "f1": per["1"]["f1"],
+        "accuracy": float(np.trace(cm) / max(cm.sum(), 1)),
+        "balanced_accuracy": balanced_accuracy_from_cm(cm),
+        "mcc": mcc_from_cm(cm),
+        "roc_auc": float(roc_points(y_pat, p_pat)[2]),
+        "pr_auc": float(pr_points(y_pat, p_pat)[2]),
+        "brier": brier_score(y_pat, p_pat),
+        "threshold": thr,
+    }
+
+
 def best_f1_threshold(y_true: np.ndarray, scores: np.ndarray):
     """Threshold maximizing F1 (and Youden's J) for score -> positive class."""
     thresholds = np.unique(np.quantile(scores, np.linspace(0.01, 0.99, 99)))
@@ -1906,7 +2025,10 @@ def evaluate_pipeline(X_raw: np.ndarray, wn: np.ndarray, y: list[str],
     patients.  Removes the selection bias of picking preprocessing on
     the same data it is scored on.
 
-    Returns {mean_f1, std_f1, fold_f1s, fold_choices}.
+    Returns {mean_f1, std_f1, fold_f1s, fold_choices} plus POOLED
+    honest metrics over all outer test rows (2026-09-08):
+    {sens, spec, acc, auc, cm} — macro sens/spec from one pooled
+    confusion matrix; AUC binary-only (NaN otherwise).
     """
     from sklearn.metrics import f1_score
     import optimize
@@ -1928,6 +2050,13 @@ def evaluate_pipeline(X_raw: np.ndarray, wn: np.ndarray, y: list[str],
     y_arr = np.asarray(y)
     g_arr = np.asarray(groups) if groups is not None else None
     fold_f1s, fold_choices = [], []
+    # pooled test predictions across all outer folds -> the honest
+    # sens/spec/AUC the GUI banner and the reports display (2026-09-08:
+    # mean_f1 alone left the honest estimate incomplete next to the
+    # full-metric optimistic numbers)
+    pool_y: list = []
+    pool_pred: list = []
+    pool_p: list = []
     for fi, (tr, te) in enumerate(splitter.split(X_raw, y_arr, g_arr),
                                   start=1):
         if progress:
@@ -1942,16 +2071,71 @@ def evaluate_pipeline(X_raw: np.ndarray, wn: np.ndarray, y: list[str],
         Xte = pp.preprocess_matrix(X_raw[te], params, wn=wn)
         est = clone(model_by_name[model_name])
         est.fit(Xtr, y_arr[tr])
-        f1 = f1_score(y_arr[te], est.predict(Xte), average="macro")
+        pred = est.predict(Xte)
+        f1 = f1_score(y_arr[te], pred, average="macro")
         fold_f1s.append(float(f1))
         fold_choices.append({"fold": fi, "preprocess": sub["best"]["label"],
                              "model": model_name, "f1": float(f1)})
+        pool_y.extend(y_arr[te])
+        pool_pred.extend(pred)
+        p_col = None
+        if hasattr(est, "predict_proba"):
+            try:
+                proba = np.asarray(est.predict_proba(Xte))
+                if proba.ndim == 2 and proba.shape[1] == 2:
+                    p_col = proba[:, 1]
+            except Exception:
+                p_col = None
+        if p_col is None and hasattr(est, "decision_function"):
+            # AUC needs a SCORE, not a calibrated probability — plain
+            # SVC (the optimizer's frequent pick) only exposes
+            # decision_function
+            try:
+                dec = np.asarray(est.decision_function(Xte))
+                if dec.ndim == 1:
+                    p_col = dec
+            except Exception:
+                p_col = None
+        pool_p.extend(p_col if p_col is not None
+                      else [None] * len(pred))
         if progress:
             progress(f"nested fold {fi}/{k}: {sub['best']['label']} + "
                      f"{model_name} -> F1 {f1:.3f}")
+    labels = sorted(set(y_arr.tolist()))
+    cm = confusion_matrix(pool_y, pool_pred, labels=labels)
+    per = class_metrics_from_cm(cm)
+    sens = float(np.mean([m["sens"] for m in per.values()]))
+    spec = float(np.mean([m["spec"] for m in per.values()]))
+    acc = float(np.trace(cm) / max(cm.sum(), 1))
+    auc = float("nan")
+    p_arr = np.asarray(pool_p, dtype=float)
+    if len(pool_p) == len(pool_y) and len(labels) == 2 \
+            and bool(np.all(np.isfinite(p_arr))):
+        enc = np.asarray([0 if v == labels[0] else 1 for v in pool_y])
+        try:
+            auc = float(roc_points(enc, p_arr)[2])
+        except Exception:
+            auc = float("nan")
+    # supplementary metrics (2026-09-08 formula audit) — ADDITIVE keys,
+    # computed from the SAME pooled rows/probabilities
+    supp = {}
+    if len(labels) == 2:
+        enc = np.asarray([0 if v == labels[0] else 1 for v in pool_y])
+        supp["balanced_accuracy"] = balanced_accuracy_from_cm(cm)
+        supp["mcc"] = mcc_from_cm(cm)
+        if bool(np.all(np.isfinite(p_arr))) and len(p_arr) == len(enc):
+            supp["brier"] = brier_score(enc, p_arr)
+            supp["pr_auc"] = float(pr_points(enc, p_arr)[2])
+        else:
+            supp["brier"] = float("nan")
+            supp["pr_auc"] = float("nan")
     return {"mean_f1": float(np.mean(fold_f1s)),
             "std_f1": float(np.std(fold_f1s)),
-            "fold_f1s": fold_f1s, "fold_choices": fold_choices}
+            "fold_f1s": fold_f1s, "fold_choices": fold_choices,
+            # pooled honest metrics (additive — old consumers only read
+            # the four keys above)
+            "sens": sens, "spec": spec, "acc": acc, "auc": auc,
+            "cm": cm, **supp}
 
 
 def learning_curve_by_groups(X, y_encoded, groups, estimator,
@@ -2090,6 +2274,31 @@ def _apply_reference(xc: np.ndarray, reference: np.ndarray,
     return xc - reference
 
 
+def _reject_raw_degenerate(it: np.ndarray):
+    """BUG-1 raw-input check: junk spectra (empty, lone spike, subnormal
+    scale) must be rejected BEFORE preprocessing — the wavelet stage
+    smears a single spike into many tiny values, hiding it afterwards.
+    Real files carry intensity ~1e0..1e5 across essentially all points."""
+    nz = int(np.count_nonzero(np.abs(it) > 1e-9))
+    if nz < max(3, len(it) // 100):
+        raise ValueError(
+            f"spectrum has no usable signal ({nz} of {len(it)} points "
+            "carry intensity — empty, single-point or numerically "
+            "degenerate); fix or re-measure the file")
+
+
+def _reject_degenerate(xc: np.ndarray):
+    """Deploy-boundary check on the PREPROCESSED vector (BUG-1):
+    non-finite or subnormal-scale features (float-underflow territory
+    for PCA) must never become a silent confident prediction."""
+    if (not np.all(np.isfinite(xc))
+            or float(np.abs(xc).max(initial=0.0)) < 1e-9):
+        raise ValueError(
+            "spectrum has no usable signal in the model's wavenumber "
+            "range (empty, all-zero or numerically degenerate after "
+            "preprocessing)")
+
+
 def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
                         intensities: np.ndarray,
                         reference: np.ndarray | None = None) -> dict:
@@ -2109,8 +2318,24 @@ def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
         # trust boundary (hand-made or future writers)
         return p if hasattr(p, "validate") else PreprocessParams(**p)
 
+    # release-gate: mismatched/empty arrays crashed at the sort itself
+    # (IndexError) before any guard could speak — reject cleanly FIRST
+    if len(wavenumbers) != len(intensities) or len(intensities) == 0:
+        raise ValueError(
+            f"empty or mismatched spectrum arrays ({len(wavenumbers)} "
+            f"wavenumbers vs {len(intensities)} intensities) — the "
+            "file is corrupt")
     order = np.argsort(wavenumbers)
     wn, it = np.asarray(wavenumbers)[order], np.asarray(intensities)[order]
+    # non-finite guard (2026-09-08 audit BUG-1): an all-NaN spectrum used
+    # to reach the classifier as zeros and came back with MAXIMAL
+    # confidence (Tumor p=1.0) — silent garbage.  Fail loudly instead.
+    n_bad = int(np.count_nonzero(~np.isfinite(it)))
+    if n_bad:
+        raise ValueError(
+            f"spectrum contains {n_bad} NaN/Inf intensity points — fix "
+            "or re-measure the file; predicting on it would fabricate a "
+            "confident answer")
     grid = np.asarray(bundle["wavenumbers"], dtype=float)
     # overlap guard (2026-09-05): np.interp CONSTANT-extrapolates, so a
     # spectrum whose measured axis does not span the training grid would
@@ -2123,6 +2348,7 @@ def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
             f"does not cover the model's wavenumber range "
             f"{lo:.1f}-{hi:.1f} — interpolation would fabricate the "
             f"missing region")
+    _reject_raw_degenerate(it)
     y = np.interp(grid, wn, it)
     params = _as_params(bundle["prep_params"])
     # 2026-09-06: bundles trained with wn_calibrate=True were predicted
@@ -2139,6 +2365,7 @@ def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
     proba = None
     for vec in ((y[m], y) if int(m.sum()) != len(grid) else (y,)):
         xc = preprocess_spectrum(vec, params)
+        _reject_degenerate(xc)
         if reference is not None:
             xc = _apply_reference(xc, reference, bundle)
         try:
@@ -2234,19 +2461,37 @@ def predict_with_bundle_many(bundle: dict, spectra: list,
     lo, hi = float(grid.min()), float(grid.max())
     for i, ((wn, it), ref) in enumerate(zip(spectra, refs, strict=True)):
         try:
+            # release-gate: mismatched/empty arrays crashed at the sort
+            # itself before any guard could speak — reject cleanly FIRST
+            if len(wn) != len(it) or len(it) == 0:
+                raise ValueError(
+                    f"empty or mismatched spectrum arrays ({len(wn)} "
+                    f"wavenumbers vs {len(it)} intensities) — the file "
+                    "is corrupt")
             order = np.argsort(wn)
             w, x = np.asarray(wn)[order], np.asarray(it)[order]
+            # BUG-1 guards (2026-09-08): identical to the single-spectrum
+            # path — non-finite input and degenerate features must land
+            # in errors[i], never in a confident prediction
+            n_bad = int(np.count_nonzero(~np.isfinite(x)))
+            if n_bad:
+                raise ValueError(
+                    f"spectrum contains {n_bad} NaN/Inf intensity points "
+                    "— fix or re-measure the file; predicting on it "
+                    "would fabricate a confident answer")
             if float(w[0]) > lo + 1.0 or float(w[-1]) < hi - 1.0:
                 raise ValueError(
                     f"spectrum axis {float(w[0]):.1f}-{float(w[-1]):.1f} "
                     f"cm-1 does not cover the model's wavenumber range "
                     f"{lo:.1f}-{hi:.1f} — interpolation would fabricate "
                     f"the missing region")
+            _reject_raw_degenerate(x)
             y = np.interp(grid, w, x)
             if params.wn_calibrate:
                 y = align_to_grid(w, x, grid, params)
             for vec in ((y[m], y) if int(m.sum()) != len(grid) else (y,)):
                 xc = preprocess_spectrum(vec, params)
+                _reject_degenerate(xc)
                 if ref is not None:
                     xc = _apply_reference(xc, ref, bundle)
                 if exp is None or len(xc) == exp:

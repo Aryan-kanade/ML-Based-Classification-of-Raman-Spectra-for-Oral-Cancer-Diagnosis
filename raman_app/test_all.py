@@ -204,8 +204,11 @@ def test_bundle_roundtrip_with_crop():
         modeling.save_bundle(path, winner, wn_bundle, params)
         b = modeling.load_bundle(path)
         # raw spectrum spanning the full grid -> cropped inside
+        # (2026-09-08: a zeros() dummy is now correctly REJECTED by the
+        # BUG-1 zero-signal guard — use a constant-with-signal vector;
+        # the assertion targets crop/axis mechanics, which are unchanged)
         out = modeling.predict_with_bundle(b, wn_bundle[::-1],
-                                           np.zeros_like(wn_bundle))
+                                           np.ones_like(wn_bundle))
         assert out["prediction"] in ("A", "B")
         assert abs(sum(out["probabilities"].values()) - 1) < 1e-6
 
@@ -1751,6 +1754,98 @@ def test_reference_vector_junk_tolerance():
         # input was removed 2026-09-06)
 
 
+def test_predict_rejects_nonfinite_and_degenerate():
+    """2026-09-08 execution-audit BUG-1: an all-NaN or all-zero spectrum
+    used to return a MAXIMALLY confident prediction (Tumor p=1.0) —
+    silent garbage.  Both deploy entry points now reject with a clear
+    ValueError; finite input still predicts; a non-finite REFERENCE
+    file is skipped with a reason instead of poisoning the mean."""
+    import paired as paired_mod
+    X, y, g = _synthetic_ml(n=60, groups_n=10, seed=9)
+    wn = np.linspace(500.0, 2000.0, X.shape[1])
+    results, winner = modeling.evaluate_models(
+        X, y, ["PCA + LDA"], 3, 42, groups=g, repeats=1, wavenumbers=wn)
+    params = pp.PreprocessParams().validate()
+    with tempfile.TemporaryDirectory() as td:
+        bpath = os.path.join(td, "w.joblib")
+        modeling.save_bundle(bpath, winner, wn, params, dataset_name="t")
+        b = modeling.load_bundle(bpath)
+        good = (wn, X[0])
+        r = modeling.predict_with_bundle(b, *good)
+        assert r["prediction"] in ("A", "B")     # finite input still works
+        bad_inputs = {
+            "all-NaN": X[0] * np.nan,
+            "half-NaN": np.where(np.arange(X.shape[1]) < 20, X[0], np.nan),
+            "all-zero": np.zeros_like(X[0]),
+            # round 3 residuals — same BUG-1 class, all previously
+            # returned p=1.0 CONFIDENT predictions:
+            "one-nonzero-point": np.where(
+                np.arange(X.shape[1]) == 5, 1.0, 0.0),
+            "subnormal-scale": X[0] * 1e-300,     # PCA float-underflow
+            "near-zero-constant": np.full(X.shape[1], 1e-300),
+        }
+        for name, inten in bad_inputs.items():
+            try:
+                modeling.predict_with_bundle(b, wn, inten)
+            except ValueError as exc:
+                assert "signal" in str(exc) or "NaN" in str(exc), exc
+            else:
+                raise AssertionError(f"{name} spectrum was not rejected")
+        # degenerate-but-real inputs STAY accepted (they carry signal):
+        r_const = modeling.predict_with_bundle(
+            b, wn, np.full(X.shape[1], 5.0))
+        assert r_const["prediction"] in ("A", "B")
+        # release gate: empty / length-mismatched arrays must be a clean
+        # ValueError (previously IndexError at the sort step)
+        for w_bad, i_bad in ((wn, np.zeros(0)),
+                             (wn[:10], np.zeros(X.shape[1]))):
+            try:
+                modeling.predict_with_bundle(b, w_bad, i_bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("mismatched arrays not rejected")
+        r_m, e_m = modeling.predict_with_bundle_many(
+            b, [(wn, np.zeros(0))])
+        assert 0 in e_m and r_m[0] is None
+        # batched twin: per-row error isolation, good row still predicted
+        specs = [(wn, X[0]), (wn, bad_inputs["all-NaN"]),
+                 (wn, bad_inputs["all-zero"])]
+        res, errs = modeling.predict_with_bundle_many(b, specs)
+        assert res[0] is not None and res[0]["prediction"] in ("A", "B")
+        assert res[1] is None and res[2] is None
+        assert 1 in errs and 2 in errs
+        # non-finite reference file: skipped with a reason, good one used
+        with tempfile.TemporaryDirectory() as td2:
+            gpts = np.linspace(500.0, 2000.0, 200)
+            ok_p = os.path.join(td2, "ok.csv")
+            nan_p = os.path.join(td2, "nan.csv")
+            zero_p = os.path.join(td2, "zero.csv")
+            with open(ok_p, "w", encoding="utf-8") as fh:
+                for w in gpts:
+                    fh.write(f"{w:.3f},{50 + 10 * np.sin(w / 100):.4f}\n")
+            with open(nan_p, "w", encoding="utf-8") as fh:
+                for i, w in enumerate(gpts):
+                    v = "nan" if i == 5 else 60.0
+                    fh.write(f"{w:.3f},{v}\n")
+            with open(zero_p, "w", encoding="utf-8") as fh:
+                for w in gpts:
+                    fh.write(f"{w:.3f},0.0\n")
+            ref = paired_mod.reference_vector(b, [ok_p, nan_p, zero_p])
+            assert np.all(np.isfinite(ref))
+            # the zero file must NOT warp the reference (round 3:
+            # it used to dilute the mean by its share)
+            ref_ok = paired_mod.reference_vector(b, [ok_p])
+            assert np.allclose(ref, ref_ok, atol=1e-12)
+            for bad_p, tag in ((nan_p, "nan.csv"), (zero_p, "zero.csv")):
+                try:
+                    paired_mod.reference_vector(b, [bad_p])
+                except ValueError as exc:
+                    assert tag in str(exc), exc
+                else:
+                    raise AssertionError(f"{tag} only-folder accepted")
+
+
 def test_is_chain_winner_guard():
     """Chain winners (AveragedChain/SequentialChain) make every refit-
     based diagnostic multiply ~45 inner pipeline fits — the auto
@@ -2701,6 +2796,114 @@ def _isolated_main_window():
     return app, win
 
 
+def test_supplementary_metrics_formulas():
+    """2026-09-08 metric-audit supplements: balanced accuracy, MCC,
+    PR-AUC, Brier, threshold stability stats, patient-level
+    evaluation.  Ground truth TP=8 TN=7 FP=2 FN=3 plus degenerate
+    cases.  These are ADDITIVE — no existing metric changed."""
+    cm = np.array([[7, 2], [3, 8]])
+    # --- exact ground truth ---
+    assert abs(modeling.balanced_accuracy_from_cm(cm)
+               - (8 / 11 + 7 / 9) / 2) < 1e-12          # 0.7525252...
+    assert abs(modeling.mcc_from_cm(cm)
+               - 50 / np.sqrt(10 * 11 * 9 * 10)) < 1e-12  # 0.5025189...
+    # perfect / one-sided / degenerate
+    perfect = np.array([[10, 0], [0, 10]])
+    assert modeling.balanced_accuracy_from_cm(perfect) == 1.0
+    assert modeling.mcc_from_cm(perfect) == 1.0
+    allpos = np.array([[0, 10], [0, 10]])
+    assert modeling.mcc_from_cm(allpos) == 0.0
+    assert modeling.mcc_from_cm(np.zeros((2, 2), int)) == 0.0
+    assert np.isnan(modeling.mcc_from_cm(
+        np.zeros((3, 3), int)))                    # non-binary -> NaN
+    # Brier (probabilities, never labels)
+    assert abs(modeling.brier_score([1, 0], [0.8, 0.2])
+               - (0.04 + 0.04) / 2) < 1e-12
+    assert modeling.brier_score([1, 0], [np.nan, 0.0]) == 0.0  # NaN skipped
+    assert np.isnan(modeling.brier_score([1], [np.nan]))
+    # PR-AUC reuses probability-based average precision (perfect case)
+    _p, _r, ap = modeling.pr_points(np.array([0, 1, 0, 1]),
+                                    np.array([.1, .8, .2, .9]))
+    assert abs(ap - 1.0) < 1e-9
+    # --- threshold_stats (computed, never hardcoded) ---
+    ts = modeling.threshold_stats([0.010, 0.884, 0.058, 0.096, 0.021])
+    assert ts["n_kept"] == 5 and abs(ts["median"] - 0.058) < 1e-9
+    assert ts["unstable"] is True            # 88x spread
+    ts2 = modeling.threshold_stats([None, None, 0.543, 0.57, None])
+    assert ts2["n_kept"] == 2 and ts2["unstable"] is False
+    ts3 = modeling.threshold_stats([None, None])
+    assert ts3["n_kept"] == 0 and ts3["min"] is None
+    # --- patient-level evaluation (dominant-class truth, mean-P) ---
+    ye = np.array([0, 0, 1, 1, 0, 0, 1, 1])
+    groups = np.array(["A", "A", "A", "A", "B", "B", "C", "C"])
+    # patient A = 2 normal + 2 tumor -> dominant tie -> unique picks 0
+    proba = np.array([[.9, .1]] * 4 + [[.8, .2]] * 2 + [[.1, .9]] * 2)
+    pe = modeling.patient_level_evaluation(ye, groups, proba, threshold=0.5)
+    assert pe is not None and pe["n"] == 3
+    assert pe["tp"] == 1 and pe["tn"] == 2 and pe["fp"] == 0
+    assert pe["fn"] == 0 and pe["accuracy"] == 1.0
+    assert pe["mcc"] == 1.0
+    assert abs(pe["brier"] - np.mean(
+        [(0.1 - 0) ** 2, (0.2 - 0) ** 2, (0.9 - 1) ** 2])) < 1e-9
+    assert modeling.patient_level_evaluation(ye, None, proba) is None
+    # --- honest check carries the new keys (values additive) ---
+    X, y, g = _synthetic_ml(n=60, groups_n=10, seed=11)
+    wn2 = np.linspace(500.0, 2000.0, X.shape[1])
+    out = modeling.evaluate_pipeline(X, wn2, list(y), groups=list(g),
+                                     k=3, seed=0)
+    for key in ("balanced_accuracy", "mcc", "brier", "pr_auc"):
+        assert key in out and 0.0 <= out[key] <= 1.0, (key, out.get(key))
+    # sanity: bacc == mean of pooled sens/spec for binary
+    assert abs(out["balanced_accuracy"]
+               - (out["sens"] + out["spec"]) / 2) < 1e-9
+
+
+def test_supplement_report_and_manifest():
+    """Report writers + freeze manifest carry the supplementary block
+    with explicit PATIENT/SPECTRUM level labels and machine-readable
+    fields (additive — everything existing unchanged)."""
+    import gui
+    app, win = _isolated_main_window()
+    _saved = gui.APP_DIR
+    from qt_compat import QtWidgets
+    _box = QtWidgets.QMessageBox.information
+    QtWidgets.QMessageBox.information = staticmethod(lambda *a, **k: None)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            gui.APP_DIR = td
+            X, y, g = _synthetic_ml(n=60, groups_n=10, seed=5)
+            wn2 = np.linspace(500.0, 2000.0, X.shape[1])
+            res, win.winner = modeling.evaluate_models(
+                X, list(y), model_names=["PCA + Gaussian Naive Bayes"],
+                k_folds=3, groups=list(g), wavenumbers=wn2)
+            win.results = res
+            win._honest_result = {"mean_f1": 0.55, "std_f1": 0.05,
+                                  "sens": 0.56, "spec": 0.54, "acc": 0.55,
+                                  "auc": 0.6, "balanced_accuracy": 0.55,
+                                  "mcc": 0.10, "brier": 0.24,
+                                  "pr_auc": 0.62,
+                                  "cm": np.array([[80, 20], [25, 75]])}
+            win.render_result_page()
+            assert "SPECTRUM LEVEL" in win.r_supp_spec_lbl.text()
+            assert "PATIENT LEVEL" in win.r_supp_pat_lbl.text()
+            assert "TP=" in win.r_supp_spec_lbl.text()
+            assert "Threshold stability" in win.r_supp_thr_lbl.text()
+            win.save_result_report()
+            txt = open(os.path.join(td, "result_report.txt"),
+                       encoding="utf-8").read()
+            assert "SPECTRUM LEVEL" in txt and "PATIENT LEVEL" in txt
+            assert "balanced accuracy" in txt and "MCC" in txt
+            win.save_result_report_html()
+            html = open(os.path.join(td, "result_report.html"),
+                        encoding="utf-8").read()
+            assert "Supplementary scientific metrics" in html
+            assert "PATIENT LEVEL" in html
+    finally:
+        QtWidgets.QMessageBox.information = _box
+        gui.APP_DIR = _saved
+        win.close()
+
+
 def test_settings_persistence_roundtrip():
     """Real settings.json write/read (ui_helpers.save/load_settings) —
     every other test stubs these; the actual file path handling was
@@ -2989,14 +3192,18 @@ def test_diag_queue_order_and_chain_guard():
         for n in names:
             setattr(win, n, (lambda nm: lambda *a, **k: order.append(nm))(
                 n))
-        # plain winner: FULL battery, serial order
+        # plain winner: FULL battery, serial order — HONEST FIRST since
+        # 2026-09-08 (its result is the number the banner shows)
         win.winner = modeling.ModelResult(name="plain",
                                           classes=["A", "B"])
         win.winner.pipeline = Pipeline([("sc", StandardScaler()),
                                         ("lr", LogisticRegression())])
         win.run_all_diagnostics()
-        assert order == list(names), order
-        # chain winner: heavy items skipped, light items + honest only
+        assert order == ["run_honest_check", "run_region_importance",
+                         "run_band_agreement", "run_learning_curve",
+                         "run_seed_stability", "run_noise_check",
+                         "run_locked_eval", "run_lopo"], order
+        # chain winner: heavy items skipped, honest + light items only
         import sequential as seq
         order.clear()
         win._diag_queue = []
@@ -3006,8 +3213,8 @@ def test_diag_queue_order_and_chain_guard():
             [Pipeline([("sc", StandardScaler()),
                        ("lr", LogisticRegression())])], n_seeds=1)
         win.run_all_diagnostics()
-        assert order == ["run_region_importance", "run_band_agreement",
-                         "run_honest_check"], order
+        assert order == ["run_honest_check", "run_region_importance",
+                         "run_band_agreement"], order
         # auto-diagnostics checkbox off -> _on_train_done_then_diags skips
         order.clear()
         win._diag_queue = []
@@ -3023,6 +3230,82 @@ def test_diag_queue_order_and_chain_guard():
         except RuntimeError:
             pass
         QtWidgets.QMessageBox.information = _saved_box
+
+
+def test_honest_numbers_are_the_displayed_numbers():
+    """2026-09-08 user decision — ONE performance number: the nested
+    honest estimate, computed automatically. evaluate_pipeline returns
+    pooled sens/spec/acc/auc/cm; the Train banner, Result page and BOTH
+    report writers show the honest values (PRELIMINARY selection-CV tag
+    before it lands; the saved bundle's honest F1 is the restore
+    fallback); selection-CV numbers appear only as a labeled ranking."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from qt_compat import QtWidgets
+    # ---- 1. evaluate_pipeline pooled honest metrics ----
+    X, y, g = _synthetic_ml(n=60, groups_n=10, seed=5)
+    wn = np.linspace(500.0, 2000.0, X.shape[1])
+    out = modeling.evaluate_pipeline(X, wn, list(y), groups=list(g),
+                                     k=3, seed=0)
+    for key in ("mean_f1", "std_f1", "sens", "spec", "acc"):
+        assert key in out and 0.0 <= out[key] <= 1.0, (key, out[key])
+    assert out["cm"].shape == (2, 2) and int(out["cm"].sum()) == len(y)
+    assert 0.5 < out["auc"] <= 1.0        # separable synthetic data
+    # ---- 2/3/4. the GUI shows ONE (honest) number everywhere ----
+    app, win = _isolated_main_window()
+    import gui
+    _saved = gui.APP_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            gui.APP_DIR = td
+            w = modeling.ModelResult(name="PCA + LDA", classes=["A", "B"])
+            w.macro = {"f1": (0.9, 0.0), "sens": (0.9, 0.0),
+                       "spec": (0.9, 0.0)}
+            win.winner = w
+            win.results = [w]
+            win._set_result_banner()
+            assert "PRELIMINARY" in win.banner_plain.text()
+            assert win.stat_values["f1"].text() == "0.900"
+            # honest result lands -> banner swaps in place
+            win._honest_result = {"mean_f1": 0.55, "std_f1": 0.05,
+                                  "sens": 0.56, "spec": 0.54,
+                                  "acc": 0.55, "auc": 0.60}
+            win._set_result_banner()
+            assert "NESTED HONEST" in win.banner_plain.text()
+            assert win.stat_values["f1"].text() == "0.550"
+            assert win.stat_values["sens"].text() == "0.560"
+            # Result page: the same honest numbers, honest AUC preferred
+            win.render_result_page()
+            assert win.r_stats["f1"].text() == "0.550"
+            assert win.r_stats["auc"].text() == "0.600"
+            assert "NESTED HONEST" in win.r_model_note.text()
+            # reports carry the honest values (fixed APP_DIR paths)
+            win.save_result_report()
+            txt = open(os.path.join(td, "result_report.txt"),
+                       encoding="utf-8").read()
+            assert "0.550" in txt and "NESTED HONEST" in txt
+            assert "SELECTION ranking" in txt
+            _info = QtWidgets.QMessageBox.information
+            QtWidgets.QMessageBox.information = staticmethod(
+                lambda *a, **k: None)
+            try:
+                win.save_result_report_html()
+            finally:
+                QtWidgets.QMessageBox.information = _info
+            html = open(os.path.join(td, "result_report.html"),
+                        encoding="utf-8").read()
+            assert "0.550" in html and "NESTED HONEST" in html
+            # pending-honest tag reappears when honest never ran
+            win._honest_result = None
+            win.render_result_page()
+            assert "PRELIMINARY" in win.r_model_note.text()
+            # saved-bundle fallback after a restore
+            win.bundle = {"model_name": "x", "nested_honest_f1": (0.61, 0.0)}
+            win._set_result_banner()
+            assert win.stat_values["f1"].text() == "0.610"
+            assert "SAVED model" in win.banner_plain.text()
+    finally:
+        gui.APP_DIR = _saved
+        win.close()
 
 
 def test_failure_callbacks_reenable():
