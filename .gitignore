@@ -33,3 +33,7 @@ raman_app/bench/
 raman_app/study_*.log
 raman_app/repro_out/
 raman_app/report_replication.md
+
+# Auto-generated model cards (written on every "Save best model";
+# deleted from the repo 2026-09-07 — they regenerate locally)
+raman_app/model_*_card.md

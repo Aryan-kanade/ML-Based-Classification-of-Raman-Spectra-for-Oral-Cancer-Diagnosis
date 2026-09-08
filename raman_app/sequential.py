@@ -1499,7 +1499,9 @@ def main(argv=None) -> int:
             modeling.save_bundle(
                 os.path.join(out_dir, "winner.joblib"), winner_ns, grid,
                 params, dataset_name=args.data,
-                paired=args.mode in ("paired", "paired-pqn"), **extras)
+                paired=args.mode in ("paired", "paired-pqn"),
+                pqn=(args.mode == "paired-pqn"),   # deploy must PQN too
+                **extras)
             print(f"[3sse] winner bundle: {_fmt_arch(winner['arch'])}")
         except Exception as exc:
             print(f"[3sse] winner bundle not saved: {exc}")

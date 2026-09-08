@@ -241,7 +241,7 @@ class SeqSearchWorker(QtCore.QThread):
 
     def __init__(self, X, y, groups, wavenumbers, model_names, k=3,
                  seed=42, top=20, fast=False, resume_path=None,
-                 parent=None):
+                 repeats=1, parent=None):
         super().__init__(parent)
         self.X, self.y, self.groups = X, y, groups
         self.wavenumbers = wavenumbers
@@ -249,11 +249,65 @@ class SeqSearchWorker(QtCore.QThread):
         self.k, self.seed, self.top = k, seed, top
         self.fast = fast
         self.resume_path = resume_path
+        self.repeats = repeats
         self._cancel = threading.Event()
 
     def cancel(self):
         """Cooperative stop; finished triples stay in the checkpoint."""
         self._cancel.set()
+
+    def _fair_singles(self, singles: list) -> list:
+        """Re-score every screened SINGLE with the EXACT Train-page
+        protocol — modeling.evaluate_models with the same k/seed/
+        repeats/groups (nested hyperparameter tuning + threshold
+        tuning) — so the Single Models tab shows the SAME number a
+        plain "Start training" run of that model shows in the same
+        mode. Results land in an ADDITIVE `metrics_fair` key: the
+        search/ranking/validation pipeline keeps reading `metrics`
+        (screening) and is untouched. Pairs/triples stay screening
+        estimates by design (nested-tuning all 4,369 chains would
+        take days); their honest numbers live in the Winner tab."""
+        if self.fast:              # quick-estimate mode: skip the pass
+            return singles
+        import modeling
+        rows = [r for r in singles
+                if isinstance(r.get("arch"), list) and len(r["arch"]) == 1
+                and "error" not in r]
+        if not rows:
+            return singles
+        try:
+            results, _winner = modeling.evaluate_models(
+                self.X, self.y, [r["arch"][0] for r in rows], self.k,
+                self.seed, groups=self.groups, repeats=self.repeats,
+                wavenumbers=self.wavenumbers)
+        except Exception:
+            # bookkeeping must never fail the search (§26 lesson)
+            FILE_LOG.exception("fair singles evaluation failed")
+            return singles
+        by_name = {r.name: r for r in results if r.error is None}
+        for row in rows:
+            r = by_name.get(row["arch"][0])
+            if r is None:
+                continue          # errored in the fair pass: keep screening
+            fair = {k: float(r.macro.get(k, (float("nan"), 0.0))[0])
+                    for k in ("f1", "sens", "spec")}
+            try:                  # binary AUC from the pooled OOF probs
+                if (r.oof_proba is not None and r.y_true_encoded is not None
+                        and len(r.classes) == 2):
+                    valid = ~np.isnan(r.oof_proba[:, 1])
+                    fair["auc"] = float(modeling.roc_points(
+                        r.y_true_encoded[valid],
+                        r.oof_proba[valid, 1])[2])
+                else:
+                    fair["auc"] = float("nan")
+            except Exception:
+                fair["auc"] = float("nan")
+            fair["acc"] = (float(np.trace(r.cm) / r.cm.sum())
+                           if r.cm is not None else float("nan"))
+            row["metrics_fair"] = fair
+            self.progress.emit(-1, f"Singles (fair nested CV): "
+                               f"{r.name} — F1 {fair['f1']:.3f}")
+        return singles
 
     def run(self):
         # import in its OWN try: if `import sequential` fails, matching
@@ -294,6 +348,14 @@ class SeqSearchWorker(QtCore.QThread):
         except Exception:
             self.failed.emit(traceback.format_exc())
             return
+        if not self.fast:
+            # singles tab shows Train-page-identical numbers (fair
+            # nested+tuned CV); fast screening = quick estimates only
+            try:
+                board["singles"] = self._fair_singles(board.get("singles",
+                                                                []))
+            except Exception:
+                FILE_LOG.exception("fair singles pass failed (skipped)")
         try:
             validated = sequential.validate_top(
                 board, self.X, self.y, self.groups, self.wavenumbers,
@@ -926,6 +988,30 @@ class SeqResultsDialog(QtWidgets.QDialog):
         self.setWindowTitle("3SSE — Sequential Architecture Search")
         self.resize(880, 600)
         lay = QtWidgets.QVBoxLayout(self)
+        mode = payload.get("mode") or ""
+        if "paired-pqn" in mode:
+            mode_txt = ("Data: PAIRED margin features + PQN — each "
+                         "spectrum scale-corrected (PQN), then minus the "
+                         "patient's own normal")
+        elif "paired" in mode:
+            mode_txt = ("Data: PAIRED margin features — each spectrum "
+                        "minus the patient's own normal")
+        elif mode:
+            mode_txt = ("Data: UNPAIRED standard preprocessed (absolute) "
+                        "spectra")
+        else:
+            mode_txt = ""
+        note = QtWidgets.QLabel(
+            "Single Models tab: nested CV with tuned hyperparameters — "
+            "the SAME number a Train-page run of that model shows (same "
+            "data mode, folds, seed).\n2-Model / 3-Model tabs: quick "
+            "screening estimates at default hyperparameters — compare "
+            "them only to each other; the Overall Winner tab holds the "
+            "nested numbers."
+            + (f"\n{mode_txt}" if mode_txt else ""))
+        note.setWordWrap(True)
+        note.setObjectName("CardHint")
+        lay.addWidget(note)
         tabs = QtWidgets.QTabWidget()
         lay.addWidget(tabs)
         level_meta = ((1, "singles", "Single Models"),
@@ -1038,22 +1124,32 @@ class SeqResultsDialog(QtWidgets.QDialog):
         return rows
 
     @staticmethod
-    def _rows(entries, level):
+    def _disp_metrics(e, level):
+        """Singles prefer the FAIR metrics (Train-page-identical nested
+        CV, `metrics_fair`) when the run produced them; pairs/triples
+        and old saved runs show the screening metrics."""
+        if level == 1 and isinstance(e.get("metrics_fair"), dict):
+            return e["metrics_fair"]
+        return e.get("metrics") or {}
+
+    @classmethod
+    def _rows(cls, entries, level):
         # 2026-09-06: error-tolerant screening records failed archs as
         # {"arch", "level", "error"} WITHOUT metrics — sorting those by
         # f1 crashed the dialog with KeyError('f1') on saved runs
         scored = sorted(
             (e for e in entries
              if isinstance(e.get("metrics"), dict)
-             and isinstance(e["metrics"].get("f1"), (int, float))),
-            key=lambda e: (-e["metrics"].get("f1", -1.0),
-                           -e["metrics"].get("sens", -1.0),
-                           -e["metrics"].get("spec", -1.0)))
+             and isinstance(cls._disp_metrics(e, level).get("f1"),
+                            (int, float))),
+            key=lambda e: (-(cls._disp_metrics(e, level).get("f1", -1.0)),
+                           -(cls._disp_metrics(e, level).get("sens", -1.0)),
+                           -(cls._disp_metrics(e, level).get("spec", -1.0))))
         label = {1: "Single", 2: "2-Model", 3: "3-Model"}[level]
         nan = float("nan")
 
         def _m(e, k):
-            v = e["metrics"].get(k, nan)
+            v = cls._disp_metrics(e, level).get(k, nan)
             return v if isinstance(v, (int, float)) else nan
         return [[i + 1, label, " → ".join(e["arch"]),
                  f"{_m(e, 'f1'):.3f}", f"{_m(e, 'sens'):.3f}",
@@ -1497,6 +1593,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 ("&Save best model…", self.save_model, "Ctrl+S"),
                 (None, None, None),
                 ("&Reset session (keep training)…", self.reset_session,
+                 None),
+                ("&Clear training (keep data)…", self.clear_training,
                  None),
                 (None, None, None),
                 ("E&xit", self.close, "Ctrl+Q")):
@@ -2177,28 +2275,41 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---- left: controls ----
         ctrl, cv = self.card("Controls")
         cv.addWidget(self.section_label("1 · MODE"))
-        cv.addWidget(QtWidgets.QLabel("Classification mode:"))
-        self.combo_mode = QtWidgets.QComboBox()
+        cv.addWidget(QtWidgets.QLabel("Data (paired or unpaired):"))
+        self.combo_data = QtWidgets.QComboBox()
         for label, role in (
-                ("Standard", "standard"),
-                ("Margin — vs patient's own normal", "paired"),
-                ("Margin + PQN (Dieterle 2006)", "paired-pqn"),
-                ("3SSE search (standard data)", "seq-standard"),
-                ("3SSE search (paired data)", "seq-paired")):
-            self.combo_mode.addItem(label, role)
-        self.combo_mode.insertSeparator(3)
-        self.combo_mode.setToolTip(
-            "Standard: every spectrum is classified on its own (works for "
-            "any new spectrum).\nMargin mode (paired reference): features "
-            "are the DEVIATION from the same patient's mean normal "
-            "spectrum — measurably stronger (~+0.1 F1 on the clinical "
-            "data) and it models intraoperative tumor-margin assessment "
-            "(fiber-optic Raman, in-vivo literature); needs a normal "
-            "reference from the same patient at prediction time.\n"
-            "Margin + PQN: the deviation is additionally scale-corrected "
-            "with probabilistic quotient normalization against the "
-            "patient's own normal (Dieterle 2006).")
-        cv.addWidget(self.combo_mode)
+                ("Unpaired — standard spectra", "standard"),
+                ("Paired — vs patient's own normal", "paired"),
+                ("Paired + PQN (Dieterle 2006)", "paired-pqn")):
+            self.combo_data.addItem(label, role)
+        self.combo_data.setToolTip(
+            "Unpaired (standard): every spectrum is classified on its own "
+            "(works for any new spectrum).\nPaired (margin reference): "
+            "features are the DEVIATION from the same patient's mean "
+            "normal spectrum — measurably stronger (~+0.1 F1 on the "
+            "clinical data) and it models intraoperative tumor-margin "
+            "assessment (fiber-optic Raman, in-vivo literature); needs a "
+            "normal reference from the same patient at prediction "
+            "time.\nPaired + PQN: the deviation is additionally "
+            "scale-corrected with probabilistic quotient normalization "
+            "against the patient's own normal (Dieterle 2006).\n"
+            "This choice applies to BOTH trainers below — the same data "
+            "mode is used whether you train single models or run the "
+            "3SSE search, and nothing switches it silently.")
+        cv.addWidget(self.combo_data)
+        cv.addWidget(QtWidgets.QLabel("Trainer:"))
+        self.combo_trainer = QtWidgets.QComboBox()
+        for label, role in (
+                ("Single-spectrum models", "single"),
+                ("3SSE architecture search", "seq")):
+            self.combo_trainer.addItem(label, role)
+        self.combo_trainer.setToolTip(
+            "Single-spectrum models: train every checked model on the "
+            "selected data.\n3SSE architecture search: screen every "
+            "chain (single → 2-model → 3-model) on the selected data — "
+            "paired or unpaired, exactly as chosen above (it is never "
+            "switched automatically).")
+        cv.addWidget(self.combo_trainer)
         cv.addSpacing(4)
         # ---- 3SSE card: collapsible, run button + live search status --
         seq_card, scv = self.card(
@@ -2287,8 +2398,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "in study_run_3sse/ — no re-run needed.")
         self.b_3sse_view.clicked.connect(self.view_saved_3sse)
         sb.addWidget(self.b_3sse_view)
-        self.combo_mode.currentIndexChanged.connect(
-            self._update_seq_card)
+        for combo in (self.combo_data, self.combo_trainer):
+            combo.currentIndexChanged.connect(self._update_seq_card)
+            # remember the chosen data/trainer mode — they used to reset
+            # to Standard after every restart, silently changing what
+            # "the same model" was trained on (2026-09-08)
+            combo.currentIndexChanged.connect(self._record_mode_kind)
         cv.addSpacing(4)
         cv.addWidget(self.section_label("2 · MODELS"))
         head_row = QtWidgets.QHBoxLayout()
@@ -4993,6 +5108,126 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log("Session reset — trained model kept "
                  f"({self.winner.name if self.winner else 'none'}).")
 
+    def _confirm_clear_training(self) -> tuple[bool, bool]:
+        """Ask the user; returns (confirmed, also_delete_saved_3sse).
+        Separate method so tests can stub the dialog away."""
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Clear training")
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setText(
+            "Discard the trained model and its results (comparison "
+            "table, diagnostics, charts)?\n\nLoaded data, preprocessing "
+            "settings and predictions are KEPT. Saved model files on "
+            "disk are not touched.")
+        chk = QtWidgets.QCheckBox(
+            "Also delete the saved 3SSE run — otherwise it is restored "
+            "at the next app start")
+        box.setCheckBox(chk)
+        box.setStandardButtons(QtWidgets.QMessageBox.Yes
+                               | QtWidgets.QMessageBox.No)
+        box.setDefaultButton(QtWidgets.QMessageBox.No)
+        confirmed = box.exec() == QtWidgets.QMessageBox.Yes
+        return confirmed, chk.isChecked()
+
+    def clear_training(self):
+        """File-menu mirror of reset_session: clear ONLY what the Train
+        step produced (winner, results, in-session bundle, diagnostics);
+        the loaded dataset, preprocessing settings, predictions and
+        saved model files are kept."""
+        running = [w for w in (self.worker, self._opt_worker,
+                               self._pred_worker, self._honest_worker,
+                               self._analysis_worker, self._seq_worker)
+                   if w is not None and w.isRunning()]
+        if running:
+            QtWidgets.QMessageBox.information(
+                self, "Work still running",
+                "A training / search / prediction is still running.\n"
+                "Stop or wait for it before clearing the training.")
+            return
+        if self.winner is None and not self.results:
+            QtWidgets.QMessageBox.information(
+                self, "Clear training",
+                "Nothing to clear — no model has been trained yet.")
+            return
+        confirmed, delete_saved = self._confirm_clear_training()
+        if not confirmed:
+            return
+        self._diag_queue = []          # stale chain must not continue
+        self._train_row_map = None     # OOF rows belong to the old winner
+        # ---- state produced by training ----
+        self.results = None
+        self.winner = None
+        self.bundle = None             # in-session bundle only (files kept)
+        self._seq_payload = None
+        self._paired_mode = False
+        self._pqn_mode = False
+        self._lc_data = None
+        self._lc_data_key = None
+        self._lc_wn = None
+        self._region_bands = None
+        self._op_points = None
+        self._locked_result = None
+        self._lopo_result = None
+        self._seed_result = None
+        self._noise_result = None
+        self._friedman_result = None
+        self._band_stats = None
+        self._honest_result = None
+        self._honest_btn = None
+        # ---- Train page widgets → the initial, untrained look ----
+        for _key, (frame, _cv, _cap) in list(self._diag_panels.items()):
+            self.diag_stack.removeWidget(frame)
+            frame.deleteLater()
+        self._diag_panels = {}
+        if self._winner_row is not None:      # the cm+roc side-by-side row
+            self.diag_stack.removeWidget(self._winner_row)
+            self._winner_row.deleteLater()
+            self._winner_row = None
+        self.chain_flow.set_arch([])          # empty arch also hides it
+        for b in getattr(self, "_diag_buttons", []):
+            b.setEnabled(False)
+        self.b_save.setEnabled(False)
+        self.progress.setValue(0)
+        self.banner_title.setText(
+            "No model trained yet — press Start training")
+        for val in self.stat_values.values():
+            val.setText("–")
+            val.setStyleSheet("")
+        self.banner_plain.setText("")
+        self.compare_table.setRowCount(0)
+        self.perclass_table.setRowCount(0)
+        self.seq_counter.setText("")
+        self.seq_top5.setText("")
+        self.seq_best.setText("")
+        self.seq_phase.setText(
+            "Ready — press Run (or pick a 3SSE mode and Start training).")
+        self.b_train.setEnabled(bool(self.spectra))
+        self.b_model_lab.setEnabled(bool(self.spectra))
+        self.train_status.setText(
+            "Ready — press Start training." if self.spectra
+            else "Load data first (Start or Data page).")
+        self.statusBar().showMessage("Training cleared — data kept.")
+        # ---- optional: stop the saved 3SSE winner from restoring ----
+        if delete_saved:
+            run_dir = os.path.join(APP_DIR, "study_run_3sse")
+            removed = []
+            for name in ("winner.json", "winner.joblib", "validated.json",
+                         "screening.jsonl"):
+                path = os.path.join(run_dir, name)
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                        removed.append(name)
+                except OSError as exc:
+                    self.log(f"Could not delete {name}: {exc}")
+            if removed:
+                self.log("Saved 3SSE run deleted: " + ", ".join(removed))
+        self.update_welcome()
+        self.refresh_nav()
+        self.render_result_page()      # drop the stale trained-model view
+        self.log(f"Training cleared — loaded data kept "
+                 f"({len(self.spectra)} spectra in session).")
+
     def load_folder(self, folder: str, quiet: bool = False):
         import clinical_data
         if clinical_data.is_clinical_layout(folder):
@@ -6938,9 +7173,11 @@ class MainWindow(QtWidgets.QMainWindow):
             b.setEnabled(False)      # winner is going stale
         self.progress.setValue(0)
         self.train_status.setText("Preprocessing spectra…")
-        mode_kind = self.mode_kind()
-        seq_mode = mode_kind.startswith("seq")
-        paired_mode = mode_kind in ("paired", "paired-pqn", "seq-paired")
+        data = self.data_mode()
+        seq_mode = self.trainer_kind() == "seq"
+        mode_kind = self.mode_kind()      # derived combined role
+        self._seq_mode_kind = mode_kind   # shown in the results dialog
+        paired_mode = data in ("paired", "paired-pqn")
         if paired_mode and self.groups is None:
             self.b_train.setEnabled(True)
             self.b_model_lab.setEnabled(True)
@@ -6948,7 +7185,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "Paired mode needs patient groups",
                 "Paired-reference classification needs clinical data "
                 "(patient folders). Load D:\\BARC\\Data-style data first "
-                "or switch back to Standard mode.")
+                "or switch Data back to Unpaired (standard).")
             return
         try:
             # snapshot the params the winner is ACTUALLY trained with —
@@ -6964,17 +7201,17 @@ class MainWindow(QtWidgets.QMainWindow):
                                  and self.chk_exclude_flagged.isChecked()
                                  and not self.read_params().despike)
                              else None),
-                    use_pqn=(mode_kind == "paired-pqn"))
+                    use_pqn=(data == "paired-pqn"))
                 X, yy, gg = pd_.X, pd_.y, pd_.groups
                 self._lc_wn = pd_.wn
                 self._paired_mode = True
                 # PQN must travel to the SAVED bundle: predict-time
                 # PQN-normalizes against the reference before the
                 # deviation (2026-09-06 — the flag never existed)
-                self._pqn_mode = (mode_kind == "paired-pqn")
+                self._pqn_mode = (data == "paired-pqn")
                 self.log(
                     f"Paired-reference mode"
-                    f"{' + PQN' if mode_kind == 'paired-pqn' else ''}: "
+                    f"{' + PQN' if data == 'paired-pqn' else ''}: "
                     f"{pd_.n_patients} patients "
                     f"with both classes, {pd_.X.shape[0]} deviation "
                     f"spectra; {pd_.n_unpaired_excluded} patients "
@@ -7055,6 +7292,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 X, yy, gg, wn_for_models, model_names=names,
                 k=self.spin_folds.value(), seed=self.spin_seed.value(),
                 fast=self.chk_3sse_fast.isChecked(),
+                repeats=3 if self.chk_repeat.isChecked() else 1,
                 resume_path=os.path.join(APP_DIR, "study_run_3sse",
                                          "archs.jsonl"))
             self._seq_worker.progress.connect(self.on_seq_progress)
@@ -7201,16 +7439,44 @@ class MainWindow(QtWidgets.QMainWindow):
             "\n\nFull details are in session.log next to the app.")
 
     # ================================================== 3SSE handlers
+    def data_mode(self) -> str:
+        """Selected data mode: 'standard' (unpaired), 'paired' or
+        'paired-pqn'. Applies to BOTH trainers — nothing overrides it."""
+        return self.combo_data.currentData() or "standard"
+
+    def trainer_kind(self) -> str:
+        """Selected trainer: 'single' (single-spectrum models) or 'seq'
+        (3SSE architecture search)."""
+        return self.combo_trainer.currentData() or "single"
+
     def mode_kind(self) -> str:
-        """Semantic role of the selected training mode ('standard',
-        'paired', 'paired-pqn', 'seq-standard', 'seq-paired') — index
-        positions are never relied on."""
-        return self.combo_mode.currentData() or "standard"
+        """Combined role of the selection: 'standard', 'paired',
+        'paired-pqn', 'seq-standard', 'seq-paired' or 'seq-paired-pqn'
+        (data mode prefixed with 'seq-' when the 3SSE trainer is
+        selected). Index positions are never relied on."""
+        d = self.data_mode()
+        return f"seq-{d}" if self.trainer_kind() == "seq" else d
 
     def set_mode_kind(self, role: str):
-        i = self.combo_mode.findData(role)
-        if i >= 0:
-            self.combo_mode.setCurrentIndex(i)
+        """Set both combos from a combined role ('seq-paired', 'paired',
+        …). Unknown roles are ignored; 'seq-<data>' selects the 3SSE
+        trainer, everything else the single-model trainer."""
+        data = role[4:] if role.startswith("seq-") else role
+        di = self.combo_data.findData(data)
+        if di >= 0:
+            self.combo_data.setCurrentIndex(di)
+        ti = self.combo_trainer.findData(
+            "seq" if role.startswith("seq-") else "single")
+        if ti >= 0:
+            self.combo_trainer.setCurrentIndex(ti)
+
+    def _record_mode_kind(self, *_args):
+        """Keep settings current so the selection survives a restart
+        (restored in _apply_settings; unknown roles are ignored).
+        'mode_kind' is the legacy combined key kept for compatibility."""
+        self.settings["data_mode"] = self.data_mode()
+        self.settings["trainer_kind"] = self.trainer_kind()
+        self.settings["mode_kind"] = self.mode_kind()
 
     def _models_changed(self, *_args):
         """Live 'N of M models selected' counter + 3SSE card refresh."""
@@ -7276,8 +7542,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # calibrated on the measured full run (4,369 @ k=3 ≈ 55 min
         # screening + ~25 min validation) — rough by design
         est_min = total_arch * k / 240 + 60 * 0.4
-        data_note = ("paired data" if self.groups is not None
-                     else "standard data (no patient groups loaded)")
+        data_note = {
+            "standard": "UNPAIRED standard spectra",
+            "paired": "PAIRED margin features",
+            "paired-pqn": "PAIRED margin features + PQN"}[self.data_mode()]
+        if (self.data_mode() != "standard"
+                and self.groups is None):
+            data_note += " — no patient groups loaded, training would stop"
         fast_note = (" · FAST: 2-fold, slow models skipped"
                      if self.chk_3sse_fast.isChecked() else "")
         self.seq_counts.setText(
@@ -7297,8 +7568,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "resumes it instead of starting over.")
 
     def run_3sse_now(self):
-        """Run button: pick the right 3SSE mode for the loaded data and
-        start the search through the normal Start-training path."""
+        """Run button: start the search through the normal Start-training
+        path, on exactly the data mode selected in the Data dropdown."""
         if not self.spectra:
             QtWidgets.QMessageBox.information(
                 self, "No data yet",
@@ -7321,9 +7592,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 "(3 or more for two- and three-model chains) — the "
                 "'All' button above the model list checks everything.")
             return
-        # paired whenever patient groups exist; the dropdown reflects it
-        self.set_mode_kind("seq-paired" if self.groups is not None
-                           else "seq-standard")
+        # the search runs on EXACTLY the selected data mode — paired or
+        # unpaired is the user's explicit choice and nothing switches
+        # it (auto-switching by groups presence silently changed the
+        # numbers between runs; removed 2026-09-08)
+        self.set_mode_kind(f"seq-{self.data_mode()}")
+        feats = ("PAIRED margin features" if self.data_mode() != "standard"
+                 else "standard spectra")
+        self.log(f"3SSE: starting the search on {feats} (Data dropdown "
+                 f"setting; trainer → 3SSE) — a plain training run "
+                 "matches these numbers only in the same data mode.")
+        self.statusBar().showMessage(
+            f"3SSE runs on {feats}, as selected in the Data dropdown.",
+            8000)
         self.seq_counter.setText("0")
         self.seq_phase.setText("Phase: screening — starting…")
         self.seq_best.setText("")
@@ -7394,6 +7675,9 @@ class MainWindow(QtWidgets.QMainWindow):
                         rec = {"arch": list(e["arch"]),
                                "level": e["level"]}
                         rec.update(cls._json_safe(e.get("metrics") or {}))
+                        if "metrics_fair" in e:   # Train-page-identical
+                            rec["metrics_fair"] = cls._json_safe(   # scores
+                                e["metrics_fair"])
                         if "error" in e:      # failed arch (tolerant
                             rec["error"] = str(e["error"])   # screening)
                         fh.write(_json.dumps(rec) + "\n")
@@ -7475,7 +7759,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             TypeError):
                         continue      # malformed line: skip, never crash
                     metrics = {k: v for k, v in rec.items()
-                               if k not in ("arch", "level", "error")}
+                               if k not in ("arch", "level", "error",
+                                            "metrics_fair")}
                     entry = {"arch": arch,
                              "level": level,
                              # error-tolerant screening stores failed
@@ -7483,6 +7768,9 @@ class MainWindow(QtWidgets.QMainWindow):
                              # the ranking instead of crashing on f1
                              # (2026-09-06), but surface the reason
                              "metrics": metrics if "f1" in metrics else {},
+                             **({"metrics_fair": rec["metrics_fair"]}
+                                if isinstance(rec.get("metrics_fair"), dict)
+                                else {}),
                              **({"error": rec["error"]}
                                 if "error" in rec else {})}
                     board[key[level]].append(entry)
@@ -7543,6 +7831,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_3sse_cancel.hide()
         self.progress.setValue(100)
         self.seq_phase.setText("Done — winner installed.")
+        payload["mode"] = getattr(self, "_seq_mode_kind", "")
         self._seq_payload = payload
         board = payload["board"]
         fin = payload.get("winner")
@@ -8425,6 +8714,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.restoreGeometry(bytes.fromhex(geo))
             except Exception:
                 pass
+        # prefer the split keys; fall back to the legacy combined role
+        # written before the Data/Trainer dropdowns existed
+        dm, tk = s.get("data_mode"), s.get("trainer_kind")
+        if isinstance(dm, str) and dm:
+            di = self.combo_data.findData(dm)
+            if di >= 0:
+                self.combo_data.setCurrentIndex(di)
+            if tk == "seq":
+                ti = self.combo_trainer.findData("seq")
+                if ti >= 0:
+                    self.combo_trainer.setCurrentIndex(ti)
+        else:
+            mk = s.get("mode_kind")
+            if isinstance(mk, str) and mk:
+                self.set_mode_kind(mk)   # unknown roles are simply ignored
         if s.get("maximized") is True:
             self.showMaximized()
 
@@ -8459,6 +8763,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "params_version": PARAMS_VERSION,
             "folds": self.spin_folds.value(),
             "seed": self.spin_seed.value(),
+            "mode_kind": self.mode_kind(),
+            "data_mode": self.data_mode(),
+            "trainer_kind": self.trainer_kind(),
             "models": [n for n, cb in self.model_checks.items()
                        if cb.isChecked()],
             "suite_version": SUITE_VERSION,

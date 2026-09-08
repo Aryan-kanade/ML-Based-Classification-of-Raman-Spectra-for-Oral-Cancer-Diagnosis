@@ -1512,6 +1512,129 @@ def test_3sse_dialog_winner_tab_csv():
         assert "NOT significant" in text and "0.629" in text
 
 
+def test_3sse_fair_singles_match_train_page():
+    """SeqSearchWorker._fair_singles re-scores singles with the EXACT
+    Train-page call (evaluate_models, same k/seed/repeats/groups) so
+    the Single Models tab shows the same number a plain training run
+    shows in the same mode (2026-09-08 'why different values' fix).
+    Results are an ADDITIVE metrics_fair key — error rows untouched,
+    fast screening skips the pass, the dialog ranks singles by it."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    _qt_app_styled()
+    import gui
+    X, y, groups = _synthetic_ml(n=60, groups_n=12, seed=3)
+    names = ["PCA + LDA", "PCA + Gaussian Naive Bayes"]
+    singles = [
+        {"arch": [names[0]], "level": 1,
+         "metrics": {"f1": 0.10, "sens": 0.1, "spec": 0.1}},
+        {"arch": [names[1]], "level": 1,
+         "metrics": {"f1": 0.20, "sens": 0.2, "spec": 0.2}},
+        {"arch": ["Broken model"], "level": 1, "metrics": {},
+         "error": "CatBoostError: bad allocation"},
+    ]
+    w = gui.SeqSearchWorker(X, y, groups, None, model_names=names,
+                            k=3, seed=7, repeats=1)
+    out = w._fair_singles([dict(s) for s in singles])
+    # the direct Train-page evaluation with the SAME inputs must give
+    # the SAME numbers the fair pass put in metrics_fair
+    results, _win = modeling.evaluate_models(
+        X, y, names, 3, 7, groups=groups, repeats=1, wavenumbers=None)
+    by = {r.name: r for r in results}
+    for row in out[:2]:
+        r = by[row["arch"][0]]
+        assert r.error is None
+        fair = row["metrics_fair"]
+        assert abs(fair["f1"] - r.macro["f1"][0]) < 1e-12
+        assert abs(fair["sens"] - r.macro["sens"][0]) < 1e-12
+        assert abs(fair["spec"] - r.macro["spec"][0]) < 1e-12
+        assert fair["acc"] == fair["acc"] and 0 <= fair["acc"] <= 1
+    # error rows keep the screening shape untouched
+    assert "metrics_fair" not in out[2] and "error" in out[2]
+    # the dialog's singles ranking prefers the fair numbers
+    rows = gui.SeqResultsDialog._rows(out, 1)
+    shown = {r[2]: r[3] for r in rows}
+    assert len(shown) == 2
+    for row in out[:2]:
+        assert shown[row["arch"][0]] == f"{row['metrics_fair']['f1']:.3f}"
+    # without fair numbers (old saved runs) the dialog falls back
+    legacy = gui.SeqResultsDialog._rows(
+        [{**s, "metrics": s.get("metrics", {})} for s in singles
+         if "error" not in s], 1)
+    assert len(legacy) == 2 and legacy[0][3] == "0.200"
+    # fast screening skips the pass entirely
+    w_fast = gui.SeqSearchWorker(X, y, groups, None, model_names=names,
+                                 k=3, seed=7, fast=True)
+    fresh = [dict(s) for s in singles]
+    w_fast._fair_singles(fresh)
+    assert not any("metrics_fair" in r for r in fresh)
+
+
+def test_settings_mode_roundtrip():
+    """settings restore the Train-page Data/Trainer combos and are kept
+    current on change; unknown roles are ignored (2026-09-08: the mode
+    silently reset to Standard after every restart, so 'the same model'
+    was trained on different features than the user thought; same day:
+    one combined dropdown was split into Data + Trainer so paired vs
+    unpaired is an explicit choice for BOTH single models and 3SSE)."""
+    app, win = _isolated_main_window()
+    try:
+        assert win.mode_kind() == "standard"       # untouched baseline
+        win.set_mode_kind("paired")
+        assert win.settings["mode_kind"] == "paired"    # recorded live
+        assert win.settings["data_mode"] == "paired"
+        assert win.settings["trainer_kind"] == "single"
+        win.set_mode_kind("seq-paired")
+        assert win.settings["mode_kind"] == "seq-paired"
+        assert win.settings["trainer_kind"] == "seq"
+        # 3SSE + PQN is selectable now (used to be GUI-impossible)
+        win.set_mode_kind("seq-paired-pqn")
+        assert win.mode_kind() == "seq-paired-pqn"
+        assert win.data_mode() == "paired-pqn"
+        # restore path: split keys win
+        win.settings["data_mode"] = "paired"
+        win.settings["trainer_kind"] = "seq"
+        win._apply_settings()
+        assert win.mode_kind() == "seq-paired"
+        # legacy combined key still migrates when split keys are absent
+        win.settings.pop("data_mode"), win.settings.pop("trainer_kind")
+        win.settings["mode_kind"] = "paired"
+        win._apply_settings()
+        assert win.mode_kind() == "paired"
+        # unknown role ignored, no crash, selection kept
+        win.settings["mode_kind"] = "no-such-role"
+        win._apply_settings()
+        assert win.mode_kind() == "paired"
+    finally:
+        win.close()
+
+
+def test_run_3sse_now_respects_data_mode():
+    """The 3SSE Run button must run on EXACTLY the selected data mode —
+    it used to auto-switch to paired whenever patient groups were
+    loaded, so the same click gave different numbers depending on the
+    data (removed 2026-09-08)."""
+    app, win = _isolated_main_window()
+    started = []
+    win.start_training = lambda: started.append(win.mode_kind())
+    try:
+        # simulate loaded clinical data (groups present used to force
+        # paired — the exact regression this test pins down)
+        win.spectra = [object()] * 4
+        win.groups = ["P1", "P1", "P1", "P1"]
+        win.set_mode_kind("standard")
+        win.run_3sse_now()
+        assert win.data_mode() == "standard"      # NOT switched to paired
+        assert win.trainer_kind() == "seq"
+        assert started == ["seq-standard"]
+        # the user's paired+PQN choice survives the button too
+        win.set_mode_kind("paired-pqn")
+        win.run_3sse_now()
+        assert win.data_mode() == "paired-pqn"
+        assert started == ["seq-standard", "seq-paired-pqn"]
+    finally:
+        win.close()
+
+
 def test_3sse_persist_and_latest_dir():
     """GUI searches persist their payload (screening/validated/winner)
     and the viewer picks the most recent run dir — 2026-09-06: GUI runs
@@ -2197,6 +2320,22 @@ def test_reproduce_study_clinical_path():
         assert "Winner" in summary
         assert os.path.exists(os.path.join(out, "winner.joblib"))
         assert os.path.exists(os.path.join(out, "data_report.txt"))
+
+
+def test_reproduce_paired_pqn_bundle_flags():
+    """A CLI --mode paired-pqn run must save paired=True AND pqn=True in
+    the bundle — pqn was never passed, so deploy skipped the PQN step
+    training used and the same model predicted differently (2026-09-08)."""
+    import reproduce_study as rs
+    import joblib
+    with tempfile.TemporaryDirectory() as root:
+        _make_clinical_tree(root)
+        out = os.path.join(root, "..", "repro_out_pqn")
+        assert rs.main(["--data", root, "--mini", "--mode",
+                        "paired-pqn", "--out", out]) == 0
+        bundle = joblib.load(os.path.join(out, "winner.joblib"))
+        assert bundle["paired"] is True
+        assert bundle["pqn"] is True
 
 
 def test_paired_features_preprocesses_once():
@@ -2958,6 +3097,87 @@ def test_freeze_and_figures_real_paths():
             pass
         gui.APP_DIR, uh.save_settings = _saved[0], _saved[1]
         QtWidgets.QFileDialog.getExistingDirectory = _saved[2]
+
+
+def test_clear_training_menu_action():
+    """File > Clear training (keep data): clears winner/results/
+    diagnostics and resets the Train page to its untrained look while
+    the loaded dataset, predictions and SAVED files are kept; the
+    saved-3SSE deletion branch only touches the (monkeypatched)
+    APP_DIR; a session with nothing trained is a guarded no-op."""
+    import gui
+    app, win = _isolated_main_window()
+    _saved = (gui.APP_DIR, gui.MainWindow._confirm_clear_training)
+    calls = []
+
+    def _confirm_no_delete(_self):
+        calls.append(1)
+        return True, False
+    gui.MainWindow._confirm_clear_training = _confirm_no_delete
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            gui.APP_DIR = td
+            # real data + a trained-looking state
+            folder = _flat_folder_td(os.path.join(td, "data"))
+            win.load_folder(folder, quiet=True)
+            n_spec = len(win.spectra)
+            assert n_spec
+            win.winner = modeling.ModelResult(name="PCA + LDA",
+                                              classes=["A", "B"])
+            win.winner.macro = {"f1": (0.8, 0.0), "sens": (0.8, 0.0),
+                                "spec": (0.8, 0.0)}
+            win.results = [win.winner]
+            win.bundle = {"model_name": "PCA + LDA"}
+            win._seq_payload = {"board": {}}
+            win._friedman_result = {"ok": True}
+            win._honest_result = {"f1": 0.5}
+            win.b_save.setEnabled(True)
+            for b in win._diag_buttons:
+                b.setEnabled(True)
+            win._diag_panel("cm", "Confusion matrix", chart=False)
+            assert "cm" in win._diag_panels      # a panel exists to drop
+            win.clear_training()
+            assert calls                         # confirm was consulted
+            # state cleared
+            assert win.winner is None and win.results is None
+            assert win.bundle is None and win._seq_payload is None
+            assert win._friedman_result is None
+            assert win._honest_result is None
+            assert not win._diag_panels and win._winner_row is None
+            assert win.chain_flow.isHidden()
+            # widgets back to the untrained look
+            assert not win.b_save.isEnabled()
+            assert not any(b.isEnabled() for b in win._diag_buttons)
+            assert win.compare_table.rowCount() == 0
+            assert win.perclass_table.rowCount() == 0
+            assert "No model trained yet" in win.banner_title.text()
+            assert win.progress.value() == 0
+            # loaded data KEPT, training possible again
+            assert len(win.spectra) == n_spec
+            assert win.b_train.isEnabled()
+
+            # deletion branch: only files under the temp APP_DIR die
+            run_dir = os.path.join(td, "study_run_3sse")
+            os.makedirs(run_dir, exist_ok=True)
+            for fn in ("winner.json", "winner.joblib", "validated.json",
+                       "screening.jsonl"):
+                with open(os.path.join(run_dir, fn), "w") as fh:
+                    fh.write("x")
+            gui.MainWindow._confirm_clear_training = (
+                lambda _self: (True, True))
+            win.winner = modeling.ModelResult(name="X", classes=["A", "B"])
+            win.clear_training()
+            assert not os.listdir(run_dir)       # all four deleted
+            assert len(win.spectra) == n_spec    # data still kept
+
+            # no-op branch: nothing trained -> confirm never consulted
+            calls.clear()
+            win.clear_training()
+            assert not calls and win.winner is None
+    finally:
+        gui.MainWindow._confirm_clear_training = _saved[1]
+        gui.APP_DIR = _saved[0]
+        win.close()
 
 
 def test_live_mode_toggle_and_refusal():

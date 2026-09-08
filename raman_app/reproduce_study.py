@@ -298,6 +298,7 @@ def main(argv=None) -> int:
     modeling.save_bundle(bundle_path, winner, grid, params,
                          dataset_name=args.data,
                          paired=(args.mode in ("paired", "paired-pqn")),
+                         pqn=(args.mode == "paired-pqn"),   # deploy must PQN
                          **extras)
     print(f"[reproduce] bundle: {bundle_path}")
 

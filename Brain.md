@@ -9,7 +9,9 @@
 > the matching section below. Keep the "Last updated" stamp current.
 > Keep it dense — tables and one-liners, no prose padding.
 
-Last updated: 2026-09-07 (WORKSPACE CLEANUP for a portable copy — §32;
+Last updated: 2026-09-08 (3SSE FAIR SINGLES + mode honesty — §34;
+2026-09-07: FILE > CLEAR TRAINING menu action — §33;
+WORKSPACE CLEANUP for a portable copy — §32;
 previously 2026-09-06: WHOLE-PROJECT DEEP AUDIT + REMEDIATION — ~190
 findings, fixed in batches B0–B4, §20 lists the number-changing
 semantics; previously 2026-09-05: WHOLE-PROJECT ERROR HANDLING, see gotcha #23;
@@ -485,9 +487,12 @@ gates saved model-checkbox restore (bumped when the model list
 changes). Train page = everyday flow first (mode → models → CV →
 Start training → progress → Save) with the 3SSE card BELOW it
 (**collapsible** via `b_3sse_collapse`, auto-expands when its search
-starts). Mode dropdown uses **UserRole roles** (`mode_kind()` /
-`set_mode_kind()`: standard/paired/paired-pqn/seq-standard/seq-paired)
-— never rely on combo indices. Model chooser = **2-column** grid
+starts). Mode selection = **two UserRole-role dropdowns (2026-09-08)**:
+`combo_data` (Data: standard/paired/paired-pqn) + `combo_trainer`
+(single/seq) — `data_mode()`/`trainer_kind()`, combined legacy role via
+`mode_kind()`/`set_mode_kind()` (standard/paired/paired-pqn/
+seq-standard/seq-paired/**seq-paired-pqn**, never combo indices). The
+data choice applies to BOTH trainers and is never switched silently. Model chooser = **2-column** grid
 (3 columns forced a 520px card minimum → inner side scrollbar; 2 cols
 + shorter labels keep the whole page ≤ ~860px min — no h-scroll) +
 presets (`_apply_model_preset`: all/none/classical/fast) + live
@@ -522,7 +527,21 @@ asks before stopping running workers (No aborts the close; 3SSE keeps
 its checkpoint).
 Menu: File = Open folder (Ctrl+O),
 Reload (F5), Load model (Ctrl+L), Save model (Ctrl+S), **Reset session
-(keep training)…**, Exit (Ctrl+Q); Help = How to (F1), Metrics, About.
+(keep training)…**, **Clear training (keep data)…**, Exit (Ctrl+Q);
+Help = How to (F1), Metrics, About.
+**`clear_training()`** (2026-09-07, §33): the MIRROR of reset_session —
+guards the same 6 workers + no-op info box when nothing trained;
+`_confirm_clear_training()` (stubbed in tests) = Yes/No + checkbox
+"also delete the saved 3SSE run" (else restore_last_3sse brings it
+back next start). Clears winner/results/bundle(in-session)/
+_seq_payload/_paired+pqn/_lc_*/_region_bands/_op_points/
+_locked/_lopo/_seed/_noise/_friedman/_band_stats/_honest/_diag_queue/
+_train_row_map; Train page → untrained look (all diag panels +
+_winner_row deleted, chain_flow empty, Save + 8 diag buttons off,
+banner/tables/3SSE labels initial); KEEPS data/preprocess/predictions/
+saved files. Checkbox branch deletes study_run_3sse/
+{winner.json,winner.joblib,validated.json,screening.jsonl} under
+APP_DIR (per-file OSError-logged).
 **`reset_session()`** (that menu item): guards running workers (same 6
 as closeEvent) + confirm dialog → clears Data/Preprocess/Predict/Result
 (state attrs, widgets, plots, `settings["folder"]`; prep params →
@@ -752,7 +771,10 @@ are possible and documented.
   exit 2; writes screening.jsonl, report.txt, run_meta.json,
   winner.joblib.
   `prepare_dataset()` mirrors reproduce_study (GUI parity).
-- GUI: Train-page combo entries 3/4 = "3SSE search (standard/paired)";
+- GUI: Train-page Data dropdown chooses paired/unpaired for BOTH
+  trainers (Trainer dropdown: single models vs 3SSE search; the 3SSE
+  Run button uses the selected data mode, never auto-switches —
+  2026-09-08; `seq-paired-pqn` now GUI-selectable too);
   `SeqSearchWorker` (existing QThread pattern) runs screening +
   `validate_top` + `finalize_winner`; live progress `n/4369 · best ·
   ETA`; `SeqResultsDialog` = 4 sortable tabs (Single/2-Model/3-Model/
@@ -775,8 +797,9 @@ are possible and documented.
   in-memory chain; winner.joblib already exists). The card is ALWAYS
   visible and carries the primary **"Run 3SSE architecture search
   now"** button (`run_3sse_now`): guards data + busy state, auto-picks
-  paired (groups present) vs standard 3SSE mode in the dropdown, then
-  calls `start_training()`. Card extras: **Fast screening** toggle
+  paired (groups present) vs standard 3SSE mode in the dropdown — and
+  LOGS + status-bars the switch when it changed the mode (2026-09-08,
+  §34) — then calls `start_training()`. Card extras: **Fast screening** toggle
   (k=2 + skips `sequential.SLOW_MODELS` = 1D-CNN/CatBoost/XGBoost, CNN
   8 epochs), rough **time estimate** (archs·k/240 + 60·0.4 min,
   calibrated on the measured full run), **Cancel** (cooperative
@@ -1152,7 +1175,7 @@ snapshot ensembles (cyclic LR not worth tuning).
 
 | Suite | What it proves | Runtime |
 |---|---|---|
-| `test_all.py` (56) | loader hygiene (incl. site-token), preprocessing, grouped+repeated CV/ensembles, bundle roundtrip, optimize, ViT forward/checkpoint, clinical stats, biochem, FDR/Friedman + regressions (clinical reproduce path, paired single-preprocess, OOF repeat pooling, patient bootstrap, data-root discovery, device-portability scan; 2026-09-06: CONTIGUOUS calibration-bins regression, auc_power formula regression) | ~2 min |
+| `test_all.py` (90) | loader hygiene (incl. site-token), preprocessing, grouped+repeated CV/ensembles, bundle roundtrip, optimize, ViT forward/checkpoint, clinical stats, biochem, FDR/Friedman + regressions (clinical reproduce path, paired single-preprocess, OOF repeat pooling, patient bootstrap, data-root discovery, device-portability scan; 2026-09-06: CONTIGUOUS calibration-bins regression, auc_power formula regression; 2026-09-07: clear-training menu action; 2026-09-08: 3SSE fair singles, mode roundtrip) | ~2 min |
 | `deep_test.py` (19) | blank-GUI guards, one-class train, predict edge paths, legacy bundles, clinical auto refs, locked eval (+`_lc_data_key` tag in hand-built scenarios), HTML report, deep diagnostics, reset-session, train-tabs layout, CLI roundtrip (cwd-safe since 2026-09-06) | ~60 s |
 | `gui_test.py` (8 steps) | 6-page walk: load→preprocess→train→save→predict→result→report (report asserted in the TEMP APP_DIR since 2026-09-06, not in-tree) | ~20 s |
 
@@ -1200,7 +1223,8 @@ Repo `D:\BARC`, branch `main`, init 2026-08-30; per-commit history:
    sites into one mean (§21 verification note) — margin-mode patient
    rollup semantics deserve their own pass someday.
 
-## 19. Research roadmap changelog (see raman_app/RESEARCH.md)
+## 19. Research roadmap changelog (RESEARCH.md / ROADMAP.md deleted
+2026-09-08 by user — this section is the surviving record)
 
 **Stage 0+1 (2026-09-04, after the deep study of the Bidipta Rana
 internship report + ~120 sources):**
@@ -1867,3 +1891,109 @@ page + Save disabled), `bench/latest.json`
 
 Verification: import smoke test passed; 3SSE winner files present;
 git clean after commit.
+
+## 33. 2026-09-07 — File > "Clear training (keep data)…"
+
+User request: a File-menu button that clears ONLY the training
+results (the mirror of "Reset session (keep training)…" which clears
+data and keeps training). `gui.clear_training()` +
+`_confirm_clear_training()` — full behavior in §14. Key decisions:
+- In-session bundle cleared, SAVED model files on disk untouched;
+  loaded data / preprocess params / predictions kept.
+- The persisted 3SSE run is deleted only when the user ticks the
+  dialog checkbox (default OFF — restore_last_3sse would otherwise
+  re-install the old winner at next start, making the clear look
+  broken).
+- `render_result_page()` re-rendered immediately (it is predict-only
+  safe — winner=None is the fresh-session path).
+- Test `test_clear_training_menu_action`: confirm stubbed; the
+  deletion branch runs against a monkeypatched `gui.APP_DIR` temp
+  dir — tests must NEVER delete the real study_run_3sse/. Suite
+  88/88, ruff clean.
+
+## 34. 2026-09-08 — "why does the same model give different values in
+Train vs 3SSE?" (fair singles + mode honesty)
+
+User report with screenshots: PCA + Gaussian NB = F1 0.553 on the
+Train page but 0.768 in the 3SSE dialog's Single Models tab. Root
+causes (verified in session.log): (1) the single run was STANDARD
+features (n=317) while the 3SSE Run button silently auto-switched to
+seq-paired margin features (n=307) — and the mode combo reset to
+Standard after every restart; (2) the singles tab showed SCREENING
+scores (default hyperparams, fixed 0.5 threshold) while the Train
+page shows nested tuned CV + tuned threshold.
+
+Fixes:
+1. **Fair singles pass** (`SeqSearchWorker._fair_singles`, skipped
+   when Fast screening is on): after `sequential.search()` returns,
+   every screened single is RE-EVALUATED with the exact TrainWorker
+   call (`modeling.evaluate_models`, same k/seed/repeats/groups/
+   wavenumbers — nested tuning + threshold) into an ADDITIVE
+   `row["metrics_fair"]` key. Search/ranking/validation/significance
+   still read `metrics` (screening) — zero behavioral change there.
+   Worker gained a `repeats` param (GUI passes chk_repeat ×3).
+2. **Dialog**: singles tab sorts/displays `metrics_fair` (fallback =
+   screening for old saved runs; `view_saved_3sse` +
+   `_persist_3sse_payload` round-trip the key); subtitle explains the
+   protocols + shows the run's data mode (`payload["mode"]`, set by
+   `on_seq_done` from `self._seq_mode_kind` captured at train start).
+3. **Mode honesty**: `mode_kind` persisted in settings (restored in
+   `_apply_settings`, unknown roles ignored; recorded live via
+   `_record_mode_kind` on combo change + in closeEvent's update) —
+   the mode no longer silently resets to Standard after a restart;
+   `run_3sse_now` logs + status-bars when it auto-switches the mode.
+   (The auto-switch itself was removed the same day — see §35: paired
+   vs unpaired became an explicit Data dropdown; the button now only
+   TELLS which data mode it will use.)
+
+Invariant to remember: a Train-page number and a 3SSE number now
+MATCH for the same single model **iff the mode matched** (standard vs
+paired features — different feature spaces, different problems; §4).
+Pairs/triples stay screening estimates by design; their honest
+numbers live in the Winner tab (nested).
+
+Tests: `test_3sse_fair_singles_match_train_page` (metrics_fair ==
+direct evaluate_models on identical inputs, error rows untouched,
+legacy fallback, fast skip) + `test_settings_mode_roundtrip`. Suite
+90/90, ruff clean.
+
+## 35. 2026-09-08 — explicit Paired/Unpaired choice for BOTH trainers
+(user request, follows §34)
+
+The user asked for an explicit paired/unpaired option "for both 3SSE
+and the single model, so from next time we will not get the
+difference". The §34 fix still auto-switched the 3SSE Run button to
+paired whenever patient groups were loaded — the same click gave
+different numbers depending on the data.
+
+Changes (gui.py unless noted):
+1. **One combined 5-entry dropdown split into two**: `combo_data`
+   (Data: Unpaired standard / Paired margin / Paired + PQN) +
+   `combo_trainer` (Single-spectrum models / 3SSE search). Helpers
+   `data_mode()` / `trainer_kind()`; `mode_kind()` derives the legacy
+   combined role (`seq-<data>` when 3SSE) so all existing consumers,
+   `set_mode_kind` callers (Model Lab) and tests keep working. New
+   combo unlocked: **seq-paired-pqn** (3SSE + PQN was GUI-impossible;
+   the CLI always supported it).
+2. **`run_3sse_now` never switches data**: it selects the 3SSE trainer,
+   keeps the Data dropdown untouched, and log + status-bar states which
+   data the search runs on. `_update_seq_card`'s note shows the
+   SELECTED data mode (plus a "no patient groups loaded" warning when
+   paired is selected without groups) instead of guessing from groups.
+3. **`start_training`** branches on `data_mode()`: `paired_mode`,
+   `use_pqn` and `_pqn_mode` now derive from the Data dropdown for
+   every trainer — 3SSE paired+PQN runs save `pqn=True` bundles.
+4. **Settings**: `data_mode` + `trainer_kind` saved/restored (split
+   keys win; legacy `mode_kind` migrates when they are absent).
+   SeqResultsDialog data line handles seq-paired-pqn and says
+   "UNPAIRED standard" for clarity.
+5. **CLI bug (train/predict mismatch)**: sequential.py +
+   reproduce_study.py now pass `pqn=(mode == "paired-pqn")` to
+   `save_bundle` — CLI paired-pqn winners previously deployed WITHOUT
+   the PQN step they were trained with.
+
+Tests: `test_settings_mode_roundtrip` extended (split keys, legacy
+migration, seq-paired-pqn), new `test_run_3sse_now_respects_data_mode`
+(groups present + Data=standard → NOT switched) and
+`test_reproduce_paired_pqn_bundle_flags` (CLI bundle carries
+paired=True, pqn=True).
