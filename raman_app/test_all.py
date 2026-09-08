@@ -2904,6 +2904,63 @@ def test_supplement_report_and_manifest():
         win.close()
 
 
+def test_device_mode_layer_and_gpu_verification():
+    """2026-09-08 GPU work: RAMAN_DEVICE = auto|gpu|cpu with STRICT gpu
+    (no real CUDA -> loud RuntimeError, never a silent CPU fallback),
+    invalid values rejected, and verify_gpu_runtime proves execution by
+    an actual forward pass whose output tensor lands on the selected
+    device.  The XGBoost canary is build-info ONLY (device='cuda'
+    silently CPU-falls-back when no GPU is visible — probed)."""
+    import modeling as M
+    assert M.resolve_device_mode() in ("auto", "gpu", "cpu")
+    # cpu + invalid values
+    os.environ["RAMAN_DEVICE"] = "cpu"
+    try:
+        assert M.resolve_device_mode() == "cpu"
+        assert str(M.torch_device()) == "cpu"
+        assert M.gpu_ok() is False            # boosters never GPU on cpu
+        v = M.verify_gpu_runtime()
+        assert v["mode"] == "cpu"
+        assert "cpu" in v["torch_probe_device"]
+        os.environ["RAMAN_DEVICE"] = "banana"
+        try:
+            M.resolve_device_mode()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("invalid RAMAN_DEVICE accepted")
+    finally:
+        os.environ.pop("RAMAN_DEVICE", None)
+    # auto: probe lands on whatever torch_device() selected, and the
+    # reported CNN backend equals the probe device type
+    v = M.verify_gpu_runtime()
+    assert v["mode"] == "auto"
+    dev = M.torch_device()
+    assert v["cnn"] == dev.type
+    assert v["torch_probe_device"].startswith(dev.type)
+    # boosters are CPU under auto (measured policy) and LightGBM is a
+    # CPU wheel — reported honestly, never claimed as GPU
+    assert v["xgboost"] == "cpu" and v["catboost"] == "CPU"
+    assert v["lightgbm"] == "cpu"
+    # strict GPU mode without a visible device: loud failure (fresh
+    # process; CUDA_VISIBLE_DEVICES=-1 hides the GPU on Windows too)
+    code = ("import modeling\n"
+            "try:\n"
+            "    modeling.resolve_device_mode()\n"
+            "    raise SystemExit('accepted-without-gpu')\n"
+            "except RuntimeError:\n"
+            "    raise SystemExit(0)\n")
+    import subprocess
+    import sys
+    r = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        timeout=240, cwd=os.path.dirname(os.path.abspath(__file__)),
+        env={**os.environ, "RAMAN_DEVICE": "gpu",
+             "CUDA_VISIBLE_DEVICES": "-1",
+             "QT_QPA_PLATFORM": "offscreen"})
+    assert r.returncode == 0, (r.stdout, r.stderr)
+
+
 def test_settings_persistence_roundtrip():
     """Real settings.json write/read (ui_helpers.save/load_settings) —
     every other test stubs these; the actual file path handling was

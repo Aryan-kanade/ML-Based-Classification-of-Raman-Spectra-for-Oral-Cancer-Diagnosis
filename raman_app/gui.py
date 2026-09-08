@@ -1259,11 +1259,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1280, 840)
         self.setMinimumSize(1100, 700)   # layout never collapses
 
-        # cap native-thread models app-wide: CatBoost/XGBoost/LightGBM/RF
-        # with ALL cores multiplied by CV folds OOM'd the machine
-        # ("bad allocation" killed whole runs, 2026-09-05).  Power users:
-        # set RAMAN_DEVICE=gpu before starting to keep GPU CatBoost.
-        os.environ.setdefault("RAMAN_DEVICE", "cpu")
+        # Device MODE (2026-09-08): default AUTO — torch models (1D-CNN)
+        # use the GPU when CUDA is genuinely present; boosters stay CPU
+        # (they lose at n≈300 and GPU boosters OOM'd loky children,
+        # 2026-09-05).  RAMAN_DEVICE=gpu = strict GPU (validated below,
+        # no silent fallback); =cpu forces everything CPU.
+        os.environ.setdefault("RAMAN_DEVICE", "auto")
+        try:
+            self._device_mode = modeling.resolve_device_mode()
+        except RuntimeError as exc:
+            self._device_mode = "auto"
+            QtWidgets.QMessageBox.critical(
+                None, "GPU mode unavailable", str(exc))
         self._install_excepthook()
 
         # ---- state ----
@@ -1725,6 +1732,19 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---- right ~40%: progress + quick actions -----------------------
         right_col = QtWidgets.QVBoxLayout()
         right_col.setSpacing(10)
+        # Compute device card (2026-09-08 GPU work): REAL backends from
+        # device_report()/verify_gpu_runtime() — never hardcoded values
+        devc, dv = self.card("Compute device")
+        self.w_device_lbl = QtWidgets.QLabel("")
+        self.w_device_lbl.setObjectName("CardHint")
+        self.w_device_lbl.setWordWrap(True)
+        self.w_device_lbl.setToolTip(
+            "Backends are probed at startup: the 1D-CNN runs a real "
+            "forward pass on the selected torch device. RAMAN_DEVICE = "
+            "auto | gpu | cpu (gpu is strict — it fails loudly when no "
+            "CUDA backend is usable).")
+        dv.addWidget(self.w_device_lbl)
+        right_col.addWidget(devc)
         prog, pv = self.card("Your progress")
         self.w_lbl_data = QtWidgets.QLabel("")
         self.w_lbl_model = QtWidgets.QLabel("")
@@ -8855,6 +8875,24 @@ class MainWindow(QtWidgets.QMainWindow):
         return out_rows
 
     # ======================================================= status / help
+    def _device_summary_text(self) -> str:
+        """Compute-device card text — probed ONCE per session (a real
+        CUDA forward pass) and cached; always reflects the live mode."""
+        if getattr(self, "_device_summary_cache", None) is None:
+            try:
+                v = modeling.verify_gpu_runtime()
+                self._device_summary_cache = (
+                    f"Mode: {v['mode']} (RAMAN_DEVICE)\n"
+                    f"CNN: {v['cnn']}"
+                    + (f" — probe ran on {v['torch_probe_device']}"
+                       if v.get("torch_probe_device") else "")
+                    + f"\nXGBoost: {v['xgboost']} · CatBoost: "
+                      f"{v['catboost']} · LightGBM: {v['lightgbm']} · "
+                      "scikit-learn: cpu")
+            except Exception as exc:
+                self._device_summary_cache = f"Device probe failed: {exc}"
+        return self._device_summary_cache
+
     def update_welcome(self):
         def line(done: bool, text_done: str, text_todo: str) -> str:
             color = "#16a34a" if done else "#94a3b8"
@@ -8883,6 +8921,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.bundle is not None,
             "Model ready — go to Predict",
             "Save the best model"))
+        # compute-device card (probed once, then cached)
+        if hasattr(self, "w_device_lbl"):
+            self.w_device_lbl.setText(self._device_summary_text())
         # live hero pills
         n_subj = len(set(self.groups)) if self.groups else 0
         pills_txt = [

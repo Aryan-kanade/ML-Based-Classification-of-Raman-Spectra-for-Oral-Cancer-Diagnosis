@@ -97,18 +97,29 @@ _GPU_OK = None
 
 
 def _xgb_cuda_canary() -> bool:
-    """Tiny GPU fit proving the CUDA driver + xgboost agree (fallback
-    when torch is absent or is a CPU-only build)."""
+    """BUILD-capability check only: xgboost was compiled with CUDA.
+    NOT proof of GPU execution — with no visible device, device='cuda'
+    fits SILENTLY fall back to CPU (probed 2026-09-08: no warning,
+    build_info USE_CUDA=True, CUDA_VISIBLE_DEVICES='' -> CPU run).
+    Actual driver presence is proven by the torch CUDA probe in
+    _real_cuda_present(); this canary only gates the 'the wheel itself
+    supports CUDA' half."""
     if not HAS_XGB:
         return False
     try:
-        rng = np.random.default_rng(0)
-        XGBClassifier(n_estimators=2, max_depth=2, tree_method="hist",
-                      device="cuda").fit(rng.normal(size=(32, 8)),
-                                         np.arange(32) % 2)
-        return True
+        import xgboost as _xgb
+        return bool(_xgb.build_info().get("USE_CUDA"))
     except Exception:
         return False
+
+
+def _real_cuda_present() -> bool:
+    """A CUDA backend proven at RUNTIME. torch.cuda.is_available()
+    actually initializes a CUDA context (fails without a driver/GPU);
+    xgboost cannot serve as the probe because its device='cuda' fits
+    silently fall back to CPU when no device is visible.  Without a
+    CUDA torch build we conservatively report no GPU."""
+    return bool(HAS_TORCH and torch.cuda.is_available())
 
 
 def gpu_ok() -> bool:
@@ -124,8 +135,11 @@ def gpu_ok() -> bool:
         return False
     global _GPU_OK
     if _GPU_OK is None:
-        _GPU_OK = ((HAS_TORCH and torch.cuda.is_available())
-                   or _xgb_cuda_canary())
+        # driver presence via the torch CUDA probe ONLY — xgboost's
+        # device='cuda' silently falls back to CPU without a device
+        # (see _xgb_cuda_canary), so it can never prove a GPU
+        _GPU_OK = (HAS_TORCH and torch.cuda.is_available()
+                   and _xgb_cuda_canary())
     return _GPU_OK
 
 
@@ -176,6 +190,72 @@ def device_report() -> str:
     cpu_fams = "scikit-learn" + (" + LightGBM" if HAS_LGBM else "")
     parts.append(f"{cpu_fams}: CPU-only")
     return "Accelerators — " + " · ".join(parts)
+
+
+# --------------------------------------------------------------------------
+# Device MODE layer (2026-09-08 GPU work): RAMAN_DEVICE = auto|gpu|cpu.
+# auto (default): torch models (1D-CNN/ViT/TabPFN) on GPU when CUDA is
+#   real; boosters stay CPU (measured: they lose at n≈300 and auto-GPU
+#   boosters OOM'd loky children — REPORTED in the summary, not silent).
+# gpu: STRICT — a real CUDA backend is required or we fail loudly.
+# cpu: force everything to CPU (checked on every gpu_ok/torch_device call).
+# --------------------------------------------------------------------------
+def _real_cuda_present() -> bool:
+    """A CUDA backend proven at runtime — the torch probe initializes a
+    real CUDA context; never a mere 'library has a GPU option' claim
+    (xgboost device='cuda' silently CPU-falls-back, see canary)."""
+    return bool(HAS_TORCH and torch.cuda.is_available())
+
+
+def resolve_device_mode() -> str:
+    """Validate RAMAN_DEVICE and return 'auto' | 'gpu' | 'cpu'.
+    'gpu' is strict: no real CUDA -> RuntimeError (NEVER a silent CPU
+    fallback); an unknown value is also an error."""
+    mode = (os.environ.get("RAMAN_DEVICE") or "auto").strip().lower()
+    mode = {"gpu": "gpu", "cuda": "gpu", "auto": "auto", "": "auto",
+            "cpu": "cpu"}.get(mode)
+    if mode is None:
+        raise RuntimeError(
+            f"RAMAN_DEVICE={os.environ.get('RAMAN_DEVICE')!r} is invalid "
+            "— use auto, gpu or cpu.")
+    if mode == "gpu" and not _real_cuda_present():
+        raise RuntimeError(
+            "RAMAN_DEVICE=gpu was requested but no usable CUDA backend "
+            "was found (torch CUDA unavailable and the XGBoost CUDA "
+            "canary fit failed). Fix the driver/install, or use "
+            "RAMAN_DEVICE=auto.")
+    return mode
+
+
+def verify_gpu_runtime() -> dict:
+    """Runtime PROOF, not availability claims: runs an actual forward
+    pass on the selected torch device and records the device the
+    output tensor landed on; boosters report what gpu_ok()/boost_device
+    actually configure; LightGBM/scikit are confirmed CPU."""
+    out: dict = {"mode": resolve_device_mode(), "torch": None,
+                 "torch_probe_device": None, "cnn": "absent",
+                 "xgboost": "absent", "catboost": "absent",
+                 "lightgbm": "absent", "sklearn": "cpu"}
+    if HAS_TORCH:
+        dev = torch_device()
+        lin = torch.nn.Linear(8, 4).to(dev)
+        x = torch.randn(4, 8, device=dev)
+        with torch.inference_mode():
+            y = lin(x)
+        out["torch"] = torch.__version__
+        out["torch_probe_device"] = str(y.device)      # e.g. 'cuda:0'
+        out["cnn"] = dev.type
+    if HAS_XGB:
+        out["xgboost"] = boost_device()
+        if out["mode"] == "gpu":
+            # build capability (NOT execution proof — see canary note);
+            # execution-path config is proven by boost_device()=='cuda'
+            out["xgboost_cuda_build"] = _xgb_cuda_canary()
+    if HAS_CATBOOST:
+        out["catboost"] = "GPU" if gpu_ok() else "CPU"
+    if HAS_LGBM:
+        out["lightgbm"] = "cpu"   # standard Windows wheel: no GPU build
+    return out
 
 RANDOM_STATE = 42
 

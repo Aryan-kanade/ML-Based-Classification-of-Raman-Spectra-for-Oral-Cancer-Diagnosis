@@ -1416,6 +1416,19 @@ def main(argv=None) -> int:
 
     out_dir = args.out or os.path.join(APP_DIR, "study_run_3sse")
     os.makedirs(out_dir, exist_ok=True)
+    # device summary (2026-09-08): REAL backends + mode; strict GPU mode
+    # fails loudly here rather than silently running CPU
+    try:
+        _mode = modeling.resolve_device_mode()
+    except RuntimeError as exc:
+        print(f"[3sse] DEVICE ERROR: {exc}")
+        return 2
+    _v = modeling.verify_gpu_runtime()
+    print(f"[3sse] device: mode={_v['mode']} · CNN={_v['cnn']} · "
+          f"XGBoost={_v['xgboost']} · CatBoost={_v['catboost']} · "
+          f"LightGBM={_v['lightgbm']} · sklearn=cpu"
+          + (f" (torch probe: {_v['torch_probe_device']})"
+             if _v.get("torch_probe_device") else ""))
     X, y, g, wn, grid, params, meta = prepare_dataset(args.data, args.mode)
     print(f"[3sse] {meta['n_spectra']} spectra / "
           f"{meta['n_patients']} patients · mode {args.mode}")

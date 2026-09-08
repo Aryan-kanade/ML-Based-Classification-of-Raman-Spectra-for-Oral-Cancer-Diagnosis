@@ -2221,3 +2221,74 @@ Fresh validation-only pass on the current tree (FINAL_RELEASE_AUDIT.md).
   models all fail-safe.
 - Verdict **🟢 RELEASE** — limitations documented (§18 of the audit),
   repo left uncommitted with the prepared commit message.
+
+## 43. 2026-09-08 (night 3) — GPU device-mode layer + runtime proof
+(GPU_ACCELERATION.md / GPU_ACCELERATION_AUDIT.md)
+
+Engineering only; classical baselines bit-identical after (RF cm/
+thresholds, GNB, registry ET 0.760). NEW:
+- `resolve_device_mode()` (RAMAN_DEVICE auto|gpu|cpu; gpu STRICT —
+  loud RuntimeError without a real CUDA backend; invalid values
+  rejected) + `verify_gpu_runtime()` (actual forward pass; records
+  the OUTPUT TENSOR's device; per-model backends honestly).
+- **KEY FINDING**: `XGBClassifier(device='cuda')` fits SILENTLY on
+  CPU with no visible device (no warning; build_info USE_CUDA=True)
+  → the old runtime canary was a false-GPU-positive; GPU presence is
+  now proven ONLY by the torch CUDA probe (context init); the XGB
+  canary is demoted to build-capability.
+- GUI default RAMAN_DEVICE cpu→**auto** (torch models GPU by
+  default; boosters still CPU in auto per the n≈300/OOM lesson);
+  startup validates the mode (critical dialog on strict failure);
+  new "Compute device" card on the Start page (live, cached);
+  sequential.py + reproduce_study print device summaries; CLI
+  strict-mode exit 2.
+- Verified: probe cuda:0; strict failure with CVD=-1 and =99;
+  CNN GPU vs CPU 2.1→1.5 s; XGB (gpu mode) 1.02→0.56 s; 3SSE CLI
+  with GPU CNN layer exit 0 (OOF genuine); CNN bundle predictions
+  bit-identical across GPU/forced-CPU processes (weights stored/
+  predicted on CPU); CUDA peak 31 MiB flat ×3 cycles.
+- Test +1 (`test_device_mode_layer_and_gpu_verification`) → suite
+  **97/97 + 19/19 + GUI + ruff, exit 0**. LightGBM = CPU wheel
+  (documented); CatBoost GPU = parent-only behind strict mode.
+
+## 44. 2026-09-08 (night 4) — GPU STRESS/SOAK TEST → 🟢 PASS
+(GPU_STRESS_TEST_AUDIT.md; evidence .zcode/gpu_soak/)
+
+Validation only, zero production changes. Results:
+- 20× CNN training (real data, unchanged config): 20/20 OK, alloc
+  **flat 16 MiB plateau** (reserved→48 = allocator cache, not a
+  leak), no OOM; durations stable (mean 2.10 s, no degradation).
+- 100 single + 20 batch predictions: 0 NaN/Inf/invalid; first ==
+  last BIT-IDENTICAL; 20× load→predict cycles 9-13 ms stable;
+  GPU-proc vs CPU-proc bundle predictions 0.0 Δ.
+- 3× 3SSE CLI runs (GPU CNN layer) exit 0; 3× paired runs CNN F1
+  identical (0.307) — same-seed determinism.
+- GUI 5× train→save→load→predict cycles in ONE process: PASS, exit
+  0, CUDA alive. (Harness lessons re-learned: wait for ALL workers
+  incl. _analysis/_honest or the overlap guard skips cycles; HOLD
+  the QApplication reference or GC → instant qFatal 127 — both
+  harness-only, gotchas #7/#30.)
+- CUDA-error scan of every log: CLEAN. auto=cuda:0 start AND end;
+  cpu forces; strict-gpu still loud-fails; restart re-inits CUDA.
+- Post-stress: RF/GNB baselines IDENTICAL, registry 25/25 ET 0.760,
+  **97/97 + 19/19 + GUI + ruff** all after the soak.
+- Scorecard 15/15 PASS → **🟢 GPU STRESS TEST PASS**.
+
+## 45. 2026-09-08 (final) — v1.0.0 RELEASE PREPARATION →
+RELEASE WITH WARNINGS (0 blockers)
+
+Finalization pass, no production changes (README/doc only).
+- Scans clean: 0 secrets/debug/TODO; the 4 added prints = CLI device
+  summaries; pip check clean (15 pins). Invariance re-confirmed
+  (RF/GNB/ET 0.760). Fresh suite: **97/97 + 19/19 + GUI + ruff**.
+- README finalized: GPU device-mode section, performance-reporting
+  policy (honest number + supplements), validation summary,
+  Scientific-limitations section, test counts 56→97, stale v2-artifact
+  pointer → Brain §13 note.
+- New: RELEASE_NOTES_v1.0.0.md + FINAL_RELEASE_CHECKLIST.md (scorecard
+  14 PASS / 1 PARTIAL — clean-install NOT verified, stated; warnings =
+  documented limitations). Decision: **RELEASE WITH WARNINGS**.
+- Git at decision time: 7 modified (GPU layer + README + Brain) + 5
+  untracked release docs; recommended commit message in the
+  checklist; NOT committed (awaiting explicit instruction). Version
+  v1.0.0 (first semver release).

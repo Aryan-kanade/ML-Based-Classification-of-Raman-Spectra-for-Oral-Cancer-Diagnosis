@@ -188,15 +188,81 @@ are stored in the checkpoint).
 | `vit_model.py` | spectral Vision Transformer model + checkpoint I/O |
 | `vit_train.py` | train the ViT on a spectra folder (curves + confusion matrix) |
 | `vit_test.py` | re-evaluate a trained ViT checkpoint on its test set |
-| `test_all.py` / `gui_test.py` / `deep_test.py` | 56 unit tests · GUI walk · 19 adversarial scenarios |
+| `test_all.py` / `gui_test.py` / `deep_test.py` | 97 unit tests · GUI walk · 19 adversarial scenarios |
 
 ## Testing
 
 ```bat
-python test_all.py    :: 56 unit/regression tests (synthetic data, ~2 min)
+python test_all.py    :: 97 unit/regression tests (synthetic data, ~2 min)
 python gui_test.py    :: headless end-to-end GUI flow (offscreen, ~20 s)
 python deep_test.py   :: adversarial sweep: error paths, workers, CLI (~60 s)
 ```
+
+## Compute devices (CPU / GPU)
+
+The app runs CPU-only out of the box and uses the GPU where one is
+genuinely available — controlled by the `RAMAN_DEVICE` environment
+variable (default **auto**; the GUI Start page shows a live
+"Compute device" card, both CLIs print a device summary):
+
+| Mode | torch models (1D-CNN, 5-seed CNN ensemble, ViT, TabPFN) | XGBoost / CatBoost | LightGBM + scikit-learn |
+|---|---|---|---|
+| `auto` (default) | **CUDA** when a CUDA context initializes (a real forward pass is probed at startup) | CPU (measured: at n≈300 CPU wins and GPU boosters OOM'd worker processes) | CPU |
+| `gpu` | CUDA | **GPU** (parent process only) | CPU (no genuine GPU backend) |
+| `cpu` | forced CPU | forced CPU | CPU |
+
+`gpu` is **strict**: if no usable CUDA backend exists, the app fails
+loudly at startup / CLI entry instead of silently running CPU.
+LightGBM pip wheels contain no GPU build (source build with
+`-DUSE_GPU=1` required) — honestly reported as CPU. Bundle weights
+are stored on CPU, so saved-model predictions are **identical**
+whether the training ran on GPU or CPU (verified MAX |Δp| = 0).
+Full details + benchmarks: `GPU_ACCELERATION.md`,
+`GPU_ACCELERATION_AUDIT.md`, `GPU_STRESS_TEST_AUDIT.md` (repo root).
+
+## Performance reporting policy
+
+The number the GUI and reports show as performance is the **nested
+honest estimate** (preprocessing re-chosen inside every CV fold,
+pooled confusion matrix) — not the selection-CV numbers, which are
+labeled as a "selection ranking". Supplementary scientific metrics
+(balanced accuracy, MCC, PR-AUC, Brier, ECE, explicit TP/TN/FP/FN,
+threshold-stability stats with an instability warning) are shown
+separately, with PATIENT-level and SPECTRUM-level results explicitly
+labeled and never mixed.
+
+## Validation summary
+
+Five audit rounds + a formula audit + a GPU implementation audit + a
+long-running GPU soak test (all reports at the repo root: `MASTER_
+AUDIT_REPORT.md`, `FINAL_RELEASE_AUDIT.md`, `METRIC_IMPROVEMENT_
+IMPLEMENTATION.md`, `GPU_*.md`). Final state: **97/97 unit · 19/19
+deep · GUI suite · ruff clean · 25/25 registry (Extra Trees F1
+0.760) · zero patient-level leakage (fingerprint probes at chance)
+· persistence bit-exact across processes · all scientific baselines
+bit-identical after every change · GPU soak 15/15 PASS (20× train,
+100× predictions, memory plateau, 0 CUDA errors).**
+
+## Scientific limitations
+
+* **Single-centre dataset, no external cohort validation** — every
+  number is internal cross-validation; a second site is required
+  before any clinical claim.
+* The headline numbers are the honest nested estimates (e.g. honest
+  macro-F1 ≈ 0.56 on standard data); selection-CV numbers are higher
+  and are deliberately not reported as performance.
+* **Threshold instability**: per-fold tuned thresholds can vary
+  widely (e.g. 0.01–0.88 for one model); the app displays the full
+  spread and a warning rather than hiding it.
+* **Patient-level on paired winners**: patients contribute both
+  Normal and Tumor sites; the dominant-class patient rollup is a
+  documented approximation (shown with labels, not hidden).
+* **GIGO boundary**: physically odd but finite-signal inputs can
+  still receive confident predictions; NaN/no-signal/degenerate
+  inputs are rejected with clear errors on every path.
+* CNN folds trained on GPU are not bit-identical to CPU folds (CUDA
+  atomics); seeds fix the splits, and saved-bundle predictions are
+  device-independent.
 
 ## Reproducing the study
 
@@ -212,8 +278,8 @@ python reproduce_study.py --mode paired-pqn    :: margin mode + PQN
 
 > **STALE — re-run before citing.** These numbers predate the
 > 2026-09-04 loader change (padded edges kept, crop 500/2000) and the
-> 2026-09-05 hygiene change (site-token drops). Full tables:
-> `study_run_standard_v2/summary.txt`, `study_run_paired_v2/summary.txt`.
+> 2026-09-05 hygiene change (site-token drops). The v2 run artifacts
+> were removed 2026-09-07; `Brain.md` §13 is the surviving record.
 
 5-fold patient-grouped CV ×3, seed 42, 18 quality-flagged spectra
 excluded; CIs are patient-level.

@@ -131,6 +131,15 @@ def main(argv=None) -> int:
     model_names = (["PCA + LDA", "PCA + Logistic Regression",
                     "Ensemble (top-3)"] if args.mini else None)
     print("[reproduce] training…")
+    try:
+        _v = modeling.verify_gpu_runtime()
+        print(f"[reproduce] device: mode={_v['mode']} · "
+              f"CNN={_v['cnn']} · XGBoost={_v['xgboost']} · "
+              f"CatBoost={_v['catboost']} · LightGBM={_v['lightgbm']} · "
+              "sklearn=cpu")
+    except RuntimeError as exc:
+        print(f"[reproduce] DEVICE ERROR: {exc}")
+        return 2
     print(f"[reproduce] {modeling.device_report()}")
     results, winner = modeling.evaluate_models(
         X, y, model_names=model_names, k_folds=args.folds,
