@@ -313,8 +313,10 @@ def plot_calibration(ax, bins, cal_bins=None,
         ax.legend(loc="upper left", fontsize=8)
     ax.set_xlabel("predicted P(positive)")
     ax.set_ylabel("observed positive rate")
-    ax.set_xlim(-0.02, 1.02)
-    ax.set_ylim(-0.02, 1.05)
+    # 0 starts at the exact left/bottom edge (2026-09-08: the old -0.02
+    # padding inset the 0 tick; user request — also matches plot_pr)
+    ax.set_xlim(0, 1.02)
+    ax.set_ylim(0, 1.05)
     ax.set_title(title, fontsize=10)
 
 
@@ -395,8 +397,10 @@ def plot_roc(ax, fpr, tpr, auc: float, label: str = ""):
         pass
     ax.set_xlabel("1 − Specificity (FPR)")
     ax.set_ylabel("Sensitivity (TPR)")
-    ax.set_xlim(-0.02, 1.02)
-    ax.set_ylim(-0.02, 1.05)
+    # 0 starts at the exact left/bottom edge (2026-09-08: the old -0.02
+    # padding inset the 0 tick; user request — matches plot_pr beside it)
+    ax.set_xlim(0, 1.02)
+    ax.set_ylim(0, 1.05)
     ax.set_title("ROC (out-of-fold)", fontsize=10)
     ax.legend(loc="lower right")
 

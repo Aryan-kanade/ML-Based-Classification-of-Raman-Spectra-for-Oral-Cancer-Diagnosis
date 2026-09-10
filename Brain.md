@@ -2292,3 +2292,14 @@ Finalization pass, no production changes (README/doc only).
   untracked release docs; recommended commit message in the
   checklist; NOT committed (awaiting explicit instruction). Version
   v1.0.0 (first semver release).
+
+## 46. 2026-09-08 (post-release touch-up) — ROC + calibration axes
+start at 0 (user request)
+
+plot_roc / plot_calibration lower bounds -0.02 → 0 (plotting.py; the
+-0.02 padding inset the 0 tick from the left/bottom edge). plot_pr
+already used 0 — the ROC+PR side-by-side is now visually consistent.
+Display-only (no data/curve/metric change); verified via render
+assert (xlim[0]==ylim[0]==0) + plotting tests PASS + ruff. Covers
+both call sites (Result validation 2×2 + diagnostics ROC panel).
+Uncommitted.
