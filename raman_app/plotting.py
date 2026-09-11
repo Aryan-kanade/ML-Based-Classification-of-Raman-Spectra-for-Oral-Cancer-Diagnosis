@@ -141,7 +141,9 @@ def plot_spectra(ax, spectra: list[tuple[np.ndarray, np.ndarray, str]],
     ax.margins(x=0.01)
     if title:
         ax.set_title(title)
-    ax.invert_xaxis()  # Raman convention: high -> low
+    # x ASCENDING — low wavenumbers on the LEFT (user request
+    # 2026-09-08; the old high->low "Raman convention" inversion was
+    # removed everywhere so all axes read normally)
     if 0 < len(spectra) <= 10:
         ax.legend()
 
@@ -275,7 +277,6 @@ def plot_prediction_spectra(ax, wn, spectra, mean_trace=None,
                 label="patient normal reference")
     ax.set_xlabel("Raman shift (cm$^{-1}$)")
     ax.set_ylabel("Intensity (a.u.)")
-    ax.invert_xaxis()
     ax.margins(x=0.01)
     if bands:
         for b in bands[:3]:
@@ -317,6 +318,9 @@ def plot_calibration(ax, bins, cal_bins=None,
     # padding inset the 0 tick; user request — also matches plot_pr)
     ax.set_xlim(0, 1.02)
     ax.set_ylim(0, 1.05)
+    # probability axes ALWAYS run 0 -> 1 left-to-right (pin: spectral
+    # plots invert, these must never — user report 2026-09-08)
+    ax.xaxis.set_inverted(False)
     ax.set_title(title, fontsize=10)
 
 
@@ -372,6 +376,7 @@ def plot_pr(ax, prec, rec, ap: float, label: str = ""):
     ax.set_ylabel("Precision (PPV)", fontsize=9)
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1.02)
+    ax.xaxis.set_inverted(False)   # probability axis: 0 always on the LEFT
     ax.legend(loc="lower left", fontsize=8)
     ax.grid(alpha=0.25, lw=0.5)
     ax.set_title("Precision–Recall — out-of-fold", fontsize=10)
@@ -401,6 +406,7 @@ def plot_roc(ax, fpr, tpr, auc: float, label: str = ""):
     # padding inset the 0 tick; user request — matches plot_pr beside it)
     ax.set_xlim(0, 1.02)
     ax.set_ylim(0, 1.05)
+    ax.xaxis.set_inverted(False)   # probability axis: 0 always on the LEFT
     ax.set_title("ROC (out-of-fold)", fontsize=10)
     ax.legend(loc="lower right")
 
@@ -453,7 +459,6 @@ def plot_prediction(fig, wn, y_raw, y_proc, pred: str, probs: dict,
             label="preprocessed")
     ax.set_xlabel("Raman shift (cm$^{-1}$)")
     ax.set_ylabel("Intensity (a.u.)")
-    ax.invert_xaxis()
     ax.legend(loc="upper left")
     ax.set_title(title or "Spectrum", fontsize=10)
     box = dict(boxstyle="round,pad=0.5", facecolor="#dcfce7",

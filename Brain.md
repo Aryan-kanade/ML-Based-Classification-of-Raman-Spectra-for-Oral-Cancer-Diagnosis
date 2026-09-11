@@ -588,8 +588,8 @@ Preview (**one row per class** since 2026-09-04 — Normal AND Tumor each
 get a raw + preprocessed pair; a Data-page selection wins for its class,
 others fall back to first-of-class; processed curve on twin y-axis —
 raw ~1e3 vs processed ~1e-2 after vector-norm, shared axis squashed it
-flat; x ASCENDING low→high, unlike all other plots which keep Raman
-high→low) → `prep_canvas`; **Optimize preprocessing** →
+flat; x ASCENDING low→high — since 2026-09-08 ALL spectral plots run
+ascending, see §47) → `prep_canvas`; **Optimize preprocessing** →
 `OptimizeWorker` → `_apply_params(best)` + `save_best_params`.
 **Page layout (2026-09-04, user request + polish)**: param card is ONE
 vertical flow in pipeline order; EVERY stage sits in a bordered
@@ -2302,4 +2302,23 @@ already used 0 — the ROC+PR side-by-side is now visually consistent.
 Display-only (no data/curve/metric change); verified via render
 assert (xlim[0]==ylim[0]==0) + plotting tests PASS + ruff. Covers
 both call sites (Result validation 2×2 + diagnostics ROC panel).
+
+## 47. 2026-09-08 (final fix) — ALL Raman-shift axes now run
+LOW→HIGH, 0/low on the LEFT (user request)
+
+The REAL complaint behind "0 should start from left": the SPECTRAL
+plots (Data/Train `plot_spectra`, Predict/Result
+`plot_prediction_spectra`, overview `plot_prediction`) deliberately
+ran the "Raman convention" high→low (3862 left → 15.5 right) via
+three `ax.invert_xaxis()` calls (plotting.py 144/280/463). Removed
+all three → every spectrum axis reads normally: low wavenumbers on
+the LEFT rising to the right (matches the prep preview, which was
+already ascending, and the probability axes). Descending wn input
+arrays are fine (matplotlib auto-scales ascending). Band spans/
+annotations direction-neutral. Verified in isolated figures
+(inverted=False, xlim ascending for all three) + plotting tests +
+gui_test + ruff. §14's old "unlike all other plots which keep Raman
+high→low" note updated. UNCOMMITTED at writing; app RESTART required
+(stale running instances hold old code — that is why earlier fixes
+"didn't change" the graphs the user saw).
 Uncommitted.
