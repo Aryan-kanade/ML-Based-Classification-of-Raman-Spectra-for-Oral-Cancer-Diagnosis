@@ -324,26 +324,28 @@ TIPS = {
     "folder": "Pick the folder that contains your spectra files "
               "(2 columns: wavenumber + intensity).",
     "class_col": "Class of this spectrum, read from the C-number in the "
-                 "filename (e.g. S07_tissue_C8.txt -> C8). "
+                 "filename (e.g. S07_tissue_C8.txt → C8). "
                  "Double-click to correct it.",
     "wavelet": "Wavelet denoising removes instrument noise while keeping "
                "sharp Raman peaks.",
     "wavelet_name": "Wavelet shape used for denoising (sym8 is a good "
                     "default for Raman).",
     "level": "Higher levels remove smoother noise; 3-5 works well.",
-    "sg_window": "Savitzky-Golay smoothing window in data points (odd). "
+    "sg_window": "Savitzky–Golay smoothing window in data points (odd). "
                  "Bigger = smoother but blurs small peaks. 9-15 is typical.",
     "sg_poly": "Polynomial order of the smoothing fit (2-3 is standard).",
     "deriv": "0 = just smooth. 1st/2nd derivative suppresses baseline "
              "drift but makes spectra harder to eyeball.",
     "als_lambda": "Baseline stiffness: 10^5 is a good start. Increase "
                   "(10^6-10^7) for very broad humps.",
-    "als_p": "Asymmetry: 0.001-0.05. Smaller = baseline hugs peaks less.",
+    "als_p": "Asymmetry: 0.001–0.05. Smaller p keeps the baseline stiff and under the peaks; larger p lets it climb onto peaks.",
     "als_niter": "Internal iterations — 10 is plenty.",
     "norm": "vector: scales each spectrum to unit length (default). "
             "snv: standardize each spectrum (mean 0, std 1). none: skip.",
     "folds": "Cross-validation folds: each spectrum is predicted by a model "
-             "trained on the others. 5 is standard.",
+             "trained on the others — with clinical (patient-grouped) data "
+             "that means the OTHER PATIENTS, so the score reflects new people. "
+             "5 is standard.",
     "seed": "Random seed for the fold shuffle — same seed, same split, "
             "reproducible results.",
     "sens": "Sensitivity (recall): of all truly positive samples (e.g. "
@@ -385,29 +387,35 @@ cross-validation fold to maximize F1, without peeking at the test data.</p>
 spectrum gets predicted by a model that never saw it. The reported numbers
 are what you can expect on NEW spectra.</p>"""
 
-HOW_TO = """<h3>How to use this app</h3>
+def how_to(n_models: int = 24) -> str:
+    return f"""<h3>How to use this app</h3>
 <ol>
-<li><b>Data</b> — load the folder with your spectra (.txt, 2 columns).
-Classes are read from the C-number in each filename
-(S07_tissue_C8.txt → class C8) and can be fixed by double-clicking
-the Class column.</li>
+<li><b>Data</b> — load the folder with your spectra (.txt / .dat / .csv,
+2 columns). Classes come from the folder layout (clinical tree) or the
+C-number in each filename (S07_tissue_C8.txt → class C8) and can be
+fixed by double-clicking the Class column.</li>
 <li><b>Preprocess</b> — wavelet denoising, Savitzky–Golay smoothing,
 ALS baseline correction and normalization. The defaults suit most Raman
-data; press <i>Preview</i> to see the effect.</li>
+data; press <i>Preview spectrum</i> to see the effect.</li>
 <li><b>Train &amp; Evaluate</b> — press <i>Start training</i>. The app
-compares SVM, LDA, Random Forest, PLS-DA, Logistic Regression and XGBoost
-with k-fold cross-validation and keeps the model with the best
-sensitivity / specificity / F1. Then <i>Save best model</i>.</li>
+compares {n_models} model families (PCA+SVM, Random Forest, PLS-DA,
+XGBoost, 1D-CNN, …) under patient-grouped cross-validation and keeps
+the best macro-F1. Then <i>Save best model…</i>.</li>
 <li><b>Predict</b> — load the saved model once, then choose the folder
 with new spectra and press <i>Predict</i>.</li>
 </ol>"""
 
 
+# backward-compatible alias (default registry size)
+HOW_TO = how_to()
+
+
 def about_text(binding: str) -> str:
     return f"""<h3>Raman Spectra Classifier</h3>
 <p>Oral-cancer detection from SERS Raman spectra with maximum
-sensitivity, specificity and F1 score.</p>
-<p>• Nested cross-validated model comparison (no data leakage)<br>
+macro-F1.</p>
+<p>• Patient-grouped cross-validation; nested honest estimate reported
+when available<br>
 • Binary F1-optimal decision thresholds<br>
 • Winner refit on all data and saved with its preprocessing</p>
 <p>Qt binding: {binding}</p>"""

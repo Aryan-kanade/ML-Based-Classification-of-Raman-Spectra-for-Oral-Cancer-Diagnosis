@@ -178,11 +178,26 @@ def optimize_preprocessing(X_raw: np.ndarray, wn: np.ndarray, y: list[str],
 
 
 def save_best_params(params: pp.PreprocessParams, score: float,
-                     model: str, path: str = BEST_PARAMS_PATH) -> str:
+                     model: str, path: str = BEST_PARAMS_PATH,
+                     exclude_flagged: bool | None = None) -> str:
+    """Persist the winning preprocessing preset.
+
+    `score_macro_f1` is the SELECTION-CV score (max over ~12 configs x
+    3 models) — an optimistic upper bound, not an honest performance
+    estimate (winner's curse; the honest path is the GUI's nested
+    evaluate_pipeline or a fresh reproduce_study run).  Consumers label
+    it accordingly.  `exclude_flagged` records whether spiked spectra
+    were excluded during selection so downstream training (vit_train)
+    matches the data the preset was chosen on (2026-09-12 audit)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {"preprocess": asdict(params),
+               "score_macro_f1": score,
+               "score_kind": "selection-CV (optimistic upper bound)",
+               "model": model}
+    if exclude_flagged is not None:
+        payload["exclude_flagged"] = bool(exclude_flagged)
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"preprocess": asdict(params), "score_macro_f1": score,
-                   "model": model}, fh, indent=2)
+        json.dump(payload, fh, indent=2)
     return path
 
 
@@ -350,9 +365,12 @@ def main():
         print(f"  {i:2d}. {r['label']:<46} {r['model']:<13} "
               f"{r['mean_f1']:.3f} ± {r['std_f1']:.3f}")
     path = save_best_params(out["params"], out["best"]["mean_f1"],
-                            out["best"]["model"], args.out)
+                            out["best"]["model"], args.out,
+                            exclude_flagged=(exclude is not None))
     print(f"\nSaved best preprocessing: {path}")
-    print("vit_train.py and the GUI can now use these settings.")
+    print("NOTE: the saved score is the SELECTION-CV maximum over the "
+          "sweep — an optimistic upper bound, not a performance "
+          "estimate. Re-validate with reproduce_study/GUI training.")
 
 
 if __name__ == "__main__":

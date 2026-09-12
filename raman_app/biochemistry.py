@@ -104,15 +104,25 @@ def band_area(wn, y, center: float, halfwidth: float) -> float:
 
 
 def band_ratios(wn, y) -> dict[str, float]:
-    """The classical biomedical markers for one (cropped) spectrum."""
+    """The classical biomedical markers for one (cropped) spectrum.
+
+    Denominator guard (2026-09-12 audit): band areas from
+    baseline-subtracted / derivative spectra can be ≈0 or NEGATIVE —
+    an exact-zero check alone lets |d| = 1e-9 produce explosive or
+    sign-flipped ratios.  A ratio is NaN unless the denominator is at
+    least 1% of the median absolute band area of this spectrum."""
     areas = {}
     for center, halfwidth, _mol, _assign, _dir in BANDS:
         areas[center] = band_area(wn, y, center, halfwidth)
+    finite_areas = [abs(v) for v in areas.values() if np.isfinite(v)]
+    floor = (0.01 * float(np.median(finite_areas))
+             if finite_areas else 0.0)
     out: dict[str, float] = {}
     for key, num, den, _meaning in RATIOS:
         d = areas.get(den, float("nan"))
         out[key] = (areas.get(num, float("nan")) / d
-                    if d and np.isfinite(d) and d != 0 else float("nan"))
+                    if (np.isfinite(d) and floor > 0
+                        and abs(d) >= floor) else float("nan"))
     return out
 
 
@@ -281,7 +291,13 @@ def biochemical_shift(X, wn, labels) -> list[tuple]:
     lipid/carotenoid-dominated; cancer shifts toward protein + nucleic
     acids (Baraga/Feld fingerprint; Li 2023).  Positive class = the
     alphabetically-later class (Tumor > Normal).
-    Returns rows (center, molecule, expected, delta_norm, p).
+    Returns rows (center, molecule, expected, delta_norm, p_raw, p_fdr).
+
+    NARRATIVE TABLE, NOT INFERENCE: spectra are pooled across patients
+    (pseudo-replication on grouped data) and the p-values are now
+    Benjamini-Hochberg corrected across bands (2026-09-12 audit); the
+    patient-paired, FDR-corrected version is study_stats.
+    band_stats_paired.
     """
     from scipy.stats import ttest_ind
     X = np.asarray(X, dtype=float)
@@ -305,7 +321,13 @@ def biochemical_shift(X, wn, labels) -> list[tuple]:
             p = float(ttest_ind(bb, aa, equal_var=False).pvalue)
         except Exception:
             p = float("nan")
-        rows.append((center, mol, direction, float(delta), p))
+        rows.append([center, mol, direction, float(delta), p, p])
+    finite = [i for i, r in enumerate(rows) if np.isfinite(r[4])]
+    if finite:
+        import study_stats as sstats
+        adj = sstats.bh_fdr([rows[i][4] for i in finite])
+        for i, pa in zip(finite, adj, strict=True):
+            rows[i][5] = float(pa)
     return rows
 
 
@@ -316,7 +338,11 @@ def dataset_qc(X, wn) -> dict:
     saliva thiocyanate QC band is inside the measured range.
     """
     X = np.asarray(X, dtype=float)
-    noise = np.median(np.abs(np.diff(X, axis=1)), axis=1) * 1.4826
+    # MAD of first differences estimates sigma(diff) = sqrt(2)*sigma for
+    # white noise — divide by sqrt(2) to get the INTENSITY noise std
+    # (2026-09-12 audit: the old estimate was 41% high, SNR 29% low)
+    noise = (np.median(np.abs(np.diff(X, axis=1)), axis=1) * 1.4826
+             / np.sqrt(2.0))
     snr = (X.max(axis=1) - X.min(axis=1)) / np.maximum(noise, 1e-12)
     jumps = np.abs(np.diff(X, axis=1)).max(axis=1) / np.maximum(
         np.median(np.abs(np.diff(X, axis=1)), axis=1), 1e-12)
@@ -393,9 +419,14 @@ def keratin_index(wn, y) -> float:
     class structure — flag it instead of silently absorbing it).
     """
     den = band_area(wn, y, 1003.0, 8.0)
-    if not np.isfinite(den) or den == 0:
+    num = band_area(wn, y, 938.0, 10.0)
+    if not np.isfinite(den) or not np.isfinite(num):
         return float("nan")
-    return band_area(wn, y, 938.0, 10.0) / den
+    # same near-zero guard as band_ratios: a ≈0/negative denominator
+    # after baseline removal would explode the index (2026-09-12 audit)
+    if abs(den) < 1e-9 * max(abs(num), 1e-9):
+        return float("nan")
+    return num / den
 
 
 def keratin_flags(wn, spectra, z_thresh: float = 2.5) -> tuple[float, float,

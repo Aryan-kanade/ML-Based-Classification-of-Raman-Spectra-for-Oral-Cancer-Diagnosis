@@ -170,7 +170,7 @@ def plot_preprocess_preview(ax_before, ax_after, wn, raw, processed,
              solid_capstyle="round", label="preprocessed (right axis)")
     ax_after.set_title("Preprocessed")
     ax_after.set_xlabel("Raman shift (cm$^{-1}$)")
-    ax2.set_ylabel("Processed intensity", color=COL_RESULT)
+    ax2.set_ylabel("Preprocessed intensity", color=COL_RESULT)
     ax2.tick_params(axis="y", labelcolor=COL_RESULT)
     h1, l1 = ax_after.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
@@ -179,6 +179,28 @@ def plot_preprocess_preview(ax_before, ax_after, wn, raw, processed,
     if title:
         ax_before.figure.suptitle(title, fontsize=9, fontweight="bold",
                                   color="#1e293b")
+
+
+def plot_paired_deviations(ax, wn, series, title: str = ""):
+    """Paired deviation features (what the model trains on in Paired /
+    Paired+PQN mode): faint per-spectrum traces + a bold mean per
+    class, around the zero line. `series` = list of dicts
+    {label, color, traces (list of arrays), mean (array)}."""
+    ax.clear()
+    ax.axhline(0.0, color=COL_ZERO, lw=0.8, ls=":", zorder=0)
+    for s in series:
+        for y in s.get("traces", ()):
+            ax.plot(wn, y, lw=0.7, color=s["color"], alpha=0.15,
+                    solid_capstyle="round", zorder=1)
+        ax.plot(wn, s["mean"], lw=1.5, color=s["color"],
+                solid_capstyle="round", zorder=2,
+                label=f"{s['label']} mean "
+                f"(n={len(s.get('traces', ()))} spectra)")
+    ax.set_xlabel("Raman shift (cm$^{-1}$)")
+    ax.set_ylabel("Deviation (a.u.)")
+    if title:
+        ax.set_title(title)
+    ax.legend(loc="best", fontsize=8, framealpha=0.85)
 
 
 # --------------------------------------------------------------------------
@@ -250,9 +272,15 @@ def plot_prob_histogram(ax, p_pos: np.ndarray, threshold: float | None = None,
                     va="top", ha="left", fontsize=8, color="#b45309")
     ax.set_xlabel(f"P({pos_name})")
     ax.set_ylabel("spectra")
-    ax.set_xlim(-0.02, 1.02)
+    # 0 at the exact left edge (2026-09-12 graph audit: the old -0.02
+    # pad inset the 0 tick — matches plot_pr / plot_roc / plot_calibration)
+    ax.set_xlim(0, 1.02)
     ax.set_xticks(np.linspace(0, 1, 6))
-    ax.set_yticks(range(0, int(ax.get_ylim()[1]) + 2))
+    # integer counts without one tick per spectrum (2026-09-12 graph
+    # audit: a 299-spectra prediction set crammed ~300 y-ticks)
+    from matplotlib import ticker as mticker
+    ax.yaxis.set_major_locator(
+        mticker.MaxNLocator(integer=True, nbins="auto"))
     ax.set_title(f"P({pos_name}) per spectrum", fontsize=10)
 
 
@@ -486,7 +514,7 @@ def plot_prediction(fig, wn, y_raw, y_proc, pred: str, probs: dict,
 # shared bar-chart looks (Result distribution, Predict overview,
 # biochemistry deltas, NMF deltas, LOPO, local explanation)
 # --------------------------------------------------------------------------
-def plot_count_bars(ax, labels, counts, title="Class counts",
+def plot_count_bars(ax, labels, counts, title="Prediction distribution",
                     positive=None):
     """Vertical class-count bars; the positive class gets the result
     red, the rest follow the palette."""
@@ -507,45 +535,7 @@ def plot_count_bars(ax, labels, counts, title="Class counts",
     return ax
 
 
-def plot_sign_bars(ax, labels, values, ylabel="", title="",
-                   orientation="v", red_below=None, fmt="%+.2f"):
-    """
-    Sign-colored bars + zero reference line + value labels — the shared
-    look of the paired biochemistry deltas, NMF component deltas, LOPO
-    per-patient accuracy and the local-explanation bars.
-    orientation 'v' draws up/down bars, 'h' left/right bars.
-    red_below (e.g. 0.5 for LOPO accuracy) colors weak bars red
-    instead of using the sign convention.
-    """
-    vals = np.asarray(values, dtype=float)
-    if orientation == "h":
-        cols = ([COL_RESULT if v < red_below else COL_SIGN_NEG
-                 for v in vals] if red_below is not None else
-                [COL_SIGN_POS if v >= 0 else COL_SIGN_NEG for v in vals])
-        bars = ax.barh(labels, vals, color=cols, edgecolor="white",
-                       linewidth=0.6)
-        ax.axvline(0, color=COL_ZERO, lw=0.8)
-        for b, v in zip(bars, vals, strict=True):
-            # fmt is %-STYLE ("%+.2f") — f-string {v:{fmt}} rejects it
-            # (Invalid format specifier); this dead-code path had never
-            # run until the 2026-09-06 audit test pinned it
-            ax.text(v, b.get_y() + b.get_height() / 2, " " + fmt % v,
-                    va="center", ha="left" if v >= 0 else "right",
-                    fontsize=8, color=COL_TEXT)
-        ax.invert_yaxis()
-    else:
-        cols = ([COL_RESULT if v < red_below else COL_SIGN_NEG
-                 for v in vals] if red_below is not None else
-                [COL_SIGN_POS if v >= 0 else COL_SIGN_NEG for v in vals])
-        bars = ax.bar(labels, vals, color=cols, edgecolor="white",
-                      linewidth=0.6)
-        ax.axhline(0, color=COL_ZERO, lw=0.8)
-        for b, v in zip(bars, vals, strict=True):
-            ax.text(b.get_x() + b.get_width() / 2, v, fmt % v,
-                    ha="center", va="bottom" if v >= 0 else "top",
-                    fontsize=8, color=COL_TEXT)
-    if ylabel:
-        ax.set_ylabel(ylabel)
-    if title:
-        ax.set_title(title)
-    return ax
+# plot_sign_bars removed 2026-09-12 (graph audit, dead code): its
+# docstring claimed to be the shared look of the LOPO / biochem / NMF /
+# local-explanation bars, but every one of those sites hand-rolls its
+# own bars — only its pinning test ever called it.

@@ -514,14 +514,25 @@ def main():
 
     # preprocessing preset first (drives the spiked-spectrum decision)
     params = pp.PreprocessParams().validate()
+    preset_exclude_flagged: bool | None = None
     if args.preset == "best":
         loaded = load_best_params()
         if loaded is not None:
             params, meta = loaded
             params = params.validate()
+            # selection-CV score: max over the sweep — optimistic upper
+            # bound (winner's curse), NOT a performance estimate
+            # (2026-09-12 audit)
             print(f"Preprocess : auto-tuned preset from optimize.py "
-                  f"({meta.get('model', '?')}, CV macro-F1 "
-                  f"{meta.get('score_macro_f1', 0):.3f})")
+                  f"({meta.get('model', '?')}, selection-CV macro-F1 "
+                  f"{meta.get('score_macro_f1', 0):.3f} — optimistic "
+                  "upper bound)")
+            # honor the flagged-spectra policy the preset was SELECTED
+            # under (optimize.py excludes spiked by default); missing
+            # key = legacy preset, keep the despike-based rule below
+            preset_exclude_flagged = meta.get("exclude_flagged")
+            if preset_exclude_flagged is not None:
+                preset_exclude_flagged = bool(preset_exclude_flagged)
         else:
             print("Preprocess : library defaults (no optimize.py result "
                   "found - run python optimize.py first)")
@@ -537,15 +548,19 @@ def main():
         y = [s.label for s in spectra]
         groups = list(cd.groups)
         # spiked spectra are RECOVERED by Whitaker-Hayes despiking in the
-        # pipeline; only exclude them when despiking is disabled
-        if cd.flagged and any(cd.flagged) and not params.despike:
+        # pipeline; exclude them when despiking is disabled — and always
+        # when the selected preset was optimized without them
+        if cd.flagged and any(cd.flagged) and (
+                preset_exclude_flagged is True or not params.despike):
             keep = [i for i, bad in enumerate(cd.flagged) if not bad]
             n_bad = len(spectra) - len(keep)
             spectra = [spectra[i] for i in keep]
             y = [y[i] for i in keep]
             groups = [groups[i] for i in keep]
-            print(f"  cleaned   : {n_bad} spiked spectra excluded "
-                  "(quality flag, despiking off)")
+            why = ("preset selected without them"
+                   if preset_exclude_flagged is True
+                   else "quality flag, despiking off")
+            print(f"  cleaned   : {n_bad} spiked spectra excluded ({why})")
         classes = sorted(set(y))
         if cd.grid is not None:      # all files share one grid (verified)
             grid = cd.grid

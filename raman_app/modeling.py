@@ -301,15 +301,22 @@ class TTestSelect(TransformerMixin, BaseEstimator):
     INSIDE the CV pipeline so the selection never sees test spectra
     (Cawley & Talbot 2010).  Falls back to all features when nothing
     passes (tiny/unaligned folds) so pipelines still train.
+
+    SELECTION HEURISTIC, NOT INFERENCE: the per-wavenumber p-values are
+    uncorrected (~1e3 tests -> ~50 expected false positives at p<0.05);
+    set `fdr=True` to apply Benjamini-Hochberg before thresholding.
     """
 
-    def __init__(self, p_max: float = 0.05, d_min: float = 0.1):
+    def __init__(self, p_max: float = 0.05, d_min: float = 0.1,
+                 fdr: bool = False):
         self.p_max = p_max
         self.d_min = d_min
+        self.fdr = fdr
 
     def fit(self, X, y):
         X = np.asarray(X, dtype=float)
-        classes = np.unique(y)
+        y = np.asarray(y)          # list labels silently disabled the
+        classes = np.unique(y)     # filter (2026-09-12 audit)
         if len(classes) != 2:      # multiclass: keep everything (report
             self.mask_ = np.ones(X.shape[1], dtype=bool)  # is binary)
             self.n_selected_ = int(X.shape[1])
@@ -318,6 +325,11 @@ class TTestSelect(TransformerMixin, BaseEstimator):
         b = X[y == classes[1]]
         from scipy.stats import ttest_ind
         t, p = ttest_ind(a, b, axis=0, equal_var=False)   # Welch
+        if self.fdr:               # Benjamini-Hochberg step-up
+            o = np.argsort(p, kind="stable")
+            ranked = p[o] * len(p) / np.arange(1, len(p) + 1)
+            p = np.empty_like(p)
+            p[o] = np.minimum.accumulate(ranked[::-1])[::-1]
         na, nb = len(a), len(b)
         sp = np.sqrt(((na - 1) * a.var(axis=0, ddof=1)
                       + (nb - 1) * b.var(axis=0, ddof=1)) / (na + nb - 2))
@@ -1341,7 +1353,9 @@ def patient_level_evaluation(y_encoded, groups, oof_proba,
     positive when that mean >= the given (existing) threshold (0.5
     fallback).  Returns the full metric set on the patient confusion
     matrix + rank metrics on the patient mean-probabilities, or None
-    when grouping is unavailable."""
+    when grouping is unavailable.  `n_tied_patients` counts patients
+    with an EXACT Normal/Tumor spectrum tie — their dominant-class
+    truth is an arbitrary first-value tie-break (2026-09-12 audit)."""
     if groups is None or oof_proba is None or y_encoded is None:
         return None
     ye = np.asarray(y_encoded)
@@ -1353,6 +1367,7 @@ def patient_level_evaluation(y_encoded, groups, oof_proba,
         return None
     thr = float(threshold) if threshold is not None else 0.5
     pats = []
+    n_tied = 0
     for gu in np.unique(g):
         m = g == gu
         p_mean = float(P[m, 1].mean())
@@ -1360,6 +1375,8 @@ def patient_level_evaluation(y_encoded, groups, oof_proba,
         # patients contribute both classes; same rule as the existing
         # per-patient rollup)
         vals, cnts = np.unique(ye[m], return_counts=True)
+        if len(vals) == 2 and cnts[0] == cnts[1]:
+            n_tied += 1
         pats.append((int(vals[np.argmax(cnts)]), p_mean))
     y_pat = np.array([p[0] for p in pats])
     p_pat = np.array([p[1] for p in pats])
@@ -1370,6 +1387,7 @@ def patient_level_evaluation(y_encoded, groups, oof_proba,
     per = class_metrics_from_cm(cm)
     return {
         "n": int(len(pats)),
+        "n_tied_patients": n_tied,
         "tp": int(cm[1, 1]), "tn": int(cm[0, 0]),
         "fp": int(cm[0, 1]), "fn": int(cm[1, 0]),
         "sens": per["1"]["sens"], "spec": per["0"]["sens"],
@@ -1385,8 +1403,18 @@ def patient_level_evaluation(y_encoded, groups, oof_proba,
 
 
 def best_f1_threshold(y_true: np.ndarray, scores: np.ndarray):
-    """Threshold maximizing F1 (and Youden's J) for score -> positive class."""
-    thresholds = np.unique(np.quantile(scores, np.linspace(0.01, 0.99, 99)))
+    """Threshold maximizing F1 (and Youden's J) for score -> positive
+    class.  EXACT: candidates are every distinct score and every
+    midpoint between neighbours (every achievable confusion matrix);
+    the old 1-99% quantile subsample could miss the optimum (2026-09-12
+    audit).  Falls back to the quantile grid above 5000 candidates."""
+    uniq = np.unique(scores)
+    if len(uniq) > 5000:
+        thresholds = np.unique(np.quantile(scores,
+                                           np.linspace(0.01, 0.99, 99)))
+    else:
+        thresholds = np.concatenate(
+            [uniq, (uniq[:-1] + uniq[1:]) / 2.0]) if len(uniq) > 1 else uniq
     best = (0.5, -1.0, -1.0)  # (thr, f1, j)
     for t in thresholds:
         pred = scores >= t
@@ -1527,7 +1555,12 @@ def _tune_inner(estimator, grid, Xtr, ytr, inner, pos_idx=None,
         est = clone(estimator)
         if params:
             est = est.set_params(**params)
-        est.fit(Xtr[tr], ytr[tr])
+        # grouped fit: estimators with internal probability calibration
+        # (CalibratedSVC) must not calibrate across a patient boundary
+        # (2026-09-12 audit); the outer refit already used the grouped
+        # helper, the inner loop now matches it
+        fit_maybe_grouped(est, Xtr[tr], ytr[tr],
+                          groups[tr] if groups is not None else None)
         return est.predict_proba(Xtr[va])
 
     tasks = [(combo, tr, va) for combo in combos for tr, va in splits]
@@ -1935,8 +1968,12 @@ def evaluate_models(X: np.ndarray, y: list[str],
 
 # named biochemical Raman bands for interpretability annotations
 BAND_NAMES = {
-    782: "DNA/RNA phosphate", 788: "DNA", 830: "collagen", 853: "tyrosine",
-    880: "tryptophan", 938: "collagen", 1003: "phenylalanine",
+    # aligned with biochemistry.BANDS (the Result-page biochemistry card
+    # and the keratin guard read THAT table — 938 IS the keratin marker
+    # and 853/854 proline/hydroxyproline collagen there)
+    782: "DNA/RNA phosphate", 788: "DNA", 830: "collagen",
+    853: "collagen", 880: "tryptophan", 938: "keratin",
+    1003: "phenylalanine",
     1032: "phenylalanine", 1095: "phosphate / DNA", 1130: "C–C lipids",
     1209: "collagen", 1240: "amide III", 1335: "nucleic acids",
     1450: "CH2 lipids/proteins", 1555: "tryptophan", 1580: "nucleic acids",
@@ -1948,7 +1985,8 @@ def _band_name(center: float) -> str:
     if not BAND_NAMES:
         return ""
     best = min(BAND_NAMES, key=lambda c: abs(c - center))
-    return (f" ({BAND_NAMES[best]})" if abs(best - center) <= 25 else "")
+    # no leading space — consumers join with their own separator
+    return (f"({BAND_NAMES[best]})" if abs(best - center) <= 25 else "")
 
 
 def region_importance_shap(X, y, groups, wn, seed: int = RANDOM_STATE,
@@ -2137,6 +2175,7 @@ def evaluate_pipeline(X_raw: np.ndarray, wn: np.ndarray, y: list[str],
     pool_y: list = []
     pool_pred: list = []
     pool_p: list = []
+    pool_p_proba: list = []       # per fold: p_col was a true probability?
     for fi, (tr, te) in enumerate(splitter.split(X_raw, y_arr, g_arr),
                                   start=1):
         if progress:
@@ -2159,11 +2198,13 @@ def evaluate_pipeline(X_raw: np.ndarray, wn: np.ndarray, y: list[str],
         pool_y.extend(y_arr[te])
         pool_pred.extend(pred)
         p_col = None
+        p_is_proba = False
         if hasattr(est, "predict_proba"):
             try:
                 proba = np.asarray(est.predict_proba(Xte))
                 if proba.ndim == 2 and proba.shape[1] == 2:
                     p_col = proba[:, 1]
+                    p_is_proba = True
             except Exception:
                 p_col = None
         if p_col is None and hasattr(est, "decision_function"):
@@ -2178,6 +2219,7 @@ def evaluate_pipeline(X_raw: np.ndarray, wn: np.ndarray, y: list[str],
                 p_col = None
         pool_p.extend(p_col if p_col is not None
                       else [None] * len(pred))
+        pool_p_proba.append(p_is_proba)
         if progress:
             progress(f"nested fold {fi}/{k}: {sub['best']['label']} + "
                      f"{model_name} -> F1 {f1:.3f}")
@@ -2204,7 +2246,12 @@ def evaluate_pipeline(X_raw: np.ndarray, wn: np.ndarray, y: list[str],
         supp["balanced_accuracy"] = balanced_accuracy_from_cm(cm)
         supp["mcc"] = mcc_from_cm(cm)
         if bool(np.all(np.isfinite(p_arr))) and len(p_arr) == len(enc):
-            supp["brier"] = brier_score(enc, p_arr)
+            # Brier is only defined on PROBABILITIES: decision margins
+            # (plain SVC) are unbounded — a margin "brier" of 8.6 was
+            # reported before the guard (2026-09-12 audit).  AUC/PR-AUC
+            # stay valid on margins (rank-based).
+            supp["brier"] = (brier_score(enc, p_arr)
+                             if all(pool_p_proba) else float("nan"))
             supp["pr_auc"] = float(pr_points(enc, p_arr)[2])
         else:
             supp["brier"] = float("nan")
@@ -2279,8 +2326,15 @@ def _aggregate(res: ModelResult, fold_metrics, cm_total):
         res.per_class[res.classes[ci]] = per
         for k in keys:
             agg[k].append(per[k][0])
+    # macro ± is now the FOLD-TO-FOLD variability (std of fold macro-F1,
+    # population ddof=0) — the old between-class spread read like a CV
+    # error bar but was dispersion across classes (2026-09-12 audit);
+    # the per-class spread stays in res.per_class
     res.macro = {k: (float(np.mean(agg[k])), float(np.std(agg[k])))
                  for k in keys}
+    if res.fold_f1:
+        res.macro["f1"] = (float(np.mean(res.fold_f1)),
+                           float(np.std(res.fold_f1)))
 
 
 # --------------------------------------------------------------------------
@@ -2656,18 +2710,65 @@ def permutation_auc_p(est, X, y, groups, n_perm: int = 100, k: int = 5,
     by reassigning whole patients' labels, re-running the grouped CV.
     Empirical p = (1 + #{null >= observed}) / (1 + n_perm).  This is the
     hard answer to "is the AUC real at n<500?".
+
+    Patients carrying BOTH classes (paired design) break the
+    patient-level label shuffle — their single first-row label would be
+    assigned arbitrarily.  They are EXCLUDED and counted; but when the
+    cohort is (almost) FULLY paired and exclusion would remove a class
+    entirely, the null switches to WITHIN-PATIENT label shuffling
+    (shuffle which spectra of each patient carry which label — the
+    natural paired-design null) (2026-09-12 audit).
     """
     X = np.asarray(X)
     y = np.asarray(y)
     groups = np.asarray(groups)
-    obs = grouped_oof_auc(est, X, y, groups, k=k, seed=seed)
+    mixed = [g for g in np.unique(groups)
+             if len(np.unique(y[groups == g])) > 1]
+    within_patient = False
+    if mixed:
+        keep = ~np.isin(groups, mixed)
+        yk, gk = y[keep], groups[keep]
+        n_keep = len(np.unique(gk))
+        cls_counts = (np.unique(yk, return_counts=True)[1] if len(yk)
+                      else np.array([0]))
+        too_small = (len(mixed) == len(np.unique(groups))
+                     or len(np.unique(yk)) < 2
+                     or n_keep < k + 1
+                     or int(cls_counts.min()) < 2)
+        if not too_small:
+            Xk = X[keep]
+            try:                       # even a big-enough kept set can
+                obs = grouped_oof_auc(est, Xk, yk, gk, k=k, seed=seed)
+            except Exception:           # still fold into one class —
+                within_patient = True   # fall back to the paired null
+            else:
+                X, y, groups = Xk, yk, gk
+                print(f"[perm] excluding {len(mixed)} mixed-label "
+                      f"patient(s) from the permutation test")
+        else:
+            within_patient = True
+    if within_patient:
+        try:
+            obs = grouped_oof_auc(est, X, y, groups, k=k, seed=seed)
+        except Exception:
+            raise ValueError(
+                "permutation_auc_p: within-patient null needs at least "
+                "one patient with both classes and >=2 labels overall")
+    elif not mixed:
+        obs = grouped_oof_auc(est, X, y, groups, k=k, seed=seed)
     rng = np.random.default_rng(seed)
     uniq = np.unique(groups)
     null = []
     for _ in range(int(n_perm)):
-        perm_lab = dict(zip(uniq, rng.permutation(
-            [y[groups == g][0] for g in uniq])))
-        y_perm = np.array([perm_lab[g] for g in groups])
+        if within_patient:
+            y_perm = y.copy()
+            for g in uniq:
+                idx = np.where(groups == g)[0]
+                y_perm[idx] = rng.permutation(y[idx])
+        else:
+            perm_lab = dict(zip(uniq, rng.permutation(
+                [y[groups == g][0] for g in uniq])))
+            y_perm = np.array([perm_lab[g] for g in groups])
         if len(np.unique(y_perm)) < 2:
             continue
         try:
@@ -2677,6 +2778,9 @@ def permutation_auc_p(est, X, y, groups, n_perm: int = 100, k: int = 5,
             continue
     p = (1 + sum(1 for v in null if v >= obs)) / (1 + len(null))
     return {"auc": obs, "p": float(p), "n_perm": len(null),
+            "n_mixed_excluded": 0 if within_patient else len(mixed),
+            "null": ("within-patient shuffle" if within_patient
+                     else "patient-label shuffle"),
             "null_mean": float(np.mean(null)) if null else float("nan")}
 
 
@@ -2901,12 +3005,16 @@ def export_model_card(path: str, winner, params=None,
         n_pos = int((ye[valid] == 1).sum())
         n_neg = int((ye[valid] == 0).sum())
         pw = _clin.auc_power(n_pos, n_neg, auc=auc)
+        n_needed = pw.get("n_per_group_for_target")
+        n_txt = (f"~{n_needed} per group needed to reach the observed "
+                 f"AUC {auc:.3f} at 80% power"
+                 if n_needed else
+                 "the observed AUC is not reachable at 80% power even "
+                 "with 100k per group")
         lines.append(
             f"- AUC power: detectable AUC at 80% power = "
             f"{pw['detectable_auc_80pct']:.3f} "
-            f"(n+ {n_pos} / n− {n_neg}; "
-            f"~{pw['n_per_group_for_target']} per group needed to "
-            f"reach the OBSERVED AUC {auc:.2f} at 80% power)")
+            f"(n+ {n_pos} / n− {n_neg}; {n_txt})")
     except Exception:
         pass
     lines += ["", "## Limitations",

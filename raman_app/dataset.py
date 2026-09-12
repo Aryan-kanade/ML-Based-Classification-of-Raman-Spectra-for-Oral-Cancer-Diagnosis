@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -97,7 +98,15 @@ def common_grid(spectra: list[Spectrum], max_points: int = 2000) -> np.ndarray:
             f"Spectral ranges do not overlap (common span {lo:.1f}..{hi:.1f} cm-1)."
         )
     n = int(np.median([len(s) for s in spectra]))
-    n = int(np.clip(n, 50, max_points))
+    # cap at max_points (downsampling is fine); only FLOOR at 50 when it
+    # does not exceed the cap — np.clip(n, 50, max_points) with
+    # max_points < 50 quietly returned max_points, and flooring a
+    # short-file cohort to 50 would fabricate resolution (2026-09-12)
+    n = min(max(n, min(50, max_points)), max_points)
+    if n < 50:
+        warnings.warn(f"common grid has only {n} points (median of the "
+                      "cohort) — spectra shorter than 50 points",
+                      stacklevel=2)
     return np.linspace(lo, hi, n)
 
 

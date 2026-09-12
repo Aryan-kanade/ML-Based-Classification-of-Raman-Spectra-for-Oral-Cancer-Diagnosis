@@ -26,10 +26,25 @@ from __future__ import annotations
 import numpy as np
 
 # Nemenyi q_alpha (alpha=0.05) for k=2..10 classifiers, from the
-# studentized-range table (Demšar 2006, JMLR) — used by hand, no
-# statsmodels dependency
-NEMENYI_Q = {2: 1.960, 3: 2.349, 4: 2.569, 5: 2.728, 6: 2.850, 7: 2.936,
-             8: 2.998, 9: 3.045, 10: 3.081}
+# studentized-range table (Demšar 2006, JMLR).  k=7..10 corrected
+# 2026-09-12 (audit): the old values contradicted Demšar's Table 5(a)
+# and were anti-conservative by 0.4-2.6%.  k>10 is computed from
+# scipy's studentized range (the old linear extrapolation understated
+# CD by ~7% at k=24).
+NEMENYI_Q = {2: 1.960, 3: 2.349, 4: 2.569, 5: 2.728, 6: 2.850, 7: 2.949,
+             8: 3.031, 9: 3.102, 10: 3.164}
+
+
+def _nemenyi_q(k: int) -> float:
+    """Nemenyi q at alpha=0.05 for k classifiers (exact table for
+    k<=10; scipy.stats.studentized_range for larger k)."""
+    if k in NEMENYI_Q:
+        return NEMENYI_Q[k]
+    try:
+        from scipy.stats import studentized_range
+        return float(studentized_range.ppf(0.95, k, np.inf) / np.sqrt(2.0))
+    except Exception:                       # scipy unavailable: fall back
+        return 3.164 + 0.03 * (k - 10)      # to a CONSERVATIVE slope
 
 
 def bh_fdr(pvals: list[float]) -> list[float]:
@@ -208,8 +223,7 @@ def friedman_nemenyi(scores: dict[str, list[float]],
         ranks[:, j] = r
     avg_ranks = ranks.mean(axis=1)
     k = len(names)
-    q = alpha_q if alpha_q is not None else NEMENYI_Q.get(
-        k, 3.081 + 0.02 * (k - 10))
+    q = alpha_q if alpha_q is not None else _nemenyi_q(k)
     cd = q * np.sqrt(k * (k + 1) / (6.0 * n_blocks))
     best = int(np.argmin(avg_ranks))
     vs_best = {names[i]: (float(avg_ranks[i] - avg_ranks[best]),
@@ -407,7 +421,10 @@ def band_stats_paired(X, y, groups, wn) -> list[tuple]:
     For every literature band: patient-paired Wilcoxon signed-rank on
     (mean tumor band area − mean own-normal band area), with
     Benjamini-Hochberg FDR across bands.  Rows:
-    (center, molecule, direction, median_delta, p_raw, p_fdr, significant)
+    (center, molecule, assignment, direction, median_delta, p_raw,
+     significant, p_fdr)  — the raw Wilcoxon p is kept AND the FDR
+     value reported separately (2026-09-12 audit: the raw p used to be
+     overwritten by the adjusted one).
     """
     from scipy.stats import wilcoxon
     import biochemistry as bio
@@ -449,13 +466,13 @@ def band_stats_paired(X, y, groups, wn) -> list[tuple]:
                 p = float("nan")
         rows.append([float(center), mol, assign, direction,
                      float(np.median(deltas)) if deltas else float("nan"),
-                     p, False])
+                     p, False, p])
     finite = [i for i, r in enumerate(rows) if np.isfinite(r[5])]
     if finite:
         adj = bh_fdr([rows[i][5] for i in finite])
         for i, a in zip(finite, adj, strict=True):
             rows[i][6] = bool(a < 0.05)
-            rows[i][5] = a           # report FDR-adjusted p
+            rows[i][7] = float(a)          # FDR-adjusted p (raw kept at 5)
     return [tuple(r) for r in rows]
 
 

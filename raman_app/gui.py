@@ -63,12 +63,19 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # bump when the model suite changes so saved checkbox states don't hide
 # newly added models
-SUITE_VERSION = 7          # 22 models (v7: +Spectral + band features;
+SUITE_VERSION = 7          # 24 models today (len(ALL_MODEL_NAMES) is
+                           # authoritative; v7: +Spectral + band features;
                            # v6 stage-2: +Sparse PLS-DA, PLS/PCA/t-test+XGB)
 
 # bump when PreprocessParams defaults change so old saved values (e.g.
 # crop 400/1800) don't silently override the new defaults
 PARAMS_VERSION = 3
+
+# diagnostics constants — ONE home; every on-screen "(5 seeds)" /
+# "at 5% noise" mention derives from these, so text can never drift
+# from the computation (text-audit 2026-09-12)
+SEED_STABILITY_SEEDS = (0, 1, 2, 3, 4)
+NOISE_LEVELS = (0.0, 0.01, 0.02, 0.05)
 
 # every GUI log line is mirrored to a rotating session log on disk
 import logging                                    # noqa: E402
@@ -265,7 +272,7 @@ class SeqSearchWorker(QtCore.QThread):
         mode. Results land in an ADDITIVE `metrics_fair` key: the
         search/ranking/validation pipeline keeps reading `metrics`
         (screening) and is untouched. Pairs/triples stay screening
-        estimates by design (nested-tuning all 4,369 chains would
+        estimates by design (nested-tuning the whole chain space would
         take days); their honest numbers live in the Winner tab."""
         if self.fast:              # quick-estimate mode: skip the pass
             return singles
@@ -416,7 +423,7 @@ class PredictWorker(QtCore.QThread):
     def _auto_reference(self, path: str, cache: dict,
                         errors: dict | None = None):
         """
-        Margin mode: build the reference from the SAME patient's
+        Paired mode: build the reference from the SAME patient's
         Normal-class folder in the surrounding clinical tree. The tree
         is discovered by walking UP from the file, so ANY input
         selection works — whole tree, class folder, single/multiple
@@ -774,12 +781,12 @@ def prep_param_rows(params) -> list[tuple[str, str]]:
 
 def prep_compact(params) -> str:
     """One-line summary, e.g.
-    'crop 500-2000 cm-1 · despike off · wavelet sym8 L4 · SG 11/3 ·
+    'crop 500–2000 cm⁻¹ · despike off · wavelet sym8 L4 · SG 11/3 ·
     baseline als · norm vector'."""
     d = _prep_fields(params)
     crop_lo = d.get("crop_min") or 0
     crop_hi = d.get("crop_max") or 0
-    crop = (f"crop {_prep_fmt(crop_lo)}-{_prep_fmt(crop_hi)} cm-1"
+    crop = (f"crop {_prep_fmt(crop_lo)}–{_prep_fmt(crop_hi)} cm⁻¹"
             if crop_lo or crop_hi else "no crop")
     despike = (f"despike z={_prep_fmt(d.get('despike_z', 7.0))}"
                if d.get("despike") else "despike off")
@@ -828,7 +835,14 @@ def seq_results_html(payload: dict, params,
     arch = winner.get("arch") or []
     wm = winner.get("metrics") or {}
     mode = payload.get("mode") or ""
-    mode_txt = (" · paired margin features"
+    # study reference baseline — mode-aware, numbers from ONE source
+    # (sequential.BASELINES) so CLI/GUI/HTML can never drift
+    import sequential as _seq
+    _bn, _bf1, _bauc = _seq.baseline_for(mode)
+    _bword = "paired" if "paired" in mode else "standard"
+    _btxt = (f"{_bn} study reference ({_bword} mode): "
+             f"F1 {_bf1:.3f} · AUC {_bauc:.3f}")
+    mode_txt = (" · paired (vs patient's own normal)"
                 + (" + PQN" if "pqn" in mode else "")
                 if "paired" in mode else "")
     parts = [
@@ -848,7 +862,7 @@ def seq_results_html(payload: dict, params,
         "</style></head><body>",
         "<h1>3SSE — Sequential Architecture Search</h1>",
         f"<p class='muted'>Generated {datetime.now():%Y-%m-%d %H:%M}"
-        f" · Raman Classifier{mode_txt}"
+        f" · Raman Spectra Classifier{mode_txt}"
         + (f" · {payload['total']} candidates"
            if isinstance(payload.get("total"), int) else "")
         + "</p>",
@@ -873,8 +887,7 @@ def seq_results_html(payload: dict, params,
             f"<tr><th>Specificity</th><td>{_m(wm, 'spec')}</td></tr>"
             f"<tr><th>ROC-AUC</th><td>{_m(wm, 'auc')}</td></tr>"
             f"<tr><th>Accuracy</th><td>{_m(wm, 'acc')}</td></tr>"
-            "<tr><th>Baseline</th><td>paired Extra Trees: "
-            "F1 0.702 · AUC 0.788</td></tr></table>")
+            f"<tr><th>Baseline</th><td>{esc(_btxt)}</td></tr></table>")
     validated = payload.get("validated") or {}
     nest = []
     for level in (1, 2, 3):
@@ -971,7 +984,8 @@ class LikelihoodMeter(QtWidgets.QWidget):
             return ("", "#475569")
         for lo, label, color in self.TIERS:
             if self._value >= lo:
-                return (f"{label} · mean P = {self._value:.0%}", color)
+                return (f"{label} · mean P(pos) over all spectra "
+                        f"= {self._value:.0%}", color)
         return ("", "#475569")
 
     def paintEvent(self, _event):
@@ -1059,6 +1073,10 @@ class ChainFlowWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self._arch = list(arch)
         self.setMinimumHeight(52)
+        self.setToolTip(
+            "Chain architecture: each model's class PROBABILITIES are "
+            "appended as extra columns (the P1+ / P2+ badges) for the "
+            "next layer's input.")
 
     def set_arch(self, arch):
         self._arch = list(arch)
@@ -1127,7 +1145,7 @@ class ChainFlowWidget(QtWidgets.QWidget):
 
 class ArchTableModel(QtCore.QAbstractTableModel):
     """Sortable read-only table of architecture results (handles the
-    4,080-row tab without per-row widgets)."""
+    multi-thousand-row tab without per-row widgets)."""
 
     HEADERS = ["Rank", "Type", "Architecture", "Macro-F1", "Sens",
                "Spec", "AUC", "Acc"]
@@ -1186,21 +1204,31 @@ class SeqResultsDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
         mode = payload.get("mode") or ""
         if "paired-pqn" in mode:
-            mode_txt = ("Data: PAIRED margin features + PQN — each "
-                         "spectrum scale-corrected (PQN), then minus the "
+            mode_txt = ("Data: PAIRED + PQN — each spectrum scale-corrected "
+                         "(PQN, Dieterle 2006), then minus the "
                          "patient's own normal")
         elif "paired" in mode:
-            mode_txt = ("Data: PAIRED margin features — each spectrum "
-                        "minus the patient's own normal")
+            mode_txt = ("Data: PAIRED — each spectrum minus the patient's "
+                        "own normal")
         elif mode:
             mode_txt = ("Data: UNPAIRED standard preprocessed (absolute) "
                         "spectra")
         else:
             mode_txt = ""
+        # fast-screening / restored runs show screening numbers on the
+        # Single Models tab (no metrics_fair) — the note must say so
+        fair = any(isinstance(e.get("metrics_fair"), dict)
+                   for e in board["singles"]) if board["singles"] else False
         note = QtWidgets.QLabel(
-            "Single Models tab: nested CV with tuned hyperparameters — "
-            "the SAME number a Train-page run of that model shows (same "
-            "data mode, folds, seed).\n2-Model / 3-Model tabs: quick "
+            ("Single Models tab: nested CV with tuned hyperparameters — "
+             "the SAME number a Train-page run of that model shows (same "
+             "data mode, folds, seed, repeat setting)."
+             if fair else
+             "Single Models tab: this run used FAST SCREENING or was "
+             "restored from disk — these are screening estimates, not "
+             "the Train-page-identical nested numbers (run a full "
+             "search for those).")
+            + "\n2-Model / 3-Model tabs: quick "
             "screening estimates at default hyperparameters — compare "
             "them only to each other; the Overall Winner tab holds the "
             "nested numbers."
@@ -1224,9 +1252,12 @@ class SeqResultsDialog(QtWidgets.QDialog):
         tabs.addTab(self._winner_tab(payload), "Overall Winner")
         btn_row = QtWidgets.QHBoxLayout()
         b_csv = QtWidgets.QPushButton("Export this tab to CSV…")
-        b_csv.setToolTip("Writes the currently selected ranking tab "
-                         "(as displayed, sorted) to a CSV file, with "
-                         "the run's preprocessing parameters as a "
+        b_csv.setToolTip("Writes the currently selected ranking tab to "
+                         "a CSV file in the DISPLAYED order (a header "
+                         "click re-sorts, the export follows); on the "
+                         "Overall Winner tab it exports the winner and "
+                         "nested best-per-level rows. The run's "
+                         "preprocessing parameters ride along as a "
                          "comment row on top.")
         b_csv.clicked.connect(self._export_csv)
         btn_row.addWidget(b_csv)
@@ -1260,7 +1291,17 @@ class SeqResultsDialog(QtWidgets.QDialog):
         if idx < len(self._tab_models):
             title, model = self._tab_models[idx]
             default = f"3sse_{title.lower().replace(' ', '_')}.csv"
-            rows = model._rows
+            # export in the DISPLAYED order — honor a header-clicked
+            # re-sort by reading the rows through the view's proxy
+            view = self._tabs.widget(idx)
+            proxy = (view.model()
+                     if isinstance(view, QtWidgets.QTableView) else None)
+            if proxy is not None and proxy.rowCount():
+                rows = [[proxy.data(proxy.index(r, c))
+                         for c in range(model.columnCount())]
+                        for r in range(proxy.rowCount())]
+            else:
+                rows = model._rows
         else:
             # Overall Winner tab (2026-09-06: used to be refused with
             # "Select a ranking tab first") — export the winner summary
@@ -1274,7 +1315,7 @@ class SeqResultsDialog(QtWidgets.QDialog):
                     "The winner tab has no winner data to export.")
                 return
         path, _f = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export ranking to CSV",
+            self, "Export 3SSE results to CSV",
             os.path.join(os.path.expanduser("~"), "Desktop", default),
             "CSV (*.csv)")
         if not path:
@@ -1423,8 +1464,15 @@ class SeqResultsDialog(QtWidgets.QDialog):
                         else f"{label}: n/a", tone))
                 pills.addStretch(1)
                 lay.addLayout(pills)
+            import sequential as _seq
+            _bn, _bf1, _bauc = _seq.baseline_for(payload.get("mode")
+                                                 or "")
+            _bword = ("paired" if "paired" in (payload.get("mode")
+                                               or "") else "standard")
             base = QtWidgets.QLabel(
-                "Baseline (paired Extra Trees): F1 0.702 · AUC 0.788")
+                f"{_bn} study reference ({_bword} mode): "
+                f"F1 {_bf1:.3f} · AUC {_bauc:.3f} — measured on the "
+                "2026-08-30 reference run, not on this dataset")
             base.setObjectName("CardHint")
             lay.addWidget(base)
 
@@ -1460,6 +1508,12 @@ class SeqResultsDialog(QtWidgets.QDialog):
         btn = QtWidgets.QPushButton("Save winner as model bundle…")
         # only live search results carry the fitted chain
         btn.setEnabled(bool(winner and winner.get("chain")))
+        btn.setToolTip(
+            "Saves the winner chain as a standard .joblib bundle with "
+            "its preprocessing. Available for fresh search results — "
+            "runs restored from disk lack the fitted chain (their "
+            "winner.joblib already exists in the run folder; re-run "
+            "the search to save a deployable model).")
         btn.clicked.connect(self._on_save)
         lay.addWidget(btn)
         outer.addWidget(wrap_scroll(body))
@@ -1540,8 +1594,8 @@ class SeqResultsDialog(QtWidgets.QDialog):
         significant = isinstance(p, (int, float)) and p < 0.05
         head = QtWidgets.QHBoxLayout()
         head.addWidget(uh.pill(
-            ("✔  SIGNIFICANT" if significant
-             else "✖  NOT significant"),
+            ("✔ SIGNIFICANT" if significant
+             else "✖ NOT significant"),
             "green" if significant else "slate"))
         head.addStretch(1)
         v.addLayout(head)
@@ -2059,15 +2113,15 @@ class MainWindow(QtWidgets.QMainWindow):
         title.setObjectName("HeroTitle")
         hleft.addWidget(title)
         sub = QtWidgets.QLabel(
-            "Oral-cancer detection from SERS Raman spectra — automatically "
-            "picks the model with the best <b>sensitivity, specificity and "
-            "F1 score</b>.")
+            "Oral-cancer detection from SERS Raman spectra — compares "
+            f"<b>{len(modeling.ALL_MODEL_NAMES)} model families</b> and "
+            "keeps the best <b>macro-F1</b>.")
         sub.setObjectName("HeroSub")
         sub.setWordWrap(True)
         hleft.addWidget(sub)
         self.hero_pills = [uh.pill("no data", "white"),
                            uh.pill("0 classes", "white"),
-                           uh.pill("0 patients", "white")]
+                           uh.pill("—", "white")]
         pills_row = QtWidgets.QHBoxLayout()
         pills_row.setSpacing(8)
         for p in self.hero_pills:
@@ -2100,7 +2154,8 @@ class MainWindow(QtWidgets.QMainWindow):
         left_col.addWidget(note)
         # the F1 walkthrough, surfaced — fills the column instead of space
         how, hov = self.card("How to use this app")
-        htxt = QtWidgets.QLabel(uh.HOW_TO)
+        htxt = QtWidgets.QLabel(
+            uh.how_to(len(modeling.ALL_MODEL_NAMES)))
         htxt.setWordWrap(True)
         hov.addWidget(htxt)
         left_col.addWidget(how, 2)
@@ -2166,7 +2221,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.folder_edit = QtWidgets.QLineEdit()
         self.folder_edit.setReadOnly(True)
         self.folder_edit.setPlaceholderText(
-            "Folder containing spectra .txt files …")
+            "Folder containing spectra .txt / .dat / .csv files…")
         self.folder_edit.setToolTip(TIPS["folder"])
         top.addWidget(self.folder_edit, 1)
         b_browse = QtWidgets.QPushButton("Browse…")
@@ -2314,8 +2369,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_crop_min.setValue(500)
         self.spin_crop_min.setToolTip(
             "Keep only this wavenumber range (0 = no limit). The default "
-            "500-2000 is the tuned working range — widen to 15-3862 to "
-            "use the whole spectrum.")
+            "500–2000 is the tuned working range — widen to the loaded "
+            "data's full range (see the grid extents on the Data page) "
+            "to use the whole spectrum.")
         self.spin_crop_max = QtWidgets.QDoubleSpinBox()
         self.spin_crop_max.setRange(0, 5000)
         self.spin_crop_max.setDecimals(0)
@@ -2324,7 +2380,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_crop_max.setToolTip(
             "Upper end of the kept range (0 = no limit).")
         grid.addWidget(panel(
-            1, "REGION (cm-1)",
+            1, "REGION (cm⁻¹)",
             ("Keep range", self.spin_crop_min, QtWidgets.QLabel("to"),
              self.spin_crop_max)), 0, 0)
 
@@ -2381,9 +2437,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_wcycle.setRange(0, 5)
         self.spin_wcycle.setValue(0)
         self.spin_wcycle.setToolTip(
-            "Cycle-spinning (0 = off): average the denoising over +-N "
+            "Cycle-spinning (0 = off): average the denoising over ±N "
             "circular shifts — translation-invariant, removes wiggle "
-            "artifacts near peaks at 2N+1x the cost.")
+            "artifacts near peaks at 2N+1× the cost.")
         grid.addWidget(panel(
             2, "DENOISING",
             self.chk_despike,
@@ -2454,7 +2510,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_wncal = QtWidgets.QCheckBox("Align on Phe-1003 band")
         self.chk_wncal.setToolTip(
             "Wavenumber calibration: shift every spectrum so its "
-            "phenylalanine ~1003 cm-1 band sits on the cohort median "
+            "phenylalanine ~1003 cm⁻¹ band sits on the cohort median "
             "position (icoshift-style single anchor). Literature: axis "
             "alignment mattered more than any intensity normalization.")
         grid.addWidget(panel(
@@ -2520,23 +2576,26 @@ class MainWindow(QtWidgets.QMainWindow):
         b_preview = QtWidgets.QPushButton("Preview spectrum")
         b_preview.setProperty("primary", True)
         b_preview.setToolTip("One row per class (e.g. Normal and Tumor): "
-                             "raw vs preprocessed. A spectrum selected on "
-                             "the Data page represents its class. The "
-                             "preview also refreshes by itself after "
-                             "every parameter change.")
+                             "raw (left) vs the class MEAN after the "
+                             "pipeline (right). A spectrum selected on "
+                             "the Data page only prioritizes its "
+                             "patient(s) in the Paired features card "
+                             "below. The preview refreshes by itself "
+                             "after every parameter change.")
         b_preview.clicked.connect(self.preview_preprocess)
         btns.addWidget(b_preview, 1)
         b_optimize = QtWidgets.QPushButton("Optimize preprocessing")
         b_optimize.setToolTip(
             "Tries crop-range / derivative / normalization combinations "
-            "under patient-grouped cross-validation and applies the best "
-            "one. Typically 1-3 minutes.")
+            "under cross-validation (patient-grouped when the loaded "
+            "data has patient folders) and applies the best one. "
+            "Typically 1–3 minutes.")
         b_optimize.clicked.connect(self.run_optimize)
         btns.addWidget(b_optimize, 1)
         pv.addLayout(btns)
         self.optimize_status = QtWidgets.QLabel(
             "Optimize tries combinations on your data and applies the "
-            "winner (grouped CV, no leakage).")
+            "winner (grouped CV when patient groups exist).")
         self.optimize_status.setObjectName("CardHint")
         self.optimize_status.setWordWrap(True)
         pv.addWidget(self.optimize_status)
@@ -2697,8 +2756,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "Unpaired (standard): every spectrum is classified on its own "
             "(works for any new spectrum).\nPaired (margin reference): "
             "features are the DEVIATION from the same patient's mean "
-            "normal spectrum — measurably stronger (~+0.1 F1 on the "
-            "clinical data) and it models intraoperative tumor-margin "
+            "normal spectrum — measurably stronger on the reference "
+            "clinical set (paired Extra Trees 0.702 vs standard 0.594 "
+            "macro-F1) and it models intraoperative tumor-margin "
             "assessment (fiber-optic Raman, in-vivo literature); needs a "
             "normal reference from the same patient at prediction "
             "time.\nPaired + PQN: the deviation is additionally "
@@ -2759,9 +2819,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_3sse_run.setProperty("primary", True)   # styled CTA
         self.b_3sse_run.setToolTip(
             "Runs the full search on the loaded data with the checked "
-            "models (paired data when patient groups exist, standard "
-            "otherwise). Takes a while — progress is shown below and "
-            "the app stays responsive.")
+            "models, in exactly the data mode selected above (it is "
+            "never switched automatically). Takes a while — progress "
+            "is shown below and the app stays responsive.")
         self.b_3sse_run.clicked.connect(self.run_3sse_now)
         sb.addWidget(self.b_3sse_run)
         run_row = QtWidgets.QHBoxLayout()
@@ -2806,7 +2866,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_3sse_view.setToolTip(
             "Open the ranking tables (single / 2-model / 3-model layers "
             "and the overall winner) of the last completed 3SSE search "
-            "in study_run_3sse/ — no re-run needed.")
+            "in study_run_3sse/ — or the last Model Lab run in "
+            "study_run_lab/ — no re-run needed.")
         self.b_3sse_view.clicked.connect(self.view_saved_3sse)
         sb.addWidget(self.b_3sse_view)
         for combo in (self.combo_data, self.combo_trainer):
@@ -2873,7 +2934,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cv_row.addWidget(self.spin_seed)
         cv_row.addStretch(1)
         cv.addLayout(cv_row)
-        self.chk_repeat = QtWidgets.QCheckBox("Repeat CV ×3 (stabler winner)")
+        self.chk_repeat = QtWidgets.QCheckBox("Repeat CV ×3 (more stable winner)")
         self.chk_repeat.setToolTip(
             "Repeats the whole cross-validation with three different fold "
             "shuffles and pools the folds — the winner is picked on the "
@@ -2910,7 +2971,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "Runs the whole optimization program unattended: paired "
             "preprocessing sweep → fast 3SSE architecture search → "
             "per-layer tuning of the winning chain → seed-averaged "
-            "deployable bundle. Results appear in the Diagnostics tab.")
+            "deployable bundle. Results appear in the Model Lab panel "
+            "on the Train page.")
         self.b_model_lab.setEnabled(False)      # until data is loaded
         self.b_model_lab.clicked.connect(self.run_model_lab)
         cv.addWidget(self.b_model_lab)
@@ -2928,7 +2990,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_save.setToolTip(TIPS["save_model"])
         self.b_save.clicked.connect(self.save_model)
         cv.addWidget(self.b_save)
-        b_metrics = QtWidgets.QPushButton("What do these metrics mean?")
+        b_metrics = QtWidgets.QPushButton("What the metrics mean")
         b_metrics.setFlat(True)
         b_metrics.clicked.connect(self.show_metric_help)
         cv.addWidget(b_metrics)
@@ -2963,7 +3025,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lab = QtWidgets.QLabel(name)
             lab.setObjectName("StatName")
             lab.setAlignment(ALIGN_CENTER)
-            val = QtWidgets.QLabel("–")
+            val = QtWidgets.QLabel("—")
             val.setObjectName("StatValue")
             val.setAlignment(ALIGN_CENTER)
             nt = QtWidgets.QLabel(note)
@@ -3110,7 +3172,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "table — double-click its Class cell to correct it, then "
             "retrain.")
         lc2_row.addWidget(diag(b_labels, self.run_label_error_review))
-        lc2_row.addWidget(diag(b_locked, self.run_locked_eval))
         lc2_row.addStretch(1)
         chv.addLayout(lc2_row)
         deep_row = QtWidgets.QHBoxLayout()
@@ -3222,7 +3283,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row = QtWidgets.QHBoxLayout()
         self.model_path_edit = QtWidgets.QLineEdit()
         self.model_path_edit.setReadOnly(True)
-        self.model_path_edit.setPlaceholderText("model .joblib file …")
+        self.model_path_edit.setPlaceholderText("model .joblib file…")
         row.addWidget(self.model_path_edit, 1)
         b_model = QtWidgets.QPushButton("Load model…")
         b_model.clicked.connect(self.browse_model)
@@ -3243,7 +3304,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             "Pick a folder of spectra or individual "
                             ".txt / .dat / .csv files — every spectrum "
                             "is classified. Clinical trees auto-find each "
-                            "patient's normal reference for margin models.")
+                            "patient's normal reference for Paired models.")
         row2 = QtWidgets.QHBoxLayout()
         self.spec_path_edit = QtWidgets.QLineEdit()
         self.spec_path_edit.setPlaceholderText(
@@ -3275,19 +3336,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_live.setToolTip(
             "Watch the chosen spectra folder and re-classify "
             "automatically whenever new files land there — the clinical "
-            "acquisition rhythm (0.1–1 s/spectrum) with sub-100 ms "
-            "inference.")
+            "acquisition rhythm (0.1–1 s/spectrum). NOTE: Paired-mode "
+            "models are refused here (they need each patient's normal "
+            "reference); measured speed is shown after each batch in "
+            "ms/spectrum.")
         self.b_live.toggled.connect(self._toggle_live_watch)
         g2v.addWidget(self.b_live)
         left.addWidget(g2)
         # compact explainer fills the column instead of empty space
-        pair, paiv = self.card("How margin mode works")
+        pair, paiv = self.card("How Paired mode works")
         ptxt = QtWidgets.QLabel(
-            "Margin mode compares each spectrum against the SAME "
+            "Paired mode compares each spectrum against the SAME "
             "patient's normal reference — the prediction measures change "
             "from that patient's own baseline, cancelling person-to-person "
-            "differences.\n\nLeave the reference empty: for clinical trees "
-            "the matching Normal folder is found automatically.")
+            "differences.\n\nNothing to pick: for clinical trees the "
+            "matching Normal folder is found automatically.")
         ptxt.setObjectName("CardHint")
         ptxt.setWordWrap(True)
         paiv.addWidget(ptxt)
@@ -3325,7 +3388,8 @@ class MainWindow(QtWidgets.QMainWindow):
         rv.addWidget(pred_holder, 1)
         self.pred_table = QtWidgets.QTableWidget(0, 5)
         self.pred_table.setHorizontalHeaderLabels(
-            ["File", "Prediction", "Triage", "Probability", "Set 90%"])
+            ["File", "Prediction", "Triage", "Probability",
+                     "Conformal set (90%)"])
         self.pred_table.horizontalHeader().setSectionResizeMode(
             0, HEADER_STRETCH)
         for col in (1, 2, 3, 4):
@@ -3393,7 +3457,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for key, name, note in (
                 ("sens", "SENSITIVITY", "positives caught"),
                 ("spec", "SPECIFICITY", "negatives cleared"),
-                ("f1", "MACRO-F1", "balance of both"),
+                ("f1", "Macro-F1", "balance of both"),
                 ("auc", "ROC AUC", "ranking quality")):
             block = QtWidgets.QWidget()
             bx = QtWidgets.QVBoxLayout(block)
@@ -3402,7 +3466,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lab = QtWidgets.QLabel(name)
             lab.setObjectName("StatName")
             lab.setAlignment(ALIGN_CENTER)
-            val = QtWidgets.QLabel("–")
+            val = QtWidgets.QLabel("—")
             val.setObjectName("StatValue")
             val.setAlignment(ALIGN_CENTER)
             nt = QtWidgets.QLabel(note)
@@ -3469,9 +3533,9 @@ class MainWindow(QtWidgets.QMainWindow):
         deep, deepv = self.card("Deep evaluation",
                                 "Leave-one-patient-out, seed stability "
                                 "and noise robustness — run from the "
-                                "Train page ('deep diagnostics' row); "
-                                "Friedman is computed after every "
-                                "training.")
+                                "Train page ('HONEST EVALUATION & "
+                                "STABILITY' buttons); Friedman is "
+                                "computed after every training.")
         self.r_deep_label = QtWidgets.QLabel("Not run yet.")
         self.r_deep_label.setObjectName("CardHint")
         self.r_deep_label.setWordWrap(True)
@@ -3552,7 +3616,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.r_pred_table = QtWidgets.QTableWidget(0, 5)
         self.r_pred_table.setHorizontalHeaderLabels(
             ["File", "Predicted class", "Triage", "Probability",
-             "Set 90%"])
+             "Conformal set (90%)"])
         self.r_pred_table.horizontalHeader().setSectionResizeMode(
             0, HEADER_STRETCH)
         for col in (1, 2, 3, 4):
@@ -3689,9 +3753,8 @@ class MainWindow(QtWidgets.QMainWindow):
         b_freeze = QtWidgets.QPushButton("Freeze study")
         b_freeze.setToolTip(
             "Writes study_manifest.json — data + code hashes, "
-            "preprocessing, model metrics and confidence interval — so "
-            "every number on this page can be reproduced and verified "
-            "later.")
+            "preprocessing and model metrics — so every number on this "
+            "page can be reproduced and verified later.")
         b_freeze.clicked.connect(self.freeze_study)
         b_figs = QtWidgets.QPushButton("Save figures…")
         b_figs.setToolTip(
@@ -3708,8 +3771,11 @@ class MainWindow(QtWidgets.QMainWindow):
         b_save_report.clicked.connect(self.save_result_report)
         b_html = QtWidgets.QPushButton("Save report (HTML)…")
         b_html.setToolTip(
-            "One self-contained, printable HTML file with every figure "
-            "and table from this page — share it or print it as-is.")
+            "One self-contained, printable HTML file with the model "
+            "metrics, predictions and all validation figures — share it "
+            "or print it as-is. (The patient rollup, triage-per-1000 "
+            "and biochemistry tables stay on this page / the txt "
+            "report.)")
         b_html.clicked.connect(self.save_result_report_html)
         row.addStretch(1)
         row.addWidget(b_freeze)
@@ -3938,7 +4004,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if pos and binary and len(probs) == len(rows):
                 tier = clin.triage(probs[r].get(pos, float("nan")),
                                    lo, hi, fallback=threshold)
-            it2 = QtWidgets.QTableWidgetItem(tier or "–")
+            it2 = QtWidgets.QTableWidgetItem(tier or "—")
             it2.setTextAlignment(ALIGN_CENTER)
             it2.setToolTip(clin.TRIAGE_ACTIONS.get(tier, ""))
             if tier in tri:
@@ -3968,7 +4034,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # OOF-calibrated threshold; empty set = principled abstain
             if table.columnCount() > 4:
                 q = self._conformal_q()
-                it4 = QtWidgets.QTableWidgetItem("–")
+                it4 = QtWidgets.QTableWidgetItem("—")
                 if q is not None and len(probs) == len(rows):
                     keep = [k for k, v in probs[r].items()
                             if v >= 1.0 - q]
@@ -4388,7 +4454,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             f"as {pos.upper()} ({pct:.0%})")
                 mean_p = (sum(p for _f, c, p in rows if c == pos) / k
                           if k else 0.0)
-                note = (f"Average {pos} probability: {mean_p:.0%} · "
+                note = (f"Mean P({pos}) among positive calls "
+                        f"(call confidence): {mean_p:.0%} · "
                         "positive calls are highlighted in the table below"
                         if k else "No positive findings")
                 pills = [f"{k} {pos}", f"{n - k} negative",
@@ -4492,7 +4559,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not honest:
                 bits.append(f"{self.spin_folds.value()}-fold CV")
                 if self.chk_repeat.isChecked():
-                    bits.append("repeated x3")
+                    bits.append("repeated ×3")
                 if self.groups:
                     bits.append(
                         f"grouped by {len(set(self.groups))} patients")
@@ -4557,12 +4624,12 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.r_model_title.setText("No model trained yet")
             for lbl in self.r_stats.values():
-                lbl.setText("–")
+                lbl.setText("—")
                 lbl.setStyleSheet("")
             self.r_model_note.setText("")
-        # predictive values by clinical setting (prevalence matters)
-        sens_v = w.macro.get("sens", (None,))[0] if w is not None else None
-        spec_v = w.macro.get("spec", (None,))[0] if w is not None else None
+        # predictive values by clinical setting (prevalence matters) —
+        # ONE source for screen / txt / HTML (honest when available)
+        sens_v, spec_v, _pv_note = self._ppv_source()
         for r_i, (setting, prev) in enumerate(clin.PREVALENCE_SCENARIOS):
             ppv = npv = None
             if sens_v is not None and spec_v is not None:
@@ -4570,9 +4637,9 @@ class MainWindow(QtWidgets.QMainWindow):
             for c_i, txt in enumerate((
                     setting, f"{prev:.0%}",
                     f"{ppv:.0%}" if ppv is not None
-                    and np.isfinite(ppv) else "–",
+                    and np.isfinite(ppv) else "—",
                     f"{npv:.0%}" if npv is not None
-                    and np.isfinite(npv) else "–")):
+                    and np.isfinite(npv) else "—")):
                 it = QtWidgets.QTableWidgetItem(txt)
                 if c_i:
                     it.setTextAlignment(ALIGN_CENTER)
@@ -4602,7 +4669,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     for c_i, txt in enumerate((
                             setting, f"{ar['biopsies_triage']}",
                             f"{ar['cancers_caught']} "
-                            f"({ar['caught_or_flagged_pct']:.0f}%+flag)",
+                            f"({ar['caught_or_flagged_pct']:.0f}% incl. flagged)",
                             f"{ar['cancers_missed_negative']}",
                             f"-{ar['reduction_pct']:.0f}%")):
                         it = QtWidgets.QTableWidgetItem(txt)
@@ -4633,12 +4700,13 @@ class MainWindow(QtWidgets.QMainWindow):
                    if np.isfinite(lo_["auc"]) else ""))
         if self._seed_result:
             f1s_ = self._seed_result
-            bits.append(f"seed stability: {np.mean(f1s_):.3f} ± "
-                        f"{np.std(f1s_):.3f} (5 seeds)")
+            bits.append(f"Seed stability: {np.mean(f1s_):.3f} ± "
+                        f"{np.std(f1s_):.3f} "
+                        f"({len(SEED_STABILITY_SEEDS)} seeds)")
         if self._noise_result:
             nr_ = self._noise_result
-            bits.append(f"noise: F1 {nr_[0][1]:.3f} → {nr_[-1][1]:.3f} "
-                        "at 5% noise")
+            bits.append(f"Noise: F1 {nr_[0][1]:.3f} → {nr_[-1][1]:.3f} "
+                        f"at {max(NOISE_LEVELS):.0%} noise")
         if self._friedman_result and self._friedman_result.get("ok"):
             fr_ = self._friedman_result
             bits.append("Friedman: differences "
@@ -4811,8 +4879,9 @@ class MainWindow(QtWidgets.QMainWindow):
             n_pos = sum(1 for p in pats if pos and p[4] == pos)
             self.r_pat_hint.setText(
                 f"{plural(len(pats), 'patient')} — {n_pos} called "
-                f"{pos if pos else 'positive'} (majority vote per "
-                "patient; mean probability of the positive class)")
+                f"{pos if pos else 'positive'} (verdict = mean "
+                "P(positive) at the tuned threshold; vote counts shown "
+                "for reference)")
         else:
             self.r_pat_hint.setText(
                 "No patient grouping detected — predict a clinical-style "
@@ -4865,11 +4934,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.r_spec_card.setVisible(False)
 
         # ---- validation charts ----------------------------------------------
+        # 2026-09-12 graph audit: a winner without cm / oof_proba used to
+        # leave the PREVIOUS winner's charts on screen (stale content);
+        # the else-branches clear to a labelled placeholder like the
+        # calibration / DCA pair below
         if w is not None and getattr(w, "cm", None) is not None:
             axc = plotting.clear(self.r_cm_canvas)
             plotting.plot_confusion_matrix(
                 axc, w.cm, w.classes,
                 title="Confusion matrix (pooled CV folds)")
+            self.r_cm_canvas.draw_idle()
+        else:
+            axc = plotting.clear(self.r_cm_canvas)
+            axc.text(0.5, 0.5, "no confusion matrix\nfor this winner",
+                     ha="center", va="center",
+                     transform=axc.transAxes, color="#94a3b8", fontsize=9)
+            axc.set_axis_off()
             self.r_cm_canvas.draw_idle()
         if w is not None and getattr(w, "oof_proba", None) is not None:
             try:
@@ -4898,6 +4978,12 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 self.log("Result-page validation chart failed:\n"
                          + traceback.format_exc())
+        else:
+            axr = plotting.clear(self.r_roc_canvas)
+            axr.text(0.5, 0.5, "no out-of-fold\nprobabilities for\nthis winner", ha="center", va="center",
+                     transform=axr.transAxes, color="#94a3b8", fontsize=9)
+            axr.set_axis_off()
+            self.r_roc_canvas.draw_idle()
         # calibration + decision curve (TRIPOD+AI calibration/utility)
         have_oof = (w is not None
                     and getattr(w, "oof_proba", None) is not None
@@ -4989,8 +5075,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if c_i:
                     it.setTextAlignment(ALIGN_CENTER)
                 self.r_bio_table.setItem(len(bio_rows), c_i, it)
-            hint = ("Red = higher than the patient's own normal, blue = "
-                    "lower. Literature: nucleic/protein and amide I/III "
+            delta_hint = ("Red = higher than the patient's own normal, "
+                          "blue = lower. "
+                          if ref_r is not None else "")
+            hint = (delta_hint
+                    + "Literature: nucleic/protein and amide I/III "
                     "rise in tumor, collagen/protein falls.")
             if ref_r is None:
                 hint = ("No paired reference — absolute marker values. "
@@ -5020,10 +5109,13 @@ class MainWindow(QtWidgets.QMainWindow):
                          f"<b>{sens:.0%}</b> of positive cases "
                          "(sensitivity) and correctly clears "
                          f"<b>{spec:.0%}</b> of negative cases "
-                         "(specificity) under patient-grouped "
-                         "cross-validation.")
+                         "(specificity) under "
+                         + ("patient-grouped "
+                            if getattr(w, "groups", None) or self.groups
+                            else "spectrum-level ")
+                         + "cross-validation.")
         if self._paired_mode:
-            parts.append("<b>Margin mode (paired normal reference)</b>: "
+            parts.append("<b>Paired mode (patient's own normal reference)</b>: "
                          "every spectrum is classified by its deviation "
                          "from the same patient's normal tissue — the "
                          "same principle as intraoperative margin "
@@ -5033,7 +5125,7 @@ class MainWindow(QtWidgets.QMainWindow):
                          "same patient.")
         if (sens is not None and spec is not None):
             ppv30, npv30 = clin.ppv_npv(sens, spec, 0.30)
-            ppv05, _ = clin.ppv_npv(sens, spec, 0.05)
+            ppv05, npv05 = clin.ppv_npv(sens, spec, 0.05)
             parts.append(
                 "What a positive call is worth depends on where you "
                 "stand: at a lesion-clinic prevalence (~30%) a positive "
@@ -5058,7 +5150,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if k:
                 parts.append(f"On the {n} spectra you just classified, "
                              f"<b>{k} were called {pos}</b>. Spectra near "
-                             "the decision threshold (probability 0.4-0.6) "
+                             "the decision-threshold zone (the deployed cut is F1-tuned per "
+                             "fold — see the threshold value in the "
+                             "banner) "
                              "are the least certain — check them "
                              "individually.")
             else:
@@ -5102,7 +5196,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return "<br><br>".join(parts)
 
     def save_result_figures(self):
-        """Export the three Result-page charts as 200-dpi PNGs."""
+        """Export every Result-page chart as 200-dpi PNGs."""
         if not self._pred_rows and self.winner is None:
             QtWidgets.QMessageBox.information(
                 self, "Nothing to save yet",
@@ -5117,8 +5211,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings["last_figure_dir"] = folder
         uh.save_settings(self.settings)
         saved = []
+        # 2026-09-12 graph audit: calibration + DCA were shown on the
+        # page and embedded in the HTML report but never made it into
+        # the PNG export set
         for canvas, name in ((self.r_cm_canvas, "result_confusion_matrix"),
                              (self.r_roc_canvas, "result_validation"),
+                             (self.r_cal_canvas, "result_calibration"),
+                             (self.r_dca_canvas, "result_decision_curve"),
                              (self.dist_canvas, "result_distribution"),
                              (self.r_spec_canvas,
                               "result_predicted_spectra")):
@@ -5132,6 +5231,39 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log(f"Saved {len(saved)} result figures to {folder}")
             self.statusBar().showMessage(
                 f"Saved {len(saved)} figures to {folder}")
+
+
+    def _deep_eval_lines(self) -> list[str]:
+        """Canonical deep-evaluation sentences — the txt and the HTML
+        report render the SAME lines, so the two can never disagree
+        (text-audit 2026-09-12)."""
+        deep = []
+        if self._lopo_result:
+            lo_ = self._lopo_result
+            deep.append(
+                f"Leave-one-patient-out ({lo_['n_patients']} patients): "
+                f"macro-F1 {lo_['f1']:.3f}"
+                + (f", AUC {lo_['auc']:.3f}"
+                   if np.isfinite(lo_["auc"]) else "")
+                + f", mean per-patient accuracy "
+                  f"{np.mean(lo_['accs']):.3f}")
+        if self._seed_result:
+            deep.append(
+                f"Seed stability ({len(SEED_STABILITY_SEEDS)} seeds): "
+                f"macro-F1 {np.mean(self._seed_result):.3f} ± "
+                f"{np.std(self._seed_result):.3f}")
+        if self._noise_result:
+            deep.append("Noise robustness: " + " → ".join(
+                f"{int(l * 100)}%: {f:.3f}"
+                for l, f in self._noise_result))
+        if self._friedman_result and self._friedman_result.get("ok"):
+            fr_ = self._friedman_result
+            deep.append(
+                f"Friedman test: p={fr_['p']:.3f} — differences "
+                + ("significant" if fr_["significant"]
+                   else "NOT significant (models statistically tie)")
+                + f"; best by average rank: {fr_['best']}")
+        return deep
 
     def _supplement_report_lines(self) -> list[str]:
         """Plain-text supplementary-metrics block shared by the txt and
@@ -5197,7 +5329,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Write everything on the Result page to result_report.txt."""
         from datetime import datetime
         w = self.winner
-        lines = ["Raman Classifier — final result report",
+        lines = ["Raman Spectra Classifier — final result report",
                  f"Generated: {datetime.now():%Y-%m-%d %H:%M:%S}",
                  "=" * 60]
         if self.spectra:
@@ -5227,7 +5359,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if w.threshold is not None:
                 lines.append(f"  decision threshold {w.threshold:.3f}")
             if self._region_bands:
-                tops = ", ".join(f"{b[0]:.0f} cm-1 {b[2]}".strip()
+                tops = ", ".join(f"{b[0]:.0f} cm⁻¹ {b[2]}".strip()
                                  for b in self._region_bands[:3])
                 lines.append(f"  top discriminative bands: {tops}")
             if self.results:
@@ -5258,14 +5390,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 ps = [x for x in ps if x is not None]
                 if ps:
                     mean_p = float(np.mean(ps))
-                    tier = ("HIGH" if mean_p >= 0.66 else
-                            "MODERATE" if mean_p >= 0.4 else "LOW")
-                    thr = (f" (threshold "
-                           f"{self.winner.threshold:.3f})"
-                           if (self.winner is not None
-                               and self.winner.threshold is not None) else "")
-                    lines.append(f"  mean P({pos}) = {mean_p:.3f} — "
-                                 f"{tier} signal{thr}")
+                    # ONE tier system: the same clinical triage (real
+                    # operating points) the tables use — the old
+                    # HIGH/MODERATE-0.66 cuts contradicted it; the
+                    # threshold is shown in Platt space like the probs
+                    tier = (clin.triage(mean_p, lo_r, hi_r)
+                            if (lo_r is not None and hi_r is not None)
+                            else "n/a")
+                    thr_now = self._threshold_now()
+                    thr = (f" (threshold {thr_now:.3f})"
+                           if thr_now is not None else "")
+                    lines.append(f"  mean P({pos}) over all spectra = "
+                                 f"{mean_p:.3f} — {tier}{thr}")
                 if lo_r is not None and hi_r is not None:
                     tiers = [clin.triage(pr.get(pos, float("nan")), lo_r,
                                          hi_r) for pr in self._pred_probs]
@@ -5281,7 +5417,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     pos, float("nan")), lo_r, hi_r)
                         if (pos and lo_r is not None and hi_r is not None
                             and len(self._pred_probs)
-                            == len(self._pred_rows)) else "-")
+                            == len(self._pred_rows)) else "—")
                 lines.append(f"{f:<40} {c:<12} {p:>6.3f}  {tier}")
         else:
             lines.append("Predictions: none yet")
@@ -5291,23 +5427,31 @@ class MainWindow(QtWidgets.QMainWindow):
                      replace("<br><br>", "\n\n"))
         # honest literature context (meta-analyses, spectrum-level splits)
         if w is not None:
+            # the study row must carry the NESTED HONEST numbers when
+            # they exist (selection-CV values were silently used here
+            # while the headline said "report the honest number")
+            hs, hp, _hf1, hnote = self._honest_display_numbers()
+            use_honest = np.isfinite(hs) and np.isfinite(hp)
+            row_sens = hs if use_honest \
+                else w.macro.get("sens", (0.0,))[0]
+            row_spec = hp if use_honest \
+                else w.macro.get("spec", (0.0,))[0]
+            study_lab = ("This study (nested honest, patient-grouped CV)"
+                         if use_honest and self.groups else
+                         "This study (nested honest CV)" if use_honest
+                         else
+                         "This study (patient-grouped CV, preliminary)"
+                         if self.groups else
+                         "This study (spectrum-level CV, preliminary)")
+            lit_rows = "\n".join(
+                f"{name:<38} {s:>6.2f} {p:>6.2f}"
+                for name, s, p in clin.LITERATURE)
             lines.extend([
                 "", "Compared with the published literature",
                 "-" * 60,
                 f"{'Test (validation method)':<38} {'sens':>6} {'spec':>6}",
-                f"{('This study (patient-grouped CV)' if self.groups else 'This study (SPECTRUM-level CV!)'):<38} "
-                f"{w.macro.get('sens', (0,))[0]:>6.2f} "
-                f"{w.macro.get('spec', (0,))[0]:>6.2f}",
-                f"{'Han 2022 meta (13 studies)':<38} {'0.89':>6} "
-                f"{'0.84':>6}",
-                f"{'2025 meta-analysis (OSCC subgroup)':<38} {'0.89':>6} "
-                f"{'0.91':>6}",
-                f"{'Purohit 2026 review (pooled)':<38} {'0.90':>6} "
-                f"{'0.89':>6}",
-                f"{'VELscope autofluorescence (typical)':<38} {'~0.84':>6} "
-                f"{'~0.45':>6}",
-                f"{'Toluidine blue (typical)':<38} {'~0.63':>6} "
-                f"{'~0.83':>6}",
+                f"{study_lab:<38} {row_sens:>6.2f} {row_spec:>6.2f}",
+                lit_rows,
                 "",
                 "Caveat: most published Raman studies validate with "
                 "spectrum-level random splits, which lets spectra from "
@@ -5318,15 +5462,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 "directly comparable. Adjunct devices (VELscope, "
                 "toluidine blue) are shown for clinical context.",
             ])
-            # predictive values at plausible prevalence
-            sens_r = w.macro.get("sens", (None,))[0]
-            spec_r = w.macro.get("spec", (None,))[0]
+            # predictive values at plausible prevalence — same source
+            # as the screen table and the HTML report (_ppv_source)
+            sens_r, spec_r, pv_note = self._ppv_source()
             if sens_r is not None and spec_r is not None:
                 lines.extend([
                     "", "Predictive values by clinical setting",
                     "-" * 60,
                     f"{'setting':<20} {'prevalence':>10} {'PPV':>6} "
-                    f"{'NPV':>6}"])
+                    f"{'NPV':>6}"]
+                    + ([f"({pv_note})"] if pv_note else []))
                 for setting, prev in clin.PREVALENCE_SCENARIOS:
                     ppv_r, npv_r = clin.ppv_npv(sens_r, spec_r, prev)
                     lines.append(f"{setting:<20} {prev:>10.0%} "
@@ -5338,13 +5483,13 @@ class MainWindow(QtWidgets.QMainWindow):
             n_pat = len(set(self.groups)) if self.groups else 0
             tri = ["", "Reporting (TRIPOD+AI style)", "-" * 60,
                    f"Participants: {len(self.spectra)} spectra"
-                   + (f" from {n_pat} patients (paired design)"
+                   + (f" from {n_pat} patients (patient-grouped)"
                       if n_pat else " (flat layout)"),
                    "Outcomes: class labels from the top-level folders "
-                   "(histopathology-confirmed tissue sites)",
+                   "(verify the reference standard for your data)",
                    "Analysis: "
                    + ("patient-grouped CV (StratifiedGroupKFold); "
-                      "repeated x3 when enabled; "
+                      "repeated ×3 when enabled; "
                       if self.groups else
                       "SPECTRUM-LEVEL CV (no patient information in "
                       "this dataset — patient leaks are possible); ")
@@ -5367,36 +5512,14 @@ class MainWindow(QtWidgets.QMainWindow):
             lk = self._locked_result
             extra = (f", sens {lk['sens']:.3f}, spec {lk['spec']:.3f}, "
                      f"AUC {lk['auc']:.3f} (CI "
-                     f"{lk['auc_ci'][0]:.2f}-{lk['auc_ci'][1]:.2f})"
+                     f"{lk['auc_ci'][0]:.2f}–{lk['auc_ci'][1]:.2f})"
                      if "sens" in lk else "")
             deep.append(
-                f"Locked test set (FINAL, {lk['when']}): {lk['n_test_spectra']} "
+                f"Locked test-set evaluation (FINAL, {lk['when']}): "
+                f"{lk['n_test_spectra']} "
                 f"spectra / {lk['n_test_patients']} unseen patients — "
                 f"macro-F1 {lk['f1']:.3f}{extra}")
-        if self._lopo_result:
-            lo_ = self._lopo_result
-            deep.append(
-                f"Leave-one-patient-out ({lo_['n_patients']} patients): "
-                f"macro-F1 {lo_['f1']:.3f}"
-                + (f", AUC {lo_['auc']:.3f}"
-                   if np.isfinite(lo_["auc"]) else "")
-                + f", mean per-patient accuracy "
-                  f"{np.mean(lo_['accs']):.3f}")
-        if self._seed_result:
-            deep.append(f"Seed stability (5 seeds): macro-F1 "
-                        f"{np.mean(self._seed_result):.3f} ± "
-                        f"{np.std(self._seed_result):.3f}")
-        if self._noise_result:
-            deep.append("Noise robustness: " + " -> ".join(
-                f"{int(l * 100)}%:{f:.3f}"
-                for l, f in self._noise_result))
-        if self._friedman_result and self._friedman_result.get("ok"):
-            fr_ = self._friedman_result
-            deep.append(
-                f"Friedman test: p={fr_['p']:.3f} — differences "
-                + ("significant" if fr_["significant"]
-                   else "NOT significant (models statistically tie)")
-                + f"; best by average rank: {fr_['best']}")
+        deep += self._deep_eval_lines()
         if deep:
             lines += ["", "Deep evaluation", "-" * 60] + \
                 [f"  {d}" for d in deep]
@@ -5427,7 +5550,7 @@ class MainWindow(QtWidgets.QMainWindow):
                       "-" * 60,
                       f"{'band':>6} {'molecule':<16} {'median Δ':>9} "
                       f"{'p(FDR)':>8}  significant"]
-            for center, mol, _assign, _dir, med, p_fdr, sig in \
+            for center, mol, _assign, _dir, med, _p_raw, sig, p_fdr in \
                     self._band_stats:
                 lines.append(f"{center:>6.0f} {mol:<16} {med:>+9.3f} "
                              f"{p_fdr:>8.4f}  {'*' if sig else ''}")
@@ -5456,7 +5579,9 @@ class MainWindow(QtWidgets.QMainWindow):
         def fig_b64(canvas) -> str:
             try:
                 buf = io.BytesIO()
-                canvas.figure.savefig(buf, format="png", dpi=150,
+                # 200 dpi — same resolution as "Save figures…" so the
+                # HTML and the PNGs never disagree
+                canvas.figure.savefig(buf, format="png", dpi=200,
                                       bbox_inches="tight")
                 return ("data:image/png;base64,"
                         + base64.b64encode(buf.getvalue()).decode())
@@ -5469,7 +5594,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         parts = [
             "<!DOCTYPE html><html><head><meta charset='utf-8'>",
-            "<title>Raman Classifier — final result report</title>",
+            "<title>Raman Spectra Classifier — final result report</title>",
             "<style>",
             "body{font-family:'Segoe UI',system-ui,sans-serif;max-width:"
             "960px;margin:24px auto;color:#1e293b;line-height:1.45}",
@@ -5487,7 +5612,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "</style></head><body>",
             "<h1>Raman Spectra Classifier — final result report</h1>",
             f"<p class='muted'>Generated {datetime.now():%Y-%m-%d %H:%M}"
-            " · Raman Classifier (patient-grouped evaluation)</p>",
+            " · Raman Spectra Classifier ("
+            + ("patient-grouped" if self.groups else "spectrum-level")
+            + " evaluation)</p>",
         ]
         if self.spectra:
             n_pat = len(set(self.groups)) if self.groups else 0
@@ -5495,7 +5622,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "<h2>Dataset</h2><p>"
                 + esc(f"{len(self.spectra)} spectra, "
                       f"{len(set(l for l in self.labels if l))} classes"
-                      + (f", {n_pat} patients (paired design)"
+                      + (f", {n_pat} patients (patient-grouped)"
                          if n_pat else ""))
                 + "</p>")
         try:
@@ -5543,52 +5670,37 @@ class MainWindow(QtWidgets.QMainWindow):
                     "values. Run the diagnostics on the Train page (or "
                     "retrain) so the nested honest estimate replaces "
                     "them before citing this report.</p>")
-            # predictive values (deployment calibration; need finite
-            # honest sens/spec or they are meaningless)
-            if np.isfinite(hs) and np.isfinite(hp):
+            # predictive values (deployment calibration) — same source
+            # as the screen table and the txt report (_ppv_source)
+            _ps, _pp, _pnote = self._ppv_source()
+            if _ps is not None and _pp is not None \
+                    and np.isfinite(_ps) and np.isfinite(_pp):
                 rows_ppv = "".join(
                     f"<tr><td>{esc(s_)}</td><td>{pv_:.0%}</td>"
                     f"<td>{ppv_:.0%}</td><td>{npv_:.0%}</td></tr>"
                     for s_, pv_ in clin.PREVALENCE_SCENARIOS
-                    for ppv_, npv_ in [clin.ppv_npv(hs, hp, pv_)])
+                    for ppv_, npv_ in [clin.ppv_npv(_ps, _pp, pv_)])
                 parts.append(
                     "<h2>Predictive values by clinical setting</h2>"
                     "<table><tr><th>Setting</th><th>Prevalence</th>"
-                    f"<th>PPV</th><th>NPV</th></tr>{rows_ppv}</table>")
+                    f"<th>PPV</th><th>NPV</th></tr>{rows_ppv}</table>"
+                    + (f"<p class='muted'>({esc(_pnote)})</p>"
+                       if _pnote else ""))
             # locked final exam
             if self._locked_result:
                 lk = self._locked_result
-                extra = (f", sens {lk['sens']:.2f}, spec {lk['spec']:.2f}, "
-                         f"AUC {lk['auc']:.3f} (95% CI "
+                extra = (f", sens {lk['sens']:.3f}, spec {lk['spec']:.3f}, "
+                         f"AUC {lk['auc']:.3f} (CI "
                          f"{lk['auc_ci'][0]:.2f}–{lk['auc_ci'][1]:.2f})"
                          if "sens" in lk else "")
                 parts.append(
                     "<h2>Locked test-set evaluation (FINAL)</h2><p>"
-                    + esc(f"One-shot on {lk['n_test_spectra']} spectra / "
-                          f"{lk['n_test_patients']} unseen patients "
-                          f"({lk['when']}): macro-F1 {lk['f1']:.3f}"
+                    + esc(f"Locked test-set evaluation (FINAL, "
+                          f"{lk['when']}): {lk['n_test_spectra']} "
+                          f"spectra / {lk['n_test_patients']} unseen "
+                          f"patients — macro-F1 {lk['f1']:.3f}"
                           + extra) + "</p>")
-        deep_bits = []
-        if self._lopo_result:
-            lo_ = self._lopo_result
-            deep_bits.append(
-                f"Leave-one-patient-out ({lo_['n_patients']} patients): "
-                f"macro-F1 {lo_['f1']:.3f}"
-                + (f", AUC {lo_['auc']:.3f}"
-                   if np.isfinite(lo_["auc"]) else ""))
-        if self._seed_result:
-            deep_bits.append(f"Seed stability: {np.mean(self._seed_result):.3f}"
-                             f" ± {np.std(self._seed_result):.3f} (5 seeds)")
-        if self._noise_result:
-            deep_bits.append("Noise robustness: " + " → ".join(
-                f"{int(l * 100)}%: {f:.3f}"
-                for l, f in self._noise_result))
-        if self._friedman_result and self._friedman_result.get("ok"):
-            fr_ = self._friedman_result
-            deep_bits.append(f"Friedman p={fr_['p']:.3f} — differences "
-                             + ("significant"
-                                if fr_["significant"]
-                                else "not significant (models tie)"))
+        deep_bits = self._deep_eval_lines()
         if deep_bits:
             parts.append("<h2>Deep evaluation</h2><p>"
                          + "<br>".join(esc(b) for b in deep_bits)
@@ -5610,10 +5722,14 @@ class MainWindow(QtWidgets.QMainWindow):
                             == len(self._pred_rows)) else "–")
                 body += (f"<tr><td>{esc(f)}</td><td>{esc(c)}</td>"
                          f"<td>{p:.3f}</td><td>{esc(tier)}</td></tr>")
+            cap_note = (f"<p class='muted'>Showing the first 300 of "
+                        f"{len(self._pred_rows)} predictions — the txt "
+                        "report lists every file.</p>"
+                        if len(self._pred_rows) > 300 else "")
             parts.append(
                 "<h2>Predictions</h2><table><tr><th>File</th>"
                 f"<th>Class</th><th>Probability</th><th>Triage</th>"
-                f"</tr>{body}</table>")
+                f"</tr>{body}</table>{cap_note}")
         parts.append("<h2>Figures</h2>")
         for canvas, cap in (
                 (self.r_cm_canvas, "Confusion matrix (pooled CV folds)"),
@@ -5638,10 +5754,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     "possible — no patient information in this data)")
             + "; published oral-cancer "
             "Raman meta-analyses (Han 2022; 2025 meta; Purohit 2026) "
-            "pool ~0.89–0.90 sensitivity / 0.84–0.91 specificity but "
-            "mostly under spectrum-level splits, which inflate them. "
-            "Single-centre data; no external validation; PPV/NPV move "
-            "with prevalence.</p>")
+            f"pool {min(s for _n, s, _p in clin.LITERATURE[:3]):.2f}–"
+            f"{max(s for _n, s, _p in clin.LITERATURE[:3]):.2f} "
+            f"sensitivity / {min(p for _n, _s, p in clin.LITERATURE[:3]):.2f}–"
+            f"{max(p for _n, _s, p in clin.LITERATURE[:3]):.2f} "
+            "specificity but mostly under spectrum-level splits, which "
+            "inflate them. Single-centre data (as loaded); no external "
+            "validation; PPV/NPV move with prevalence.</p>")
         parts.append("</body></html>")
         path = os.path.join(APP_DIR, "result_report.html")
         try:
@@ -5687,7 +5806,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.preview_preprocess()
         if idx == TAB_TRAIN and self.spectra and self.winner is None:
             self.statusBar().showMessage("Ready to train — press "
-                                         "“Start training”.")
+                                         "'Start training'.")
         if idx == TAB_RESULT:
             self.render_result_page()
 
@@ -5727,7 +5846,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if running:
             QtWidgets.QMessageBox.information(
                 self, "Work still running",
-                "A training / search / prediction is still running.\n"
+                "A training / optimization / search / analysis / "
+                "prediction job is still running.\n"
                 "Stop or wait for it before resetting the session.")
             return
         ans = QtWidgets.QMessageBox.question(
@@ -5764,7 +5884,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_pipeline_strip()
         self.optimize_status.setText(
             "Optimize tries combinations on your data and applies the "
-            "winner (grouped CV, no leakage).")
+            "winner (grouped CV when patient groups exist).")
         # Predict + Result state (model card / bundle kept)
         self._pred_rows = []
         self._pred_probs = []
@@ -5827,7 +5947,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if running:
             QtWidgets.QMessageBox.information(
                 self, "Work still running",
-                "A training / search / prediction is still running.\n"
+                "A training / optimization / search / analysis / "
+                "prediction job is still running.\n"
                 "Stop or wait for it before clearing the training.")
             return
         if self.winner is None and not self.results:
@@ -6712,13 +6833,13 @@ class MainWindow(QtWidgets.QMainWindow):
             # next manual run reproduces the Lab's features
             self.set_mode_kind("paired-pqn")
             self.log("Model Lab: winning config uses PQN — mode "
-                     "switched to Margin+PQN.")
+                     "switched to Paired + PQN.")
         panel = self._diag_panel("model_lab", "Model Lab — one click",
                                  chart=False)
         cap = [f"Best preprocessing: {sweep['label']} "
                f"(screening F1 {sweep['mean_f1']:.3f}, "
                f"{sweep['model']}) — applied"
-               + (" (mode → Margin+PQN)." if payload.get("use_pqn")
+               + (" (mode → Paired + PQN)." if payload.get("use_pqn")
                   else ".")]
         if fin:
             m = fin["metrics"]
@@ -7039,13 +7160,13 @@ class MainWindow(QtWidgets.QMainWindow):
             panel[1].draw()       # sync: no idle timer outliving the panel
             verdict = ("still rising — more patients should help"
                        if means[-1] > means[0] + 0.02 else
-                       "flat — more of the same patients adds little")
+                       "plateaued — adding more similar patients helps little")
             self._diag_caption(
                 panel, f"F1 {means[0]:.3f} → {means[-1]:.3f} from "
                        f"{sizes[0]} to {sizes[-1]} patients — {verdict}.")
             self.log(f"Learning curve: {len(sizes)} points from "
                      f"{sizes[0]} to {sizes[-1]} patients, "
-                     f"F1 {means[0]:.3f} -> "
+                     f"F1 {means[0]:.3f} → "
                      f"{means[-1]:.3f} ({verdict})")
             self.train_status.setText(f"Learning curve done — {verdict}.")
 
@@ -7291,7 +7412,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 ax.set_title("Marker values per class (no pairing)",
                              fontsize=10)
             ax.axhline(0, color=COL_ZERO, lw=0.8)
-            ax.set_ylabel("Δ marker (paired)")
+            # 2026-09-12 graph audit: the no-pairing branch plots
+            # class MEANS, not paired deltas — the label must not
+            # claim "paired"
+            ax.set_ylabel("Δ marker (paired)" if paired_rows
+                          else "marker level (class mean)")
             ax.margins(y=0.18)
             ax.tick_params(axis="x", labelsize=9)
 
@@ -7566,7 +7691,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def done(out):
             self._locked_result = out
-            self.log(f"Locked FINAL evaluation ({out['when']}): "
+            self.log(f"Locked test-set evaluation (FINAL, {out['when']}): "
                      f"{out['n_test_spectra']} spectra / "
                      f"{out['n_test_patients']} unseen patients — "
                      f"macro-F1 {out['f1']:.3f}"
@@ -7682,6 +7807,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ax.axhline(np.mean(accs), color=COL_ZERO, lw=1.0, ls="--",
                        label=f"mean {np.mean(accs):.2f}")
             ax.set_ylabel("per-patient accuracy")
+            ax.set_xlabel("patient — hardest on the left", fontsize=8)
             ax.set_title(f"Leave-one-patient-out ({len(pp)} patients, "
                          f"F1 {out['f1']:.3f})", fontsize=10)
             ax.set_ylim(0, 1.05)
@@ -7707,21 +7833,23 @@ class MainWindow(QtWidgets.QMainWindow):
         def fn():
             return sstats.seed_stability(
                 X, yy, gg, clone(winner_pl), {}, winner_classes,
-                seeds=(0, 1, 2, 3, 4), k=k,
+                seeds=SEED_STABILITY_SEEDS, k=k,
                 cancel_check=self._diag_cancel.is_set,
                 progress=self._emit_progress)
 
         def done(f1s):
             self._seed_result = f1s
             self.log(f"Seed stability: macro-F1 {np.mean(f1s):.3f} ± "
-                     f"{np.std(f1s):.3f} over 5 seeds "
+                     f"{np.std(f1s):.3f} over "
+                     f"{len(SEED_STABILITY_SEEDS)} seeds "
                      f"(min {min(f1s):.3f}, max {max(f1s):.3f})")
             self.train_status.setText(
                 f"Seed stability: {np.mean(f1s):.3f} ± {np.std(f1s):.3f}")
             panel = self._diag_panel("seeds", "Seed stability")
             self._diag_caption(
                 panel, f"macro-F1 {np.mean(f1s):.3f} ± {np.std(f1s):.3f} "
-                       f"over 5 seeds (min {min(f1s):.3f}, "
+                       f"over {len(SEED_STABILITY_SEEDS)} seeds "
+                       f"(min {min(f1s):.3f}, "
                        f"max {max(f1s):.3f})")
             ax = plotting.clear(panel[1])
             ax.boxplot([f1s], tick_labels=["winner"], showmeans=True,
@@ -7738,8 +7866,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ax.scatter([1] * len(f1s), f1s, color=COL_MAIN, zorder=3,
                        s=18)
             ax.set_ylabel("macro-F1 (grouped CV)")
+            ax.set_xlabel("seed re-runs (5 points)", fontsize=8)
             ax.set_title(f"Seed stability — {np.mean(f1s):.3f} ± "
-                         f"{np.std(f1s):.3f} (5 seeds)", fontsize=10)
+                         f"{np.std(f1s):.3f} "
+                    f"({len(SEED_STABILITY_SEEDS)} seeds)", fontsize=10)
             panel[1].draw()       # sync: no idle timer outliving the panel
 
         self._diag_running("seeds", "Seed stability")
@@ -7760,24 +7890,26 @@ class MainWindow(QtWidgets.QMainWindow):
         def fn():
             return sstats.noise_robustness(
                 X, yy, gg, clone(winner_pl), {}, winner_classes,
-                levels=(0.0, 0.01, 0.02, 0.05), k=k, seed=seed,
+                levels=NOISE_LEVELS, k=k, seed=seed,
                 cancel_check=self._diag_cancel.is_set,
                 progress=self._emit_progress)
 
         def done(curve):
             self._noise_result = curve
             drop = curve[0][1] - curve[-1][1]
-            self.log("Noise robustness: " + " -> ".join(
+            self.log("Noise robustness: " + " → ".join(
                 f"{int(lv * 100)}%: {f:.3f}" for lv, f in curve)
-                + f" (drop {drop:.3f} at 5% noise)")
+                + f" (drop {drop:.3f} at "
+                          f"{max(NOISE_LEVELS):.0%} noise)")
             self.train_status.setText(
                 f"Noise check: F1 {curve[0][1]:.3f} -> {curve[-1][1]:.3f} "
-                "at 5% noise")
+                f"at {max(NOISE_LEVELS):.0%} noise")
             panel = self._diag_panel("noise", "Noise robustness")
             self._diag_caption(
                 panel, " → ".join(f"{int(lv * 100)}%: {f:.3f}"
                                   for lv, f in curve)
-                + f" (drop {drop:.3f} at 5% noise)")
+                + f" (drop {drop:.3f} at "
+                          f"{max(NOISE_LEVELS):.0%} noise)")
             ax = plotting.clear(panel[1])
             lv = [f"{int(l * 100)}%" for l, _f in curve]
             fv = [f for _l, f in curve]
@@ -8163,8 +8295,27 @@ class MainWindow(QtWidgets.QMainWindow):
             return (float("nan"), float("nan"), float("nan"), "")
         return (w.macro["sens"][0], w.macro["spec"][0], w.macro_f1(),
                 "PRELIMINARY (selection CV) — the nested honest estimate "
-                "is computing (or press 'Run all diagnostics') and will "
-                "replace these numbers.")
+                "will replace these numbers once it runs (press 'Run all "
+                "diagnostics' or retrain).")
+
+    def _ppv_source(self):
+        """(sens, spec, label) for every PPV/NPV table — ONE source so
+        the screen, txt and HTML reports can never disagree: nested
+        honest values when available, else selection-CV values tagged
+        'preliminary'. (None, None, '') when nothing is trained.)"""
+        w = self.winner
+        if w is None:
+            return None, None, ""
+        hs, hp, _hf1, hnote = self._honest_display_numbers()
+        # only the REAL nested-honest numbers count (note prefix);
+        # _honest_display_numbers' selection fallback also returns
+        # finite values, so finiteness alone would silently relabel
+        # preliminary numbers as honest
+        if np.isfinite(hs) and np.isfinite(hp)                 and hnote.startswith("NESTED"):
+            return hs, hp, ""
+        return (w.macro.get("sens", (None,))[0],
+                w.macro.get("spec", (None,))[0],
+                "preliminary (selection-CV) sens/spec")
 
     def _set_result_banner(self):
         """(Re)build the Train result banner from the honest numbers.
@@ -8183,7 +8334,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lbl.setText(_txt(v))
             lbl.setStyleSheet(f"color:{uh.metric_fg(v)};"
                               if np.isfinite(v) else "")
-        extra = (f" Decision threshold tuned to maximize F1: "
+        extra = ("Decision threshold tuned to maximize F1: "
                  f"{w.threshold:.3f}." if w.threshold is not None
                  else "")
         mid = (f"Detects {sens:.0%} of true positive cases · correctly "
@@ -8191,8 +8342,10 @@ class MainWindow(QtWidgets.QMainWindow):
                if np.isfinite(sens) and np.isfinite(spec) else "")
         self.banner_plain.setText(
             f"{note}" + (f"\n{mid}" if mid else "")
-            + f"\n{self.spin_folds.value()}-fold patient-grouped CV · "
-              "save the model to start predicting."
+            + f"\n{self.spin_folds.value()}-fold "
+            + ("patient-grouped CV" if getattr(w, "groups", None)
+               or self.groups else "CV (spectrum-level)")
+            + " · save the model to start predicting."
             + extra)
         # B6 patient-level reading belongs to the selection-CV protocol
         # — only shown while the banner is still preliminary
@@ -8234,7 +8387,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_result_banner()
         self.train_status.setText(
             f"Done — best: {winner.name} (selection-CV macro-F1 "
-            f"{f1:.3f}); honest estimate next…")
+            f"{f1:.3f}); the nested honest estimate will replace these "
+            "numbers once it runs…")
         self.log(f"Training complete. Winner: {winner.name} "
                  f"(macro sens {sens:.3f} / spec {spec:.3f} / F1 {f1:.3f})"
                  + (f", threshold={winner.threshold:.3f}"
@@ -8373,7 +8527,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if n < 3:
             # not enough models for the chain search — say so clearly
             self.seq_counts.setText(
-                f"Only {n} model{'s' if n > 1 else ''} selected — the "
+                f"Only {n} model{'s' if n == 1 else ''} selected — the "
                 "architecture search needs at least 2 (3+ for two- and "
                 "three-model chains). Tick more models above (the "
                 "'All' button checks everything).")
@@ -8391,8 +8545,8 @@ class MainWindow(QtWidgets.QMainWindow):
         est_min = total_arch * k / 240 + 60 * 0.4
         data_note = {
             "standard": "UNPAIRED standard spectra",
-            "paired": "PAIRED margin features",
-            "paired-pqn": "PAIRED margin features + PQN"}[self.data_mode()]
+            "paired": "PAIRED (vs patient's own normal)",
+            "paired-pqn": "PAIRED + PQN (Dieterle 2006)"}[self.data_mode()]
         if (self.data_mode() != "standard"
                 and self.groups is None):
             data_note += " — no patient groups loaded, training would stop"
@@ -8407,7 +8561,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{fast_note}.")
         self.seq_estimate.setText(
             f"Rough time estimate: ≈ {est_min:.0f} min "
-            "(screening + nested validation + significance tests)")
+            "(screening + nested validation + significance tests; "
+            "hardware-dependent, calibrated on the reference machine)")
         ckpt = os.path.join(APP_DIR, "study_run_3sse", "archs.jsonl")
         if os.path.isfile(ckpt):
             self.seq_phase.setText(
@@ -8432,9 +8587,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         eff = self._seq_effective_models()
         if len(eff) < 2:
+            n_txt = ("1 model is" if len(eff) == 1
+                     else f"{len(eff)} models are")
             QtWidgets.QMessageBox.information(
                 self, "Not enough models selected",
-                f"Only {len(eff)} model is selected for the "
+                f"Only {n_txt} selected for the "
                 "architecture search.\n\nTick at least 2 models "
                 "(3 or more for two- and three-model chains) — the "
                 "'All' button above the model list checks everything.")
@@ -8444,7 +8601,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # it (auto-switching by groups presence silently changed the
         # numbers between runs; removed 2026-09-08)
         self.set_mode_kind(f"seq-{self.data_mode()}")
-        feats = ("PAIRED margin features" if self.data_mode() != "standard"
+        feats = ("PAIRED features" if self.data_mode() != "standard"
                  else "standard spectra")
         self.log(f"3SSE: starting the search on {feats} (Data dropdown "
                  f"setting; trainer → 3SSE) — a plain training run "
@@ -8684,7 +8841,8 @@ class MainWindow(QtWidgets.QMainWindow):
         fin = payload.get("winner")
         n_pruned = board.get("pruned", 0)
         self.log(f"3SSE search done: {board['total']} architectures "
-                 f"({n_pruned} pruned by the sound early-abandon bound)")
+                 f"({n_pruned} pruned by the early-abandon bound — a safe "
+                 f"lower bound on F1)")
         # persist rankings/winner so 'View saved 3SSE' works after a
         # restart (GUI runs never wrote these before — 2026-09-06)
         self._persist_3sse_payload(os.path.join(APP_DIR, "study_run_3sse"),
@@ -9030,12 +9188,20 @@ class MainWindow(QtWidgets.QMainWindow):
         op = bundle.get("op_points")
         self._op_points = (tuple(op) if isinstance(op, (list, tuple))
                            and len(op) == 2 else None)
+        nested = bundle.get("nested_honest_f1")
+        if isinstance(nested, tuple):
+            nested = nested[0] if nested else None
+        nested_txt = (f" | nested honest F1 {nested:.3f}"
+                      if isinstance(nested, (int, float))
+                      and np.isfinite(nested) else
+                      " | nested honest estimate pending")
         self.model_info.setText(
             f"<b>{bundle['model_name']}</b> — classes: "
             f"{', '.join(bundle['classes'])} | macro sensitivity "
             f"{m.get('sens', (0,))[0]:.3f} · specificity "
             f"{m.get('spec', (0,))[0]:.3f} · F1 "
-            f"{m.get('f1', (0,))[0]:.3f}"
+            f"{m.get('f1', (0,))[0]:.3f} (selection CV)"
+            + nested_txt
             + (f" | F1-optimal threshold {bundle['threshold']:.3f}"
                if bundle.get("threshold") is not None else ""))
         self.b_predict.setEnabled(True)
@@ -9222,7 +9388,7 @@ class MainWindow(QtWidgets.QMainWindow):
         vals = [sum(1 for _f, c, _p in self._pred_rows if c == k)
                 for k in classes_seen]
         plotting.plot_count_bars(ax2, classes_seen, vals,
-                                 title="Predicted classes", positive=pos)
+                                 title="Prediction distribution", positive=pos)
         self.pred_canvas.draw_idle()
 
     def _set_predict_summary(self, rows):
@@ -9245,7 +9411,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 p.setVisible(False)
         self.predict_status.setText(
-            "Prediction done — full report on the Result page (Next). "
+            "Prediction done — full report on the Result page (Next) — "
             + " · ".join(parts))
 
     def on_predict_done(self, payload: dict):
@@ -9255,7 +9421,7 @@ class MainWindow(QtWidgets.QMainWindow):
         n_skip = sum(1 for line in payload["logs"]
                      if line.startswith("SKIPPED "))
         if payload["n_auto_refs"]:
-            self.log(f"Margin mode: built {payload['n_auto_refs']} "
+            self.log(f"Paired mode: built {payload['n_auto_refs']} "
                      "per-patient normal references from the clinical "
                      "tree")
         rows = payload["rows"]
@@ -9274,8 +9440,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     "None of the files could be predicted: this is a "
                     "MARGIN-mode model and no patient-specific NORMAL "
                     "reference was found.\n\nSelect the whole clinical "
-                    "tree (<root>/<class>/<patient>) or set the "
-                    "reference folder on the Predict page.")
+                    "tree (<root>/<class>/<patient>) — the matching "
+                    "Normal folder is picked up automatically.")
             else:
                 QtWidgets.QMessageBox.warning(
                     self, "Nothing predicted",
@@ -9464,9 +9630,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     top = sorted(rows, key=lambda r: -abs(r[3]))[:3]
                     txt = " · ".join(
                         f"{r[1]} {r[3]:+.2f}" +
-                        (" (p<.05)" if r[4] < 0.05 else "")
+                        (" (FDR p<.05)" if r[5] < 0.05 else "")
                         for r in top if r[0])
-                    self.log(f"Biochemical shift (top bands, {sorted(set(labels[labels != '']))[-1]} vs "
+                    self.log(f"Biochemical shift (top bands, {sorted(set(labels[labels != '']))[-1]} minus "
+                             f"{sorted(set(labels[labels != '']))[0]}: "
                              f"{sorted(set(labels[labels != '']))[0]}): {txt}")
             except Exception:
                 pass                     # QC never blocks the workflow
@@ -9487,8 +9654,13 @@ class MainWindow(QtWidgets.QMainWindow):
             n_classes = len(set(l for l in self.labels if l))
             bits.append(f"{len(self.spectra)} spectra · {n_classes} classes")
         if self.winner is not None:
-            bits.append(f"trained: {self.winner.name} "
-                        f"(F1 {self.winner.macro_f1():.2f})")
+            # one honest number policy: show the nested honest F1 when
+            # available, else the selection-CV value tagged as such —
+            # the title must never disagree with the Train banner
+            _hs, _hp, hf1, hnote = self._honest_display_numbers()
+            f1_txt = (f"F1 {hf1:.3f}" if np.isfinite(hf1)
+                      else f"F1 {self.winner.macro_f1():.3f} (sel. CV)")
+            bits.append(f"trained: {self.winner.name} ({f1_txt})")
         elif self.spectra:
             bits.append("not trained")
         self.setWindowTitle("Raman Spectra Classifier"
@@ -9499,15 +9671,16 @@ class MainWindow(QtWidgets.QMainWindow):
             traceback.format_exception(type(exc), exc, exc.__traceback__)))
         QtWidgets.QMessageBox.warning(
             self, what,
-            f"{what}:\n\n{exc}\n\nTechnical details are printed to the "
-            "console.")
+            f"{what}:\n\n{exc}\n\nTechnical details are in session.log "
+            "next to the app.")
 
     def show_howto(self):
-        QtWidgets.QMessageBox.information(self, "How to use this app",
-                                          uh.HOW_TO)
+        QtWidgets.QMessageBox.information(
+            self, "How to use this app",
+            uh.how_to(len(modeling.ALL_MODEL_NAMES)))
 
     def show_metric_help(self):
-        QtWidgets.QMessageBox.information(self, "Metrics explained",
+        QtWidgets.QMessageBox.information(self, "What the metrics mean",
                                           uh.METRIC_HELP)
 
     def show_about(self):
@@ -9615,7 +9788,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if running:
             ans = QtWidgets.QMessageBox.question(
                 self, "Work still running",
-                "A training / search / prediction is still running.\n\n"
+                "A training / optimization / search / analysis / "
+                "prediction job is still running.\n\n"
                 "Stop it and quit? (A cancelled 3SSE search keeps its "
                 "checkpoint — Run resumes it next time.)",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,

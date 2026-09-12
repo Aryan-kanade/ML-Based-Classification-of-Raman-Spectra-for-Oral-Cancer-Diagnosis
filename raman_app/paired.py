@@ -30,6 +30,8 @@ class PairedData:
     wn: np.ndarray                   # (cropped) wavenumber axis
     n_patients: int = 0
     n_unpaired_excluded: int = 0
+    n_unlabeled_dropped: int = 0     # rows with an empty label (2026-09-12)
+    n_self_ref_rows: int = 0         # k=1-normal rows (deviation ≡ 0)
 
 
 def paired_features(spectra_X: np.ndarray, labels: list[str],
@@ -44,38 +46,58 @@ def paired_features(spectra_X: np.ndarray, labels: list[str],
     spectra_X: raw intensity matrix on the common grid wn_full.
     labels/groups: one entry per row; exclude: flagged rows to skip.
     For every patient with at least one Normal AND one Tumor spectrum,
-    the reference is the mean of their (preprocessed) Normal spectra;
-    every kept spectrum becomes (preprocessed spectrum - reference).
-    Patients without a normal reference are excluded (counted).
+    TUMOR rows use the mean of the patient's (preprocessed) Normal
+    spectra as reference; NORMAL rows use the LEAVE-ONE-OUT mean of the
+    patient's OTHER normals (2026-09-12 audit: including the row itself
+    shrank Normal deviations to exactly (k-1)/k — 0.0 for k=1 — and
+    mismatched deploy time, where references never contain the spectrum
+    being classified).  k=1 normals still yield a zero deviation; they
+    are kept but counted in `n_self_ref_rows`.  Patients without a
+    normal reference are excluded (counted).
 
     With use_pqn=True each spectrum is first PQN-normalized (Dieterle
-    2006) against the patient's own normal reference — leakage-free by
-    construction — which corrects coupling/dilution scale differences
-    before the deviation is taken.
+    2006) against its own reference — leakage-free by construction —
+    which corrects coupling/dilution scale differences before the
+    deviation is taken.
     """
     keep = [i for i in range(len(labels))
             if labels[i] and (exclude is None or not exclude[i])]
+    n_unlabeled = len(labels) - len(keep) - (
+        0 if exclude is None else sum(1 for e in exclude if e))
     X = pp.preprocess_matrix(spectra_X[keep], params, wn=wn_full)
     wn = np.asarray(wn_full)[pp.crop_mask(wn_full, params)]
     labels = [labels[i] for i in keep]
     groups = [groups[i] for i in keep]
 
+    def _canon(s: str) -> str:
+        return (s or "").strip().casefold()
+
     by_patient: dict[str, dict[str, list[int]]] = {}
     for i, (g, lab) in enumerate(zip(groups, labels, strict=True)):
-        by_patient.setdefault(g, {}).setdefault(lab, []).append(i)
+        by_patient.setdefault(g, {}).setdefault(_canon(lab), []).append(i)
 
     rows_X, rows_y, rows_g = [], [], []
     n_unpaired = 0
+    n_self_ref = 0
     for g, cls_idx in by_patient.items():
-        normals = cls_idx.get("Normal") or cls_idx.get("normal")
-        tumors = cls_idx.get("Tumor") or cls_idx.get("tumor")
+        normals = cls_idx.get("normal")
+        tumors = cls_idx.get("tumor")
         if not normals or not tumors:
             n_unpaired += 1
             continue
-        ref = X[normals].mean(axis=0)
+        ref_tumor = X[normals].mean(axis=0)     # what a tumor is compared to
         for lab, idxs in (("Normal", normals), ("Tumor", tumors)):
             for i in idxs:
                 row = X[i]
+                if lab == "Normal":
+                    others = [j for j in normals if j != i]
+                    if others:                   # leave-one-out reference
+                        ref = X[others].mean(axis=0)
+                    else:                        # k=1: degenerate zero row
+                        ref = X[i]
+                        n_self_ref += 1
+                else:
+                    ref = ref_tumor
                 if use_pqn:
                     row = pp.pqn_normalize(row, ref)
                 rows_X.append(row - ref)
@@ -85,7 +107,9 @@ def paired_features(spectra_X: np.ndarray, labels: list[str],
         X=np.vstack(rows_X) if rows_X else np.zeros((0, len(wn))),
         y=rows_y, groups=rows_g, wn=wn,
         n_patients=len(by_patient) - n_unpaired,
-        n_unpaired_excluded=n_unpaired)
+        n_unpaired_excluded=n_unpaired,
+        n_unlabeled_dropped=max(0, n_unlabeled),
+        n_self_ref_rows=n_self_ref)
 
 
 def reference_vector(bundle: dict, paths: list[str]) -> np.ndarray:

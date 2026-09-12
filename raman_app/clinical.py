@@ -39,6 +39,16 @@ PREVALENCE_SCENARIOS = (
     ("biopsy queue", 0.60),
 )
 
+# published comparison values (sens, spec) — ONE home so the txt and
+# HTML reports can never drift apart; "~" marks typical/approximate
+LITERATURE = (
+    ("Han 2022 meta (13 studies)", 0.89, 0.84),
+    ("2025 meta-analysis (OSCC subgroup)", 0.89, 0.91),
+    ("Purohit 2026 review (pooled)", 0.90, 0.89),
+    ("VELscope autofluorescence (typical)", 0.84, 0.45),
+    ("Toluidine blue (typical)", 0.63, 0.83),
+)
+
 
 def operating_points(y_true, p_pos: np.ndarray, sens_target: float = 0.90,
                      spec_target: float = 0.90):
@@ -84,8 +94,15 @@ def triage(p: float, thr_ruleout: float | None,
     Three-tier clinical verdict from P(positive):
 
       p >= rule-in  -> POSITIVE
-      p <= rule-out -> NEGATIVE
-      in between    -> INDETERMINATE (the honest middle band)
+      p <  rule-out -> NEGATIVE    (STRICT: operating_points guarantees
+      in between    -> INDETERMINATE  sens>=target under sklearn's
+                                    `p >= thr` positive rule, so a
+                                    spectrum exactly AT the rule-out
+                                    threshold is a positive call and
+                                    must NOT be cleared — the old
+                                    inclusive `p <= rule-out` realized
+                                    sens below target at the boundary;
+                                    2026-09-12 audit)
 
     Falls back to a single-threshold split when the ROC cannot support
     two targets (rule-out >= rule-in: the model is too weak to tier).
@@ -98,7 +115,7 @@ def triage(p: float, thr_ruleout: float | None,
         return TRIAGE_POSITIVE if p >= t else TRIAGE_NEGATIVE
     if p >= thr_rulein:
         return TRIAGE_POSITIVE
-    if p <= thr_ruleout:
+    if p < thr_ruleout:
         return TRIAGE_NEGATIVE
     return TRIAGE_INDETERMINATE
 
@@ -263,26 +280,38 @@ def ece(y_true, p_pos: np.ndarray, n_bins: int = 10) -> float:
     return float(sum(b[2] * abs(b[0] - b[1]) for b in bins) / n)
 
 
-def isotonic_compare(y_true, p_pos: np.ndarray) -> dict:
+def isotonic_compare(y_true, p_pos: np.ndarray, k: int = 5,
+                     seed: int = 0) -> dict:
     """
     Fit isotonic mapping alongside Platt and report both ECEs — the
     honest comparison at n<500 (isotonic usually overfits small samples;
     Platt stays applied, isotonic is reported for transparency).
+
+    Both mappings are CROSS-FITTED (k-fold: fit on k-1 folds, transform
+    the held-out fold, pool) before the ECE — the old in-sample ECEs
+    were near-zero by construction, especially for isotonic, which
+    interpolates its own training points (2026-09-12 audit).
     """
     from sklearn.isotonic import IsotonicRegression
+    from sklearn.model_selection import KFold
     y = np.asarray(y_true, dtype=float)
     p = np.asarray(p_pos, dtype=float)
     ok = ~np.isnan(p)
     y, p = y[ok], p[ok]
     if len(y) < 10 or len(np.unique(y)) < 2:
         return {}
-    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-    p_iso = iso.fit_transform(p, y)
-    ab = fit_platt(y, p)
-    p_platt = apply_platt(p, ab) if ab else p
+    folds = list(KFold(n_splits=max(2, min(k, len(y) // 2)),
+                       shuffle=True, random_state=seed).split(p))
+    iso_p = np.empty_like(p)
+    platt_p = np.empty_like(p)
+    for tr, te in folds:
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        iso_p[te] = iso.fit(p[tr], y[tr]).predict(p[te])
+        ab = fit_platt(y[tr], p[tr])
+        platt_p[te] = apply_platt(p[te], ab) if ab else p[te]
     return {"ece_raw": ece(y, p),
-            "ece_platt": ece(y, p_platt),
-            "ece_isotonic": ece(y, p_iso)}
+            "ece_platt": ece(y, platt_p),
+            "ece_isotonic": ece(y, iso_p)}
 
 
 # --------------------------------------------------------------------------

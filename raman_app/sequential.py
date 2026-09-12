@@ -78,6 +78,20 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA = cdata.find_data_root() or os.path.join(APP_DIR, "..", "Data")
 # models skipped by the GUI's "fast screening" toggle (slowest first)
 SLOW_MODELS = ("1D-CNN", "CatBoost", "XGBoost")
+# study reference baselines (2026-08-30 run, seed 42, 5-fold grouped ×3)
+# — ONE home for the numbers so the CLI report, the GUI winner tab and
+# the HTML export can never drift apart; shown as "study reference",
+# not as a per-dataset result
+BASELINES = {
+    "paired": ("paired Extra Trees", 0.702, 0.788),
+    "standard": ("Peak bands + RF", 0.594, 0.610),
+}
+
+
+def baseline_for(mode: str):
+    """(name, f1, auc) study baseline for a run mode — paired modes get
+    the paired reference, everything else the standard one."""
+    return BASELINES["paired" if "paired" in (mode or "") else "standard"]
 
 
 class SearchCancelled(Exception):
@@ -255,9 +269,12 @@ def _metrics_from_oof(y, proba, classes, groups) -> dict:
         # order is arbitrary; fixed 2026-09-05)
         uniq_p = np.unique(g)
         p_true, p_pred = [], []
+        n_tied = 0
         for pat in uniq_p:
             lab = ye[g == pat]
             vals, cnts = np.unique(lab, return_counts=True)
+            if len(vals) == 2 and cnts[0] == cnts[1]:
+                n_tied += 1        # tie-break to the lowest code (audit)
             p_true.append(int(vals[np.argmax(cnts)]))
             p_pred.append(int(np.argmax(proba[g == pat].mean(axis=0))))
         pcm = confusion_matrix(p_true, p_pred,
@@ -267,6 +284,7 @@ def _metrics_from_oof(y, proba, classes, groups) -> dict:
         out["pat_f1"] = float(np.mean([pper[c]["f1"] for c in pper]))
         out["pat_sens"] = float(np.mean([pper[c]["sens"] for c in pper]))
         out["pat_spec"] = float(np.mean([pper[c]["spec"] for c in pper]))
+        out["pat_tied"] = n_tied
     return out
 
 
@@ -288,7 +306,12 @@ def _eval_last_layer(factory, feats, y, classes, groups, k, seed, cutoff):
     from sklearn.metrics import f1_score
     y_arr = np.asarray(y)
     g_arr = np.asarray(groups) if groups is not None else None
-    ye = np.searchsorted(np.asarray(classes), y_arr)
+    # y arrives PRE-ENCODED as ints (search() encodes once at the
+    # boundary).  Re-encoding against the string class list cast the
+    # ints to '0'/'1' strings that sort BEFORE every alphabetic label,
+    # making ye all-zeros — every f1_mean in level-3 screening was
+    # computed against a constant truth (2026-09-12 audit; fixed).
+    ye = np.asarray(y, dtype=int)
     cv = _splitter(k, seed, y_arr, groups)
     n_splits = cv.get_n_splits()
     oof = np.full((len(ye), len(classes)), np.nan)
@@ -479,8 +502,10 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
         at full fidelity, so screening noise never reaches the winner.
       * BEAM (prune_pairs, default 50) — triples only for the top-K
         pairs (~8x fewer third-model evaluations).
-      * WARM early-abandon cutoff seeded from the pairs ranking, so
-        pruning bites from the first triple (not after 20 scores).
+      * EARLY-ABANDON cutoff from completed triples' f1_mean — the
+        bound guarantees top-N exactness within the beam.  (A WARM
+        cutoff seeded from the pairs' pooled F1 was removed 2026-09-12:
+        it mixed metric scales and could prune valid triples.)
       * CHECKPOINTED at every level (singles/pairs carry their OOF
         arrays; resume replays them instead of refitting).
       * joblib memmapping (max_nbytes) shares X across workers once.
@@ -527,7 +552,10 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
     def top5_of(pool):
         scored = sorted((e for e in pool if "metrics" in e),
                         key=lambda e: -_screen_f1(e["metrics"]))[:5]
-        return [((" → ".join(e["arch"])), e["metrics"]["f1"])
+        # display the metric the ranking actually uses (_screen_f1:
+        # f1_mean for triples, pooled f1 otherwise) — the old display
+        # always showed pooled f1, so order and number disagreed
+        return [((" → ".join(e["arch"])), _screen_f1(e["metrics"]))
                 for e in scored]
 
     def tick(best: str, best_f1: float):
@@ -720,12 +748,14 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
     if prune_pairs and prune_pairs < len(pairs_sorted):
         beam_applied = len(pairs_sorted) - int(prune_pairs)
         pairs_sorted = pairs_sorted[:int(prune_pairs)]
-    # WARM cutoff: seed from the pairs ranking (a triple rarely beats its
-    # own base pair by much) with 0.10 slack — pruning bites from the
-    # very first triple instead of after `top` full evaluations
-    pair_f1s = sorted((p["metrics"]["f1"] for p in pairs
-                       if "metrics" in p), reverse=True)
-    cutoff = (min(pair_f1s[:top]) - 0.10) if len(pair_f1s) >= top else -1.0
+    # WARM cutoff REMOVED (2026-09-12 audit): it was seeded from the
+    # pairs' POOLED F1 minus 0.10 while triple pruning/ranking operates
+    # on f1_mean (mean per-fold F1) — a different scale, so a triple
+    # bound in f1_mean units could fall below a pooled-F1 cutoff and be
+    # wrongly abandoned in the first batch.  The cutoff now starts open
+    # (-1) and tightens from the first batch's actual f1_mean values via
+    # cutoff_now(); the abandon bound then guarantees top-N exactness.
+    cutoff = -1.0
     # beam-skipped triples count as done so progress reaches 100%
     n_names = len(names)
     done[0] += beam_applied * max(0, n_names - 2)
@@ -1269,7 +1299,12 @@ def finalize_winner(validated: dict, X, y, groups, wavenumbers,
     chain = AveragedChain(ests, k=k, seed=seed,
                           n_seeds=3).fit(X, y, groups=groups)
     classes = sorted(set(y))
-    oof_m = tuned_metrics if tuned else m
+    # threshold + calibrator derive from the UNTUNED nested OOF: the
+    # tuned variant's OOF is selection-biased (tune_chain tuned on all
+    # rows, then validate_arch scored the same rows), so its
+    # probabilities would give an optimistic threshold/calibrator
+    # (2026-09-12 audit).  tuned_metrics is flagged accordingly.
+    oof_m = m
     thr, calibrator = None, None
     if oof_m["oof_proba"].shape[1] == 2:
         # oof_m["y_true"] is already class-encoded (validate_arch)
@@ -1278,6 +1313,13 @@ def finalize_winner(validated: dict, X, y, groups, wavenumbers,
         thr_t, _f1, _j = modeling.best_f1_threshold(yv, pv)
         thr = float(thr_t)
         calibrator = clin.fit_platt(yv, pv)
+    if tuned_metrics is not None:
+        tuned_metrics = dict(tuned_metrics)
+        tuned_metrics["selection_biased"] = True   # tuned+validated on
+        tuned_metrics["selection_bias_note"] = (   # the same rows
+            "hyperparameters were tuned on ALL rows before this "
+            "nested validation — treat as an optimistic upper bound; "
+            "the honest number is 'metrics'")
     return {"arch": winner["arch"], "chain": chain, "classes": classes,
             "threshold": thr, "calibrator": calibrator, "metrics": m,
             "tuned": tuned, "tuned_metrics": tuned_metrics,
@@ -1465,9 +1507,8 @@ def main(argv=None) -> int:
                                  progress=lambda m: print(f"[3sse] {m}",
                                                           flush=True))
 
-    baseline = ({"Extra Trees (paired baseline)": (0.702, 0.788)}
-                if args.mode.startswith("paired")
-                else {"Peak bands + RF (std baseline)": (0.594, 0.610)})
+    _bname, _bf1, _bauc = baseline_for(args.mode)
+    baseline = {f"{_bname} (study baseline)": (_bf1, _bauc)}
 
     with open(os.path.join(out_dir, "validated.json"), "w",
               encoding="utf-8") as fh:

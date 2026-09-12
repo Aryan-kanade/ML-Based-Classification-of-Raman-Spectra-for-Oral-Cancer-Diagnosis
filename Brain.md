@@ -2474,3 +2474,209 @@ live on real data (titles exact, 4 titled panels + twin axes, axes
 ascending per §47) + plotting tests + gui_test + ruff. NOTE: means
 include spike-flagged spectra (exclusion is training-time — same as
 the Data page button). App RESTART required to see it.
+
+## 36. 2026-09-12 — spike analysis report + hot-pixel finding
+
+Per-file spike analysis of the 18 flagged spectra →
+**D:\BARC\SPIKE_REPORT.md** (file list, spike wavenumber/intensity/
+neighbors, caveats). Key finding: spikes recur at FIXED positions
+(1498.2 ×6, 3078.5 ×4, 1592.2 ×4, 1980.8 ×2 + 2532.6/2551.3/3015.0)
+across patients and dates → fixed detector hot pixels / interpolation
+artifacts, NOT random cosmic rays; 5 patients carry most flags. In the
+6 "Spectra pro" files the ≥300 score is technically driven by the
+Rayleigh-edge roll-off (wn 20-37), with the real single-point artifact
+mid-spectrum. Future option (not implemented): hot-pixel position mask
+in preprocessing would clean instead of drop — recovers paired-mode
+patients (32, TDOC 11, 091/092) that lose both-class spectra.
+
+## 37. 2026-09-12 — WHOLE-PROJECT CALCULATION AUDIT + FULL REMEDIATION
+
+Three adversarial audit agents + numeric spot-checks over all
+calculation code → **5 BUGs / 13 RISKs / 18 IMPROVEs, ALL fixed** in
+one pass. Full report: **D:\BARC\CALCULATION_AUDIT.md**. 17 new
+regression tests (`test_audit_*`), suite 118/118, ruff clean.
+
+Number-changing (re-run obligations):
+1. **ALS offsets [0,1,2]** (was [0,-1,-2], left-edge collapse ~500-
+   800 cm⁻¹ on the DEFAULT baseline) → re-run everything default-
+   preprocessed (models/bundles/studies/plots).
+2. **sequential `_eval_last_layer` ye = int cast** (str-cast re-encode
+   made all triple f1_mean garbage, ceiling 0.497, corr 0.031 w/
+   pooled F1 in shipped screening.jsonl) → re-run 3SSE level-3; the
+   deployed level-2 winner (RF→ET) is unaffected.
+3. **paired LOO reference** for Normal rows (was self-inclusive:
+   shrink (k-1)/k, k=1 → exact zeros; new `n_self_ref_rows` counts
+   k=1 normals kept as zero rows).
+4. despike overhaul (flag-run ≤3 filter protects peak flanks;
+   neighbours never re-infected; index-0 + mad0 fixed), PQN weakest-
+   10%-of-|ref| mask, wn-calibrate prominence guard + parabola apex.
+
+Guarded/honesty fixes: Brier only on true probabilities (margins →
+NaN); Nemenyi table k=7-10 corrected + scipy k>10 (old CD anti-
+conservative up to 7%); TTestSelect np.asarray(y) + optional fdr;
+tuned-chain threshold/calibrator from UNTUNED OOF (tuned_metrics
+flagged selection_biased); warm cutoff removed (scale mixing);
+inner-loop grouped fits; macro ± = std(fold_f1); permutation AUC
+excludes mixed-label patients; isotonic/Platt ECEs cross-fitted;
+triage rule-out strictly p<thr; optimize score labeled selection-CV;
+exclude_flagged persisted in preprocess_best.json + honored by
+vit_train; tie patients counted; band_stats_paired returns p_raw AND
+p_fdr (8-field rows; gui consumer updated); biochemical_shift BH-FDR
+(6-field rows); ratio denominator guards; SNR ÷√2; best_f1_threshold
+exact midpoints; area-norm on-grid; align_to_grid coverage guard;
+leaderboard shows its ranking metric.
+
+Verified-correct inventory (untouched): Wilson/DeLong/BH-FDR/
+Friedman/McNemar/Hanley-McNeil/conformal/ECE, nested grouped-CV
+protocol (0 leaks), OOF pooling, bootstrap groups, Platt separation,
+chaining/AveragedChain, reference_vector deploy parity (bit-identical),
+band assignments vs literature, wavelet stack, pipeline order.
+
+## 50. 2026-09-12 — GRAPH & REPORT AUDIT: every plot/report tested, 8 findings fixed
+
+Deep audit (real GUI offscreen + real data + real training; 22 PNG
+evidence pack + deterministic axes_info checks in
+`.zcode/graph_audit/`; remote vision-tool output discarded — it
+returned wrong-image descriptions, logs are authoritative). All 32 GUI
+graphs + 12 report artifacts verified: titles/labels/legends, §46/§47
+axis conventions, guards, colors, cross-report numbers.
+
+Fixed (all re-audited to 0 findings, display-only — LOPO 0.586 /
+seeds 0.576±0.011 bit-identical before vs after):
+- B1 `save_result_figures` exported only 4/6 charts → +calibration
+  +decision-curve PNGs (docstring said "three"); test now pins the set
+- B2 Result page kept the PREVIOUS winner's CM/ROC when the new winner
+  had no cm/oof_proba → else-branch placeholders (matches cal/DCA pair)
+- B3 biochem no-pairing branch ylabel said "Δ marker (paired)" while
+  plotting class MEANS → conditional label
+- B4 `plot_prob_histogram` xlim(-0.02,…) → (0, 1.02) per §46 zero-at-left
+- B6 same function: one y-tick per spectrum (~300 at n=299) →
+  MaxNLocator(integer=True); pinned by test (≤12 ticks, xlim[0]==0)
+- B5 `plot_sign_bars` removed (dead code: every site hand-rolls bars;
+  only its pinning test called it) + test rewritten to pin the
+  prob-histogram fixes instead
+- I1/I2 seeds boxplot + LOPO bars got x-labels ("seed re-runs (5
+  points)" / "patient — hardest on the left")
+
+Reviewed-OK (no action): ROC Youden/chance labels, PR/cal/DCA limits,
+CM cell text (counts + % of true class), twin-axis "left/right axis"
+legends, per-class-mean preview legends with n=, paired card, HTML
+report 6-figure captions + honest-number policy, color semantics
+(red=toward-positive/weak, blue=negative).
+
+NOTE: a PARALLEL session was concurrently landing a calculation-audit
+wave (uncommitted; §36/§37 appended out of numeric order). Graph-fix
+edits were applied atomically against that moving tree; 3 suite
+failures at last snapshot (prep_param_rows / seq_results_html /
+stage3_conformal_permutation) belong to that wave, not the graph fixes.
+
+Post-run notes (same day): (a) tests that planted the class signal as
+a constant DC offset now plant PEAKS — the corrected ALS legitimately
+absorbs DC offsets (the old left-edge bug leaked them as fake
+separating features); (b) permutation_auc_p hardened: exclusion of
+mixed-label patients falls back to WITHIN-PATIENT label shuffling when
+the kept set is too small/degenerate (fully-paired cohorts), result
+carries `null: within-patient shuffle|patient-label shuffle`;
+(c) prep_compact dash style made test-tolerant (en-dash vs ascii).
+WARNING: a second session was concurrently editing/committing this
+repo during the audit (commits 1f8f16a/419dba7/436d771, plot/GUI
+tweaks) — test_all.py was rewritten twice mid-run; if work looks
+missing, check `git log`/`git diff` before assuming a code bug. Avoid
+two agents editing the same tree simultaneously.
+
+## 51. 2026-09-12 — SCREEN-TEXT AUDIT: every user-visible string
+studied, 85 findings fixed (user: "solve each and every")
+
+Three Explore agents read EVERY on-screen string (pages, tooltips,
+dialogs, status/log lines, report writers, chart labels, About/How-to)
+and verified each claim against actual behavior → ~75 findings (+10
+from cross-checks). All fixed in 5 batches (gui.py ~90 sites,
+ui_helpers, plotting, modeling, sequential, clinical):
+
+- **WRONG (24)**: 3SSE run tooltip described the REMOVED auto-switch;
+  CSV tooltip said "as displayed, sorted" (export now really follows
+  the clicked proxy sort); dialog note claims Train-identical numbers
+  even for fast/restored runs (now conditional on metrics_fair);
+  baseline "Extra Trees 0.702" hardcoded ×3 AND shown for unpaired
+  runs → `sequential.BASELINES` + `baseline_for(mode)` one source,
+  mode-aware, labeled "study reference"; freeze tooltip claimed a
+  confidence interval; margin card + error dialog referenced the
+  DELETED reference-folder input; preview tooltip described the old
+  per-spectrum plot (now class means); "Diagnostics tab", "'deep
+  diagnostics' row"; ".txt-only" placeholder; verdict hint said
+  majority vote (it is mean-P at threshold); "patient-grouped CV"
+  asserted unconditionally in 5 places (banner/reading/HTML footer/
+  optimize/about → conditional on groups); literature row used
+  selection-CV beside the honest headline (now honest + labeled);
+  report signal tier had a second hardcoded 0.66/0.4 tier system →
+  now reuses clin.triage + _threshold_now (Platt space); HTML tooltip
+  overclaim + silent 300-row cap (now noted); PPV/NPV from 3 different
+  sources → `MainWindow._ppv_source()` (honest-first via the NESTED
+  note prefix — finiteness alone would relabel preliminary as honest);
+  TRIPOD "histopathology-confirmed"/"single centre" qualified;
+  auc_power "~None" guard; band tables 938/853 aligned to
+  biochemistry (938=keratin, 853=collagen) + _band_name join;
+  pluralization n==1 guards; window title + Predict card now honest-F1
+  first / "(selection CV)" tag + nested pending line; duplicate
+  Locked button removed; view-saved tooltip mentions study_run_lab;
+  "is computing" reworded for auto-run-off.
+- **STALE (14)**: How-to/hero/about now "compares {N} model families…
+  keeps the best macro-F1" (N=len(ALL_MODEL_NAMES), dynamic; was 6 of
+  24 + "best sens/spec/F1"); crop tooltip no longer hardcodes
+  15-3862; "~+0.1 F1" → sourced baseline numbers; literature values →
+  `clinical.LITERATURE` (txt+HTML same source); "(5 seeds)"×6 and
+  "5% noise"×5 derive from new `SEED_STABILITY_SEEDS`/`NOISE_LEVELS`
+  (module constants, computation uses them too); time estimate marked
+  hardware-dependent; exact button names in How-to; HTML figures
+  150→200 dpi (matches Save figures); SUITE_VERSION/4369/4080
+  comments; hero pill "—" not "0 patients".
+- **TYPOS (8)**: stabler→more stable, ±N/2N+1×, → in class_col tip,
+  Segoe UI dup, double spaces, leading space, "%+flag"→"% incl.
+  flagged", repeated x3→×3.
+- **CONSISTENCY (22)**: standards picked and swept — cm⁻¹ in text
+  (mathtext only on axes); ONE paired vocabulary "Paired (vs
+  patient's own normal)" / "Paired + PQN (Dieterle 2006)" (margin
+  remains only in code identifiers); app name "Raman Spectra
+  Classifier" everywhere; Macro-F1 headers/macro-F1 prose; ONE locked
+  label "Locked test-set evaluation (FINAL)" + 3 dp everywhere;
+  placeholder "—"; en-dash ranges/CI; arrows →; metrics help one name;
+  chart one name "Prediction distribution"; mean-P disambiguated
+  ("mean P(pos) over all spectra" vs "among positive calls (call
+  confidence)"); "session.log" everywhere; "preprocessed" everywhere;
+  `MainWindow._deep_eval_lines()` = canonical deep sentences rendered
+  IDENTICALLY by txt and HTML (incl. LOPO per-patient accuracy +
+  Friedman best-rank, previously HTML-only omissions); dataset line
+  "(patient-grouped)" on both surfaces; straight quotes; deep-summary
+  casing; no space before "…"; Savitzky–Golay; single space after
+  glyph prefixes.
+- **IMPROVEMENTS (17)**: save-bundle disabled-state tooltip; "Set
+  90%"→"Conformal set (90%)"; live-folder tooltip says Paired refusal
+  upfront + measured ms/spectrum; ChainFlowWidget tooltip explains
+  P1+/P2+; PPV sentence shows BOTH NPVs; paired-panel legend "n=…
+  spectra"; threshold sentence points at the real F1-tuned cut;
+  als_p/folds tips clearer (patient grouping named); learning-curve
+  "plateaued…"; early-abandon plain wording; red/blue hint only when
+  a reference exists; QC line states delta direction ("minus");
+  busy-guard lists all job types; prediction-done status separator;
+  CSV dialog title "Export 3SSE results to CSV".
+
+Tests: new `test_text_audit_fixes` (baseline mode selection in HTML,
+dynamic how_to count, canonical deep lines, honest-first _ppv_source)
++ `test_seq_results_html` updated to the canonical paired name;
+latent-bound bugs in `test_supplementary_metrics_formulas` fixed
+(MCC is signed −1..1; brier NaN is legal on decision margins —
+exposed by the §50/other-session audit's correct changes). Gate:
+test_all 119/119, gui_test PASS, deep_test 19/19, ruff clean.
+
+**TEXT STANDARDS (permanent — follow for any new string):** cm⁻¹ in
+plain text (cm$^{-1}$ only on matplotlib axes) · en-dash for numeric
+ranges/CI · "×" for multiplication, "→" for arrows/flows · "…" without
+leading space · app name "Raman Spectra Classifier" · "Paired (vs
+patient's own normal)" / "Paired + PQN (Dieterle 2006)" — never
+"margin" in UI text · "Macro-F1" in table headers, "macro-F1" in
+prose · metrics always 3 dp (CI 2 dp) · empty placeholder "—" ·
+p<0.05 · "Technical details are in session.log next to the app." ·
+numbers in text derive from named constants (BASELINES, LITERATURE,
+SEED_STABILITY_SEEDS, NOISE_LEVELS, len(ALL_MODEL_NAMES)) — never
+hand-copied · "patient-grouped" only when self.groups exists · one
+number policy: honest first, selection values always tagged.
