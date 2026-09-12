@@ -11,6 +11,7 @@ raman_app/__pycache__/
 raman_app/.ruff_cache/
 raman_app/session.log
 raman_app/session.log.*
+raman_app/crash.log
 raman_app/settings.json
 raman_app/study_manifest.json
 raman_app/data_report.txt

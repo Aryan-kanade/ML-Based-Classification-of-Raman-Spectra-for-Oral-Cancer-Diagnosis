@@ -93,7 +93,10 @@ def _models() -> list[tuple[str, object]]:
             ("pca", PCA(n_components=0.95, random_state=0)),
             ("svm", SVC(kernel="rbf", class_weight="balanced"))])),
         ("RandomForest", RandomForestClassifier(
-            n_estimators=300, class_weight="balanced", n_jobs=-1,
+            # n_jobs=1: runs from a GUI QThread (honest check); all-core
+            # loky pools next to the live Qt loop are the native-crash
+            # race (2026-09-12 crash, gotcha #25)
+            n_estimators=300, class_weight="balanced", n_jobs=1,
             random_state=0)),
         ("PCA+LogReg", Pipeline([
             ("scale", StandardScaler()),

@@ -182,7 +182,17 @@ def main() -> int:
         QtWidgets.QMessageBox.warning = _orig_warn
     assert win._excepthook_shown and warned, "excepthook did not fire"
     assert not win.isHidden()          # app survived the exception
-    print("[8] excepthook OK — slot exception logged, app alive")
+    # [8b] 2026-09-12: the error must also be ON SCREEN — persistent
+    # banner strip + ⚠ counter in the status bar (nothing fails into
+    # session.log invisibly anymore)
+    assert win._err_banner.isVisible(), "error banner did not show"
+    assert "excepthook probe" in win._err_banner.msg_lbl.text()
+    assert win._err_chip.isVisible() and win._err_chip.text() == "⚠ 1"
+    win._err_banner.b_dismiss.click()
+    assert not win._err_banner.isVisible()
+    assert win._err_chip.isVisible()   # counter survives dismissal
+    print("[8] excepthook OK — slot exception logged, banner + ⚠ shown, "
+          "app alive")
 
     win.close()
     print("\nGUI TEST PASSED")

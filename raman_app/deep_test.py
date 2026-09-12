@@ -796,6 +796,86 @@ def main() -> int:
 
     check("reproduce_study.py CLI (clinical tree, mini)", s_reproduce_cli)
 
+    def s_error_surfaces():
+        # 2026-09-12: every error must be ON SCREEN — persistent banner
+        # strip + ⚠ counter — not just session.log.  Fire the REAL
+        # excepthook path with a raising Qt callback.
+        from qt_compat import QtCore, QtWidgets
+        win = make_gui()
+        win.show()
+        QtWidgets.QApplication.processEvents()
+        n0 = win._err_count
+
+        def _boom():
+            raise ValueError("deep banner probe")
+        QtCore.QTimer.singleShot(0, _boom)
+        for _ in range(10):
+            QtWidgets.QApplication.processEvents()
+        assert win._err_count == n0 + 1, "excepthook did not surface"
+        assert win._err_banner.isVisible()
+        assert "deep banner probe" in win._err_banner.msg_lbl.text()
+        assert win._err_chip.text().endswith(str(n0 + 1))
+        assert any("Unexpected error" in t for _k, t, _x in DIALOG_LOG)
+        # worker failures feed the same surface (fake a fail payload)
+        win.on_predict_failed("Traceback (most recent call last):\n"
+                              "ValueError: nope\n")
+        assert win._err_count == n0 + 2
+        assert "Prediction failed" in win._err_banner.msg_lbl.text()
+        assert "nope" in win._err_banner._tb
+        win.close()
+
+    check("error surfaces: banner + ⚠ counter on every failure",
+          s_error_surfaces)
+
+    def s_zombie_worker_guard():
+        # 2026-09-12: a worker that outlives its retire timeout must
+        # stay REFERENCED (GC'ing a running QThread aborts the process
+        # natively) and its slot must stay occupied.
+        win = make_gui()
+
+        class _Stuck:
+            def wait(self, ms):
+                return False
+
+            def isRunning(self):
+                return True
+
+        class _Done(_Stuck):
+            def isRunning(self):
+                return False
+
+        fake = _Stuck()
+        win._analysis_worker = fake
+        assert win._retire_worker("_analysis_worker", fake, "probe",
+                                  timeout_ms=5) is False
+        assert win._analysis_worker is fake          # slot stays busy
+        assert fake in win._zombie_workers           # stays referenced
+        done = _Done()
+        win._honest_worker = done
+        assert win._retire_worker("_honest_worker", done, "probe") is True
+        assert win._honest_worker is None            # finished: cleared
+        win.close()
+
+    check("zombie-worker guard: stuck thread kept, finished cleared",
+          s_zombie_worker_guard)
+
+    def s_stress_subprocesses():
+        # stress_audit B/C/D in child processes (real Qt, real threads;
+        # A is the long real-data scenario -- run it manually)
+        import subprocess as sp
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "stress_audit.py")
+        for name in ("B", "C", "D"):
+            r = sp.run([sys.executable, script, "--scenario", name],
+                       capture_output=True, text=True, timeout=300,
+                       cwd=os.path.dirname(script))
+            assert r.returncode == 0 and f"STRESS PASS {name}" in r.stdout, \
+                f"stress {name}: rc={r.returncode}\n" \
+                + (r.stdout or "")[-600:] + (r.stderr or "")[-600:]
+
+    check("stress harness B/C/D: guards, close-mid-work, ui-churn",
+          s_stress_subprocesses)
+
     # ---------------------------------------------------------------- done
     failed = [msg for ok, msg in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} deep checks passed")

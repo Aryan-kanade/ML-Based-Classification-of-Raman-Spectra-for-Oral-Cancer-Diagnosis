@@ -1520,7 +1520,7 @@ def _NOT_THREAD_SAFE(name: str) -> bool:
 
 
 def _tune_inner(estimator, grid, Xtr, ytr, inner, pos_idx=None,
-                groups=None, serial=False):
+                groups=None, serial=False, halve=False):
     """
     ONE inner-CV pass for both jobs run_cv used to do separately
     (2026-09-05): every param combo is fit on the inner training folds
@@ -1537,6 +1537,11 @@ def _tune_inner(estimator, grid, Xtr, ytr, inner, pos_idx=None,
     machine (OpenBLAS allocation aborts, 2026-09-05). `serial=True`
     (boosters / torch models — global C++ pools, per-process RNG) runs
     the loop in-process.
+
+    `halve=True` (TURBO only — approximate): grids with >= 4 combos
+    are successive-halved — the first inner split ranks the combos,
+    the best half finish the remaining splits.  Selection can differ
+    from the exact protocol; every turbo output is captioned as such.
 
     Semantics note: hyperparameter scoring changed from mean-of-inner-
     folds to pooled-OOF macro-F1 — the same objective the threshold
@@ -1563,16 +1568,35 @@ def _tune_inner(estimator, grid, Xtr, ytr, inner, pos_idx=None,
                           groups[tr] if groups is not None else None)
         return est.predict_proba(Xtr[va])
 
-    tasks = [(combo, tr, va) for combo in combos for tr, va in splits]
-    if serial or len(tasks) == 1:
-        probas = [_fit_proba(*t) for t in tasks]
-    else:
-        probas = Parallel(n_jobs=min(4, os.cpu_count() or 1),
-                          prefer="threads")(
+    def _run_tasks(tasks):
+        if serial or len(tasks) == 1:
+            return [_fit_proba(*t) for t in tasks]
+        return Parallel(n_jobs=min(4, os.cpu_count() or 1),
+                        prefer="threads")(
             delayed(_fit_proba)(*t) for t in tasks)
-    best_i, best_f1, pooled = 0, -np.inf, None
+
     y_by_split = [ytr[va] for _t, va in splits]
     y_all = np.concatenate(y_by_split) if y_by_split else ytr
+    if halve and len(combos) >= 4 and len(splits) >= 2:
+        keep_n = max(2, len(combos) // 2)
+        pr1 = _run_tasks([(combo, tr, va)
+                          for combo in combos for tr, va in splits[:1]])
+        rank = [f1_score(y_by_split[0], np.argmax(P, axis=1),
+                         average="macro") for P in pr1]
+        surv = sorted(np.argsort(rank)[::-1][:keep_n].tolist())
+        pr1 = [pr1[i] for i in surv]
+        combos = [combos[i] for i in surv]
+        pr2 = _run_tasks([(combo, tr, va)
+                          for combo in combos for tr, va in splits[1:]])
+        rest = len(splits) - 1
+        probas = []
+        for ci in range(len(combos)):
+            probas.append(pr1[ci])
+            probas.extend(pr2[ci * rest:(ci + 1) * rest])
+    else:
+        tasks = [(combo, tr, va) for combo in combos for tr, va in splits]
+        probas = _run_tasks(tasks)
+    best_i, best_f1, pooled = 0, -np.inf, None
     for ci in range(len(combos)):
         P = np.vstack(probas[ci * len(splits):(ci + 1) * len(splits)])
         f1 = f1_score(y_all, np.argmax(P, axis=1), average="macro")
@@ -1704,13 +1728,151 @@ class StackedEnsemble:
         return self.meta_.predict(self._meta_features(X, self.bases_))
 
 
+def _run_cv_model(name: str, estimator, grid, X, ye, groups_arr,
+                  all_splits, classes, binary, pos_idx, seed,
+                  n_folds_total, progress=None, turbo=False
+                  ) -> tuple[ModelResult, tuple]:
+    """One model through every fold; returns (result, template).
+    Module-level (not a closure) so the concurrent-models loky pool can
+    pickle it as a task (2026-09-12 speed program) — results identical
+    to the previous in-function closure (pinned by
+    test_parallel_models_match_serial)."""
+    res = ModelResult(name=name, classes=classes)
+    fold_metrics: list[dict[str, dict[str, float]]] = []
+    cm_total = np.zeros((len(classes), len(classes)), dtype=int)
+    # OOF probabilities pooled (averaged) across repeats, matching the
+    # pooled confusion matrices — a plain `oof[te] = proba` would keep
+    # only the last repeat's probabilities
+    oof_sum = np.zeros((len(ye), len(classes)))
+    oof_cnt = np.zeros(len(ye))
+    param_list: list[dict] = []
+    param_counter: Counter = Counter()
+    best_tpl: tuple | None = None
+    try:
+        for fold_i, (tr, te) in enumerate(all_splits, start=1):
+            if progress:
+                progress(f"{name}: fold {fold_i}/{n_folds_total}"
+                         + (" (grouped)" if groups_arr is not None else ""))
+            Xtr, ytr, Xte, yte = X[tr], ye[tr], X[te], ye[te]
+            groups_tr = (groups_arr[tr]
+                         if groups_arr is not None else None)
+
+            min_tr = min(Counter(ytr.tolist()).values())
+            params: dict = {}
+            thr = None
+            stacked_thr_pending = False
+            # inner split for hyperparams + (binary) threshold tuning
+            # (grouped as well when patient groups are given)
+            inner_k = int(min(3, min_tr))
+            if groups_tr is not None:
+                inner_k = int(min(inner_k, len(set(groups_tr.tolist()))))
+            if min_tr >= 2 and inner_k >= 2:
+                if groups_tr is not None:
+                    inner = StratifiedGroupKFold(
+                        n_splits=inner_k, shuffle=True,
+                        random_state=seed)
+                else:
+                    inner = StratifiedKFold(n_splits=inner_k,
+                                            shuffle=True,
+                                            random_state=seed)
+                # ONE inner-CV pass: hyperparams AND the binary
+                # threshold both come from pooled inner-OOF
+                # predictions (no second cross_val_predict, no
+                # throwaway refit — see _tune_inner)
+                if binary and isinstance(estimator, StackedEnsemble):
+                    # A5: the stacked's own meta-OOF (computed in
+                    # fit, nearly free) tunes the threshold after
+                    # the fold refit — skips 3 full stacked refits
+                    params, thr = {}, None
+                    stacked_thr_pending = True
+                else:
+                    params, thr = _tune_inner(
+                        estimator, grid, Xtr, ytr, inner,
+                        pos_idx=pos_idx if binary else None,
+                        groups=groups_tr,
+                        serial=_NOT_THREAD_SAFE(name),
+                        halve=turbo)
+                param_list.append(params)
+                param_counter[str(sorted(params.items()))] += 1
+                if binary and not stacked_thr_pending:
+                    res.thresholds.append(thr)
+            else:
+                params, thr = {}, None
+                param_list.append(params)
+                param_counter[str(sorted(params.items()))] += 1
+
+            # refit best hyperparams on the whole training fold
+            final = fit_maybe_grouped(
+                clone(estimator).set_params(**params), Xtr, ytr,
+                groups_tr)
+            if binary and stacked_thr_pending:
+                # A5: threshold from the fitted stack's meta-OOF
+                mo = getattr(final, "meta_oof_", None)
+                if mo is not None:
+                    try:
+                        scores = mo[:, pos_idx]
+                        yv = (ytr == pos_idx).astype(int)
+                        if 0 < int(yv.sum()) < len(yv):
+                            cand, _, _ = best_f1_threshold(yv, scores)
+                            pred_c = np.where(scores >= cand, pos_idx,
+                                              1 - pos_idx)
+                            pred_h = np.where(scores >= 0.5, pos_idx,
+                                              1 - pos_idx)
+                            if (f1_score(ytr, pred_c, average="macro")
+                                    > f1_score(ytr, pred_h,
+                                               average="macro")):
+                                thr = float(cand)
+                    except Exception:
+                        thr = None
+                res.thresholds.append(thr)
+            proba = final.predict_proba(Xte)
+            oof_sum[te] += proba
+            oof_cnt[te] += 1
+            if binary and thr is not None:
+                pred = np.where(proba[:, pos_idx] >= thr, pos_idx, 1 - pos_idx)
+            else:
+                # classes encoded 0..C-1, proba columns follow that order
+                pred = np.argmax(proba, axis=1)
+
+            cm = confusion_matrix(yte, pred, labels=range(len(classes)))
+            cm_total += cm
+            fold_metrics.append(class_metrics_from_cm(cm))
+            res.fold_f1.append(float(f1_score(yte, pred,
+                                              average="macro")))
+        _aggregate(res, fold_metrics, cm_total)
+        oof = np.full((len(ye), len(classes)), np.nan)
+        seen = oof_cnt > 0
+        oof[seen] = oof_sum[seen] / oof_cnt[seen, None]
+        res.oof_proba = oof
+        res.y_true_encoded = ye
+        res.groups = list(groups_arr) if groups_arr is not None else None
+        if binary and res.thresholds:
+            valid = [t for t in res.thresholds if t is not None]
+            res.threshold = float(np.median(valid)) if valid else None
+        # refit on all data with the most frequently chosen hyperparams
+        if param_list:
+            best_key = param_counter.most_common(1)[0][0]
+            best_params = next(p for p in param_list
+                               if str(sorted(p.items())) == best_key)
+            res.pipeline = fit_maybe_grouped(
+                clone(estimator).set_params(**best_params), X, ye,
+                groups_arr)
+            best_tpl = (estimator, best_params)
+    except Exception:
+        res.error = traceback.format_exc()
+        if progress:
+            progress(f"{name}: FAILED")
+    return res, best_tpl
+
+
 def evaluate_models(X: np.ndarray, y: list[str],
                     model_names: list[str] | None = None,
                     k_folds: int = 5, seed: int = RANDOM_STATE,
                     progress_cb=None,
                     groups: list[str] | None = None,
                     repeats: int = 1,
-                    wavenumbers: np.ndarray | None = None
+                    wavenumbers: np.ndarray | None = None,
+                    turbo: bool = False,
                     ) -> tuple[list[ModelResult], ModelResult]:
     """
     Evaluate all selected models with stratified k-fold CV.
@@ -1790,142 +1952,68 @@ def evaluate_models(X: np.ndarray, y: list[str],
     total_work = len(specs) * n_folds_total
     done = 0
 
-    # ------------------------------------------------------------------ CV
-    def run_cv(name: str, estimator, grid) -> tuple[ModelResult, tuple]:
-        """One model through every fold; returns (result, template)."""
-        nonlocal done
-        res = ModelResult(name=name, classes=classes)
-        fold_metrics: list[dict[str, dict[str, float]]] = []
-        cm_total = np.zeros((len(classes), len(classes)), dtype=int)
-        # OOF probabilities pooled (averaged) across repeats, matching the
-        # pooled confusion matrices — a plain `oof[te] = proba` would keep
-        # only the last repeat's probabilities
-        oof_sum = np.zeros((len(ye), len(classes)))
-        oof_cnt = np.zeros(len(ye))
-        param_list: list[dict] = []
-        param_counter: Counter = Counter()
-        best_tpl: tuple | None = None
-        try:
-            for fold_i, (tr, te) in enumerate(all_splits, start=1):
-                if progress_cb:
-                    progress_cb(
-                        int(100 * done / total_work),
-                        f"{name}: fold {fold_i}/{n_folds_total}"
-                        + (" (grouped)" if groups is not None else ""))
-                Xtr, ytr, Xte, yte = X[tr], ye[tr], X[te], ye[te]
-                groups_tr = (np.asarray(groups)[tr]
-                             if groups is not None else None)
-
-                min_tr = min(Counter(ytr.tolist()).values())
-                params: dict = {}
-                thr = None
-                stacked_thr_pending = False
-                # inner split for hyperparams + (binary) threshold tuning
-                # (grouped as well when patient groups are given)
-                inner_k = int(min(3, min_tr))
-                if groups_tr is not None:
-                    inner_k = int(min(inner_k, len(set(groups_tr.tolist()))))
-                if min_tr >= 2 and inner_k >= 2:
-                    if groups_tr is not None:
-                        inner = StratifiedGroupKFold(
-                            n_splits=inner_k, shuffle=True,
-                            random_state=seed)
-                    else:
-                        inner = StratifiedKFold(n_splits=inner_k,
-                                                shuffle=True,
-                                                random_state=seed)
-                    # ONE inner-CV pass: hyperparams AND the binary
-                    # threshold both come from pooled inner-OOF
-                    # predictions (no second cross_val_predict, no
-                    # throwaway refit — see _tune_inner)
-                    if binary and isinstance(estimator, StackedEnsemble):
-                        # A5: the stacked's own meta-OOF (computed in
-                        # fit, nearly free) tunes the threshold after
-                        # the fold refit — skips 3 full stacked refits
-                        params, thr = {}, None
-                        stacked_thr_pending = True
-                    else:
-                        params, thr = _tune_inner(
-                            estimator, grid, Xtr, ytr, inner,
-                            pos_idx=pos_idx if binary else None,
-                            groups=groups_tr,
-                            serial=_NOT_THREAD_SAFE(name))
-                    param_list.append(params)
-                    param_counter[str(sorted(params.items()))] += 1
-                    if binary and not stacked_thr_pending:
-                        res.thresholds.append(thr)
-                else:
-                    params, thr = {}, None
-                    param_list.append(params)
-                    param_counter[str(sorted(params.items()))] += 1
-
-                # refit best hyperparams on the whole training fold
-                final = fit_maybe_grouped(
-                    clone(estimator).set_params(**params), Xtr, ytr,
-                    groups_tr)
-                if binary and stacked_thr_pending:
-                    # A5: threshold from the fitted stack's meta-OOF
-                    mo = getattr(final, "meta_oof_", None)
-                    if mo is not None:
-                        try:
-                            scores = mo[:, pos_idx]
-                            yv = (ytr == pos_idx).astype(int)
-                            if 0 < yv.sum() < len(yv):
-                                cand, _, _ = best_f1_threshold(yv, scores)
-                                pred_c = np.where(scores >= cand, pos_idx,
-                                                  1 - pos_idx)
-                                pred_h = np.where(scores >= 0.5, pos_idx,
-                                                  1 - pos_idx)
-                                if (f1_score(ytr, pred_c, average="macro")
-                                        > f1_score(ytr, pred_h,
-                                                   average="macro")):
-                                    thr = float(cand)
-                        except Exception:
-                            thr = None
-                    res.thresholds.append(thr)
-                proba = final.predict_proba(Xte)
-                oof_sum[te] += proba
-                oof_cnt[te] += 1
-                if binary and thr is not None:
-                    pred = np.where(proba[:, pos_idx] >= thr, pos_idx, 1 - pos_idx)
-                else:
-                    # classes encoded 0..C-1, proba columns follow that order
-                    pred = np.argmax(proba, axis=1)
-
-                cm = confusion_matrix(yte, pred, labels=range(len(classes)))
-                cm_total += cm
-                fold_metrics.append(class_metrics_from_cm(cm))
-                res.fold_f1.append(float(f1_score(yte, pred,
-                                                  average="macro")))
-                done += 1
-            _aggregate(res, fold_metrics, cm_total)
-            oof = np.full((len(ye), len(classes)), np.nan)
-            seen = oof_cnt > 0
-            oof[seen] = oof_sum[seen] / oof_cnt[seen, None]
-            res.oof_proba = oof
-            res.y_true_encoded = ye
-            res.groups = list(groups) if groups is not None else None
-            if binary and res.thresholds:
-                valid = [t for t in res.thresholds if t is not None]
-                res.threshold = float(np.median(valid)) if valid else None
-            # refit on all data with the most frequently chosen hyperparams
-            if param_list:
-                best_key = param_counter.most_common(1)[0][0]
-                best_params = next(p for p in param_list
-                                   if str(sorted(p.items())) == best_key)
-                res.pipeline = fit_maybe_grouped(
-                    clone(estimator).set_params(**best_params), X, ye,
-                    np.asarray(groups) if groups is not None else None)
-                best_tpl = (estimator, best_params)
-        except Exception:
-            res.error = traceback.format_exc()
-            if progress_cb:
-                progress_cb(int(100 * done / total_work), f"{name}: FAILED")
-        return res, best_tpl
 
     pipelines: dict[str, tuple] = {}
+    groups_arr = (np.asarray(groups) if groups is not None else None)
+
+    def run_cv(name: str, estimator, grid) -> tuple[ModelResult, tuple]:
+        """Serial path: exact % progress via the shared fold counter."""
+        nonlocal done
+
+        def _pct(msg: str):
+            progress_cb(int(100 * done / total_work), msg)
+        res, tpl = _run_cv_model(name, estimator, grid, X, ye, groups_arr,
+                                 all_splits, classes, binary, pos_idx,
+                                 seed, n_folds_total, progress=_pct
+                                 if progress_cb else None, turbo=turbo)
+
+        def _count(res):       # fold count for the % progress baseline
+            return len(res.fold_f1)
+        done += _count(res)
+        return res, tpl
+
+    # ---- concurrent model evaluation (2026-09-12 speed program) -----
+    # Models WITHOUT internal thread pools (the linear/algebra family:
+    # PCA+SVM/LDA/LogReg/KNN/NB/MLP/PLS) cannot use the cores alone —
+    # those run their whole CV CONCURRENTLY in threads (the
+    # _tune_inner pattern, proven since 2026-09-05).  Models WITH
+    # internal pools (RF/ET/HGB/boosters/CNN) stay SERIAL: they
+    # already saturate every core by themselves — capping them to make
+    # room for concurrency measured 0.94-0.96x (bench 2026-09-12), and
+    # loky children pay ~2 GB of torch+booster imports each for 1.0x.
+    # Big multi-model selections gain the most (the linear block hides
+    # behind nothing instead of stacking); results are identical to
+    # serial (pinned by test_parallel_models_match_serial).
+    _INTERNAL_POOL = ("Random Forest", "Extra Trees", "Peak bands",
+                      "Hist Gradient", "Isolation", "CatBoost",
+                      "XGBoost", "LightGBM", "1D-CNN", "TabPFN",
+                      "Ensemble", "Stacked")
+    threadable = [s for s in base_specs
+                  if not any(k in s["name"] for k in _INTERNAL_POOL)]
+    ran: dict[str, tuple[ModelResult, tuple]] = {}
+    if len(threadable) > 1:
+        n_threads = min(4, os.cpu_count() or 1)
+        from joblib import Parallel, delayed
+        gen = Parallel(n_jobs=n_threads, prefer="threads",
+                       return_as="generator")(
+            delayed(_run_cv_model)(
+                s["name"], s["estimator"], s["grid"], X, ye, groups_arr,
+                all_splits, classes, binary, pos_idx, seed, n_folds_total,
+                progress=None, turbo=turbo)
+            for s in threadable)
+        n_thr = len(threadable)
+        for i, out in enumerate(gen, start=1):
+            ran[out[0].name] = out
+            if progress_cb:
+                progress_cb(int(100 * i / n_thr),
+                            f"{out[0].name}: done "
+                            f"({i}/{n_thr} models, concurrent)")
     for spec in base_specs:
-        res, tpl = run_cv(spec["name"], spec["estimator"], spec["grid"])
+        if spec["name"] in ran:
+            res, tpl = ran[spec["name"]]
+        else:
+            res, tpl = run_cv(spec["name"], spec["estimator"],
+                              spec["grid"])
         if tpl:
             pipelines[spec["name"]] = tpl
         results.append(res)
@@ -1997,24 +2085,20 @@ def region_importance_shap(X, y, groups, wn, seed: int = RANDOM_STATE,
     (wn, signed_importance, bands) where positive importance pushes the
     prediction toward the positive class (sorted classes[1]) and bands
     are (center_cm1, share, name) of the top contributing regions.
+
+    The surrogate RF + TreeExplainer + mean signed SHAP are CACHED per
+    (X, seed, n_estimators): the auto battery used to refit the same
+    RF-300 + full TreeSHAP up to three times back-to-back (regions ->
+    band agreement -> biochemistry) and once more per local-explain
+    click (2026-09-12 speed program).
     """
     from scipy.ndimage import uniform_filter1d
 
     classes_ = sorted(set(y))
     ye = _encode(list(y), classes_)
-    est = RandomForestClassifier(
-        n_estimators=300, class_weight="balanced", n_jobs=-1,
-        random_state=seed).fit(np.asarray(X), ye)
-
-    import shap
-    expl = shap.TreeExplainer(est)
-    sv = expl.shap_values(np.asarray(X), check_additivity=False)
-    if isinstance(sv, list):                       # classic list layout
-        sv_pos = sv[1] if len(classes_) == 2 else sv[-1]
-    else:                                          # (n, features, classes)
-        sv = np.asarray(sv)
-        sv_pos = sv[..., -1]
-    signed = np.asarray(sv_pos).mean(axis=0)       # mean signed SHAP
+    est, _expl, sv_pos_mean = _surrogate_shap(
+        X, ye, seed=seed)
+    signed = sv_pos_mean                       # mean signed SHAP (cached)
     wn = np.asarray(wn, dtype=float)
     smooth = int(max(1, min(smooth, len(signed))))
     signed_s = uniform_filter1d(signed, smooth)
@@ -2036,6 +2120,64 @@ def region_importance_shap(X, y, groups, wn, seed: int = RANDOM_STATE,
     return wn, signed_s, bands
 
 
+# session-level surrogate-SHAP cache: key -> (RF, TreeExplainer, mean
+# signed SHAP over all rows).  Small (a fitted RF-300 + tree paths);
+# three training-matrices deep is plenty for regions + band agreement
+# + biochemistry + local explain on the same winner.
+_SURROGATE_CACHE: dict[tuple, tuple] = {}
+_SURROGATE_CACHE_MAX = 3
+
+
+def clear_surrogate_cache():
+    _SURROGATE_CACHE.clear()
+
+
+def _surrogate_key(X, seed: int, n_estimators: int) -> tuple:
+    return (hash(np.asarray(X).tobytes()), int(seed), int(n_estimators))
+
+
+def _surrogate_shap(X, y_encoded, seed: int = RANDOM_STATE,
+                    n_estimators: int = 300):
+    """Fit (or reuse) the tree surrogate + TreeExplainer for X.  One fit
+    per training matrix — shared by region importance, band agreement,
+    biochemistry and the Result-page local explanation.  n_jobs=1
+    deliberately (gotcha #25: loky pools beside the live Qt loop are
+    the native-crash race; the cache makes the single fit pay off)."""
+    key = _surrogate_key(X, seed, n_estimators)
+    hit = _SURROGATE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    # n_jobs=1: these diagnostics run from a GUI QThread — an all-core
+    # loky pool next to the live Qt main loop is the native-crash race
+    # that killed the app on 2026-09-12 (gotcha #25; fits are seconds)
+    est = RandomForestClassifier(
+        n_estimators=n_estimators, class_weight="balanced", n_jobs=1,
+        random_state=seed).fit(np.asarray(X), y_encoded)
+    import shap
+    expl = shap.TreeExplainer(est)
+    sv = expl.shap_values(np.asarray(X), check_additivity=False)
+    if isinstance(sv, list):                       # classic list layout
+        sv_pos = sv[-1]
+    else:                                          # (n, features, classes)
+        sv = np.asarray(sv)
+        sv_pos = sv[..., -1]
+    mean_signed = np.asarray(sv_pos).mean(axis=0)
+    if len(_SURROGATE_CACHE) >= _SURROGATE_CACHE_MAX:
+        _SURROGATE_CACHE.pop(next(iter(_SURROGATE_CACHE)))
+    _SURROGATE_CACHE[key] = (est, expl, mean_signed)
+    return est, expl, mean_signed
+
+
+def surrogate_explainer(X, y, seed: int = RANDOM_STATE,
+                        n_estimators: int = 300):
+    """Fitted surrogate RF + shap.TreeExplainer for (X, y) — the shared
+    cache behind 'Explain this prediction': the Result page used to
+    refit RF-300 + rebuild the explainer on every click."""
+    classes_ = sorted(set(y))
+    ye = _encode(list(y), classes_)
+    return _surrogate_shap(X, ye, seed=seed, n_estimators=n_estimators)[:2]
+
+
 def region_importance(X, y, groups, wn, seed: int = RANDOM_STATE,
                       smooth: int = 21, n_bands: int = 5):
     """
@@ -2052,7 +2194,7 @@ def region_importance(X, y, groups, wn, seed: int = RANDOM_STATE,
     from scipy.ndimage import uniform_filter1d
 
     est = RandomForestClassifier(
-        n_estimators=400, class_weight="balanced", n_jobs=-1,
+        n_estimators=400, class_weight="balanced", n_jobs=1,
         random_state=seed).fit(np.asarray(X), _encode(list(y),
                                                       sorted(set(y))))
     imp = np.asarray(est.feature_importances_, dtype=float)
@@ -2134,7 +2276,8 @@ def mcnemar_test(y_true, pred_a, pred_b):
 
 def evaluate_pipeline(X_raw: np.ndarray, wn: np.ndarray, y: list[str],
                       groups: list[str] | None = None, k: int = 5,
-                      seed: int = RANDOM_STATE, progress=None
+                      seed: int = RANDOM_STATE, progress=None,
+                      turbo: bool = False
                       ) -> dict:
     """
     UNBIASED end-to-end evaluation: inside every outer patient-grouped
@@ -2184,7 +2327,8 @@ def evaluate_pipeline(X_raw: np.ndarray, wn: np.ndarray, y: list[str],
         sub = optimize.optimize_preprocessing(
             X_raw[tr], wn, [y[i] for i in tr],
             groups=(None if g_arr is None else g_arr[tr].tolist()),
-            grid=grid, k=3, seed=seed, progress=lambda m: None)
+            grid=grid, k=(2 if turbo else 3), seed=seed,
+            progress=lambda m: None)
         params, model_name = sub["params"], sub["best"]["model"]
         Xtr = pp.preprocess_matrix(X_raw[tr], params, wn=wn)
         Xte = pp.preprocess_matrix(X_raw[te], params, wn=wn)
@@ -2265,21 +2409,79 @@ def evaluate_pipeline(X_raw: np.ndarray, wn: np.ndarray, y: list[str],
             "cm": cm, **supp}
 
 
+def _lc_fraction(X, y_encoded, groups, frac_index: int, frac: float,
+                 k: int, seed: int, estimator):
+    """One learning-curve point (patient subset + grouped CV), runnable
+    in a loky child (2026-09-12 speed program).  Bit-identical to the
+    serial loop: the serial code shuffles the patient list ONCE with a
+    seeded rng and every fraction takes a prefix of that permutation —
+    this child replays the same single shuffle."""
+    import study_stats as ss
+    from sklearn.metrics import f1_score
+
+    ss._pin_child()
+    est0 = ss._cap_native_threads(clone(estimator),
+                                  ss._threads_budget())
+    groups = np.asarray(groups)
+    uniq = np.unique(groups)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(uniq)
+    take = uniq[:max(2, int(round(len(uniq) * frac)))]
+    m = np.isin(groups, take)
+    Xs, ys, gs = X[m], np.asarray(y_encoded)[m], groups[m]
+    kk = int(min(k, len(take)))
+    if kk < 2 or min(Counter(ys.tolist()).values()) < 2:
+        return None                      # not enough patients for k folds
+    sgkf = StratifiedGroupKFold(n_splits=kk, shuffle=True,
+                                random_state=seed)
+    f1s = []
+    for tr, te in sgkf.split(Xs, ys, gs):
+        est = clone(est0)
+        est.fit(Xs[tr], ys[tr])
+        f1s.append(f1_score(ys[te], est.predict(Xs[te]),
+                            average="macro"))
+    return len(take), float(np.mean(f1s)), float(np.std(f1s))
+
+
 def learning_curve_by_groups(X, y_encoded, groups, estimator,
                              k: int = 5, seed: int = RANDOM_STATE,
                              fractions=(0.25, 0.50, 0.75, 1.0),
-                             cancel_check=None, progress=None):
+                             cancel_check=None, progress=None, jobs: int = 1):
     """
     Grouped-CV macro-F1 at a growing number of patients — the classic
-    diagnostic for 'how much would more data be worth?'.
+    diagnostic for 'how much would more data worth?'.
 
     Returns (n_patients_list, mean_f1_list, std_f1_list).
-    `cancel_check` (callable -> bool) aborts between folds with
-    RuntimeError('diagnostics cancelled by user'); `progress(msg)`
-    fires per fraction (2026-09-06: chain winners make this slow —
-    the user must see movement).
+    `jobs` > 1 evaluates the fractions concurrently in the thread-
+    pinned loky pool (bit-identical to serial — same rng trajectory,
+    same seeds; 2026-09-12 speed program).
+    `cancel_check` aborts between points with RuntimeError('diagnostics
+    cancelled by user'); `progress(msg)` fires per fraction
+    (2026-09-06: chain winners make this slow — the user must see
+    movement).
     """
     from sklearn.metrics import f1_score
+
+    if jobs > 1 and len(fractions) > 1:
+        from joblib import Parallel, delayed
+        from study_stats import (_clear_threads_budget, _drain,
+                                 _set_threads_budget)
+        _set_threads_budget(jobs)
+        try:
+            gen = Parallel(n_jobs=jobs, max_nbytes=100,
+                           prefer="processes", return_as="generator")(
+                delayed(_lc_fraction)(X, y_encoded, groups, i, f, k, seed,
+                                      estimator)
+                for i, f in enumerate(fractions))
+            pts = _drain(gen, len(fractions), cancel_check, progress,
+                         fmt=lambda i, r: (
+                             f"{r[0]} patients: F1 {r[1]:.3f} ± {r[2]:.3f}"
+                             if r is not None else f"point {i} skipped"))
+        finally:
+            _clear_threads_budget()
+        pts = [p for p in pts if p is not None]
+        return ([p[0] for p in pts], [p[1] for p in pts],
+                [p[2] for p in pts])
 
     groups = np.asarray(groups)
     uniq = np.unique(groups)

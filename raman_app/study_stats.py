@@ -23,6 +23,8 @@ Pure numpy/scipy/sklearn; no new dependencies.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 # Nemenyi q_alpha (alpha=0.05) for k=2..10 classifiers, from the
@@ -66,15 +68,104 @@ def bh_fdr(pvals: list[float]) -> list[float]:
 # --------------------------------------------------------------------------
 # Leave-one-patient-out
 # --------------------------------------------------------------------------
-def _lopo_fit_predict(X, ye, tr, te, estimator, params):
-    """Worker: one LOPO fold (fit on all-but-one patient, predict the
-    left-out one).  Runs inside a loky child — threads pinned to 1 so
-    N workers don't oversubscribe the CPU (same pattern as the 3SSE
-    search workers)."""
+def _threads_budget() -> int:
+    """Per-child native-thread budget, set by the pool parent via the
+    inherited RAMAN_DIAG_THREADS env (cores // workers): N children x
+    all-core pools thrash, N x one thread starves — cores//workers
+    keeps the machine exactly busy."""
+    try:
+        return max(1, int(os.environ.get("RAMAN_DIAG_THREADS", "1")))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _set_threads_budget(jobs: int):
+    os.environ["RAMAN_DIAG_THREADS"] = str(
+        max(1, (os.cpu_count() or 4) // max(1, jobs)))
+
+
+def _clear_threads_budget():
+    os.environ.pop("RAMAN_DIAG_THREADS", None)
+
+
+def _pin_child():
+    """Child-side env pins for diagnostics pools: one thread per native
+    pool + CPU device mode (2026-09-12 speed program — the PROVEN 3SSE
+    recipe: loky children, thread-pinned, RAM-capped, never touching
+    CUDA).  ONLY called from pool-task wrappers: setting these in the
+    GUI parent would flip the session's live device mode."""
     import os
-    from sklearn.base import clone
+    os.environ.setdefault("RAMAN_DEVICE", "cpu")
     for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(_v, "1")
+
+
+def _cap_native_threads(est, n: int = 1):
+    """as_env_device semantics without importing modeling (children stay
+    light): cap every n_jobs / thread_count param, at any pipeline
+    depth, so N workers never oversubscribe the CPU.  `n` > 1 spreads a
+    known core budget across the pool (e.g. cores/jobs per child)."""
+    try:
+        updates = {}
+        for key, val in est.get_params(deep=True).items():
+            if key == "n_jobs" or key.endswith("__n_jobs"):
+                if val not in (None, 1) and val != n:
+                    updates[key] = n
+            elif (key == "thread_count"
+                  or key.endswith("__thread_count")):
+                if val != n:
+                    updates[key] = n
+        if updates:
+            est = est.set_params(**updates)
+    except Exception:
+        pass
+    return est
+
+
+def _diag_jobs(requested: int = -1) -> int:
+    """RAM-capped worker count for a diagnostics pool (deferred import —
+    sequential pulls the heavy stack; any failure degrades to serial)."""
+    try:
+        from sequential import _safe_jobs
+        return max(1, _safe_jobs(requested))
+    except Exception:
+        return 1
+
+
+def _drain(gen, n: int, cancel_check, progress, fmt=None, what: str = "task"):
+    """Consume a joblib `return_as="generator"` pool with live progress
+    and cooperative cancel: cancel raises the standard diagnostics-
+    cancelled error; abandoning the generator shuts its executor down
+    (running tasks finish, queued ones are skipped)."""
+    results = []
+    try:
+        for res in gen:
+            if cancel_check is not None and cancel_check():
+                raise RuntimeError("diagnostics cancelled by user")
+            results.append(res)
+            if progress is not None:
+                progress(fmt(len(results), res) if fmt is not None
+                         else f"{what} {len(results)}/{n}")
+    finally:
+        close = getattr(gen, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
+    return results
+
+
+def _lopo_fit_predict(X, ye, tr, te, estimator, params, pin=False,
+                      threads: int = 1):
+    """One LOPO fold (fit on all-but-one patient, predict the left-out
+    one).  `pin=True` (pool tasks only) pins the child env + caps the
+    estimator's native pools; the SERIAL path runs unpinned in the
+    parent — the live session device mode must never be touched."""
+    from sklearn.base import clone
+    if pin:
+        _pin_child()
+        estimator = _cap_native_threads(estimator, threads)
     est = clone(estimator)
     if params:
         est = est.set_params(**params)
@@ -82,22 +173,44 @@ def _lopo_fit_predict(X, ye, tr, te, estimator, params):
     return te, est.predict_proba(X[te])
 
 
+def _lopo_task(X, ye, tr, te, estimator, params):
+    """Pool wrapper: pinned child, thread-budget-capped pools (N
+    workers never oversubscribe the CPU)."""
+    return _lopo_fit_predict(X, ye, tr, te, estimator, params, pin=True,
+                             threads=_threads_budget())
+
+
+def _seed_f1(X, ye, groups, estimator, params, k: int, seed: int) -> float:
+    """One seed-stability point, runnable in a loky child."""
+    from sklearn.base import clone
+    _pin_child()
+    return _grouped_f1(
+        X, ye, groups,
+        _cap_native_threads(clone(estimator), _threads_budget()),
+        params, k, seed)
+
+
 def lopo_evaluate(X, y, groups, estimator, params: dict,
                   classes: list[str], seed: int = 0,
-                  jobs: int = 1, cancel_check=None, progress=None) -> dict:
+                  jobs: int = 1, cancel_check=None, progress=None,
+                  stride: int = 1) -> dict:
     """
     Refit `estimator` (with fixed `params`, no re-tuning) once per
     left-out PATIENT and evaluate every patient unseen.  Returns pooled
     metrics + per-patient accuracy rows.  This is the strictest
     generalization check available on a small paired dataset.
 
-    `jobs` > 1 validates folds in a joblib process pool — DEFAULT 1
-    (serial): the measured rejection stands (tree winners refit with
-    n_jobs=-1 internally; process × thread oversubscription lost more
-    than the parallelism won, §16b-A4).  `cancel_check` (callable ->
-    bool) aborts between patients with RuntimeError('diagnostics
-    cancelled by user') — long chain winners make LOPO run for a long
-    time and users need a way out (2026-09-06).
+    `jobs` > 1 validates folds in a joblib PROCESS pool (generator
+    mode: live progress + cooperative cancel preserved) — the 3SSE-
+    proven recipe, thread-pinned children.  Tree winners (RF / Extra
+    Trees, internal n_jobs=-1) should keep jobs=1: process x thread
+    oversubscription lost more than the parallelism won (§16b-A4).
+    `stride` > 1 evaluates only every stride-th patient — the TURBO
+    estimate, reported as such by the caller.
+    `cancel_check` (callable -> bool) aborts between patients with
+    RuntimeError('diagnostics cancelled by user') — long chain winners
+    make LOPO run for a long time and users need a way out
+    (2026-09-06).
     """
     from sklearn.metrics import (confusion_matrix, f1_score,
                                  roc_auc_score)
@@ -107,14 +220,29 @@ def lopo_evaluate(X, y, groups, estimator, params: dict,
     y = list(y)
     lut = {c: i for i, c in enumerate(classes)}
     ye = np.array([lut[v] for v in y], dtype=int)
+    patients = sorted(set(groups.tolist()))
+    if stride > 1:
+        patients = patients[::stride]
     tasks = []
-    for g in sorted(set(groups.tolist())):
+    for g in patients:
         te = np.flatnonzero(groups == g)
         tr = np.flatnonzero(groups != g)
         if len(tr) == 0 or len(set(ye[tr].tolist())) < 2:
             continue
         tasks.append((X, ye, tr, te, estimator, params))
-    if cancel_check is not None or progress is not None:
+    if jobs > 1 and len(tasks) > 1:
+        from joblib import Parallel, delayed
+        _set_threads_budget(jobs)
+        try:
+            gen = Parallel(n_jobs=jobs, max_nbytes=100,
+                           prefer="processes", return_as="generator")(
+                delayed(_lopo_task)(X, ye, tr, te, estimator, params)
+                for X, ye, tr, te, estimator, params in tasks)
+            results = _drain(gen, len(tasks), cancel_check, progress,
+                             what="patient")
+        finally:
+            _clear_threads_budget()
+    else:
         results = []
         for i, t in enumerate(tasks):
             if cancel_check is not None and cancel_check():
@@ -122,10 +250,6 @@ def lopo_evaluate(X, y, groups, estimator, params: dict,
             if progress is not None:
                 progress(f"patient {i + 1}/{len(tasks)}")
             results.append(_lopo_fit_predict(*t))
-    else:
-        from joblib import Parallel, delayed
-        results = Parallel(n_jobs=jobs)(
-            delayed(_lopo_fit_predict)(*t) for t in tasks)
     per_patient = []
     y_true, y_pred, y_score = [], [], []
     for (te, proba) in results:
@@ -270,14 +394,30 @@ def _grouped_f1(X, ye, groups, estimator, params, k: int, seed: int,
 
 def seed_stability(X, y, groups, estimator, params, classes: list[str],
                    seeds=(0, 1, 2, 3, 4), k: int = 5,
-                   cancel_check=None, progress=None) -> list[float]:
+                   cancel_check=None, progress=None, jobs: int = 1
+                   ) -> list[float]:
     """Macro-F1 of the fixed winner across several CV seeds.
-    `cancel_check` (callable -> bool) aborts between seeds with
-    RuntimeError('diagnostics cancelled by user').  `progress(msg)`
-    is called after every seed (2026-09-06: chain winners make this
-    take minutes — the user must SEE movement)."""
+    `jobs` > 1 evaluates seeds concurrently in the thread-pinned loky
+    pool (2026-09-12 speed program; identical results — same seeds,
+    same folds).  `cancel_check` aborts with RuntimeError('diagnostics
+    cancelled by user'); `progress(msg)` fires after every seed
+    (2026-09-06: chain winners make this take minutes — the user must
+    SEE movement)."""
     lut = {c: i for i, c in enumerate(classes)}
     ye = np.array([lut[v] for v in y], dtype=int)
+    if jobs > 1 and len(seeds) > 1:
+        from joblib import Parallel, delayed
+        _set_threads_budget(jobs)
+        try:
+            gen = Parallel(n_jobs=jobs, max_nbytes=100,
+                           prefer="processes", return_as="generator")(
+                delayed(_seed_f1)(X, ye, groups, estimator, params, k, s)
+                for s in seeds)
+            return _drain(
+                gen, len(seeds), cancel_check, progress,
+                fmt=lambda i, f: f"seed {i}/{len(seeds)}: F1 {f:.3f}")
+        finally:
+            _clear_threads_budget()
     out = []
     for i, s in enumerate(seeds):
         if cancel_check is not None and cancel_check():
@@ -362,6 +502,12 @@ def patient_level_metrics(y, groups, oof_proba) -> dict | None:
         return None
     y = list(y)
     groups = np.asarray(groups)
+    if not (len(y) == len(groups) == len(oof)):
+        # restored winners carry their TRAINING-TIME y/oof while groups
+        # can come from the freshly loaded session — a mixed rollup is
+        # meaningless, skip it instead of raising (2026-09-12 startup
+        # traceback on 3SSE-winner restore)
+        return None
     keep = ~np.isnan(oof).any(axis=1)
     oof, y, groups = oof[keep], [v for v, k in zip(y, keep, strict=True)
                                  if k], groups[keep]

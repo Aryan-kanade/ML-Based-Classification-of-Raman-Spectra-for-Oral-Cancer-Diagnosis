@@ -138,7 +138,7 @@ class TrainWorker(QtCore.QThread):
     failed = Signal(str)
 
     def __init__(self, X, y, model_names, k_folds, seed, parent=None,
-                 groups=None, repeats=1, wavenumbers=None):
+                 groups=None, repeats=1, wavenumbers=None, turbo=False):
         super().__init__(parent)
         self.X, self.y = X, y
         self.model_names = model_names
@@ -146,6 +146,7 @@ class TrainWorker(QtCore.QThread):
         self.groups = groups
         self.repeats = repeats
         self.wavenumbers = wavenumbers
+        self.turbo = turbo
 
     def run(self):
         try:
@@ -155,7 +156,7 @@ class TrainWorker(QtCore.QThread):
                 self.X, self.y, self.model_names, self.k_folds, self.seed,
                 progress_cb=lambda pct, msg: self.progress.emit(pct, msg),
                 groups=self.groups, repeats=self.repeats,
-                wavenumbers=self.wavenumbers)
+                wavenumbers=self.wavenumbers, turbo=self.turbo)
             self.done.emit(results, winner)
         except Exception:
             self.failed.emit(traceback.format_exc())
@@ -189,10 +190,12 @@ class PipelineWorker(QtCore.QThread):
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, X_raw, wn, y, groups, exclude, parent=None):
+    def __init__(self, X_raw, wn, y, groups, exclude, parent=None,
+                 turbo=False):
         super().__init__(parent)
         self.X_raw, self.wn, self.y = X_raw, wn, y
         self.groups, self.exclude = groups, exclude
+        self.turbo = turbo
 
     def run(self):
         try:
@@ -206,7 +209,7 @@ class PipelineWorker(QtCore.QThread):
             else:
                 X_raw, y, g = self.X_raw, self.y, self.groups
             out = modeling.evaluate_pipeline(
-                X_raw, self.wn, y, groups=g,
+                X_raw, self.wn, y, groups=g, turbo=self.turbo,
                 progress=lambda m: self.progress.emit(m))
             self.done.emit(out)
         except Exception:
@@ -1687,6 +1690,77 @@ class SeqResultsDialog(QtWidgets.QDialog):
             pw.on_seq_save(self.payload)
 
 
+class ErrorBanner(QtWidgets.QFrame):
+    """Persistent, non-modal error strip above the status bar (2026-09-12).
+    EVERY unexpected error — unhandled slot exceptions, worker failures,
+    save errors — lands here with its message and an expandable
+    traceback; nothing fails into session.log invisibly anymore.  The
+    first error of a session also gets a modal dialog (excepthook);
+    later ones rely on this strip + the ⚠ counter in the status bar, so
+    an error storm can never spam modal boxes."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ErrorBanner")
+        self.setStyleSheet(
+            "QFrame#ErrorBanner { background:#fef2f2; "
+            "border:1px solid #fca5a5; border-left:4px solid #dc2626; "
+            "border-radius:0; }"
+            "QFrame#ErrorBanner QLabel { color:#991b1b; font-weight:600; }"
+            "QFrame#ErrorBanner QPushButton { border:none; color:#b91c1c; "
+            "font-weight:700; padding:2px 8px; }"
+            "QFrame#ErrorBanner QPushButton:hover { background:#fee2e2; }")
+        self.setVisible(False)
+        self._tb = ""
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(12, 6, 12, 6)
+        v.setSpacing(2)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        self.icon_lbl = QtWidgets.QLabel("⚠")
+        self.msg_lbl = QtWidgets.QLabel("")
+        self.msg_lbl.setWordWrap(True)
+        row.addWidget(self.icon_lbl)
+        row.addWidget(self.msg_lbl, 1)
+        self.b_details = QtWidgets.QPushButton("Details ▸")
+        self.b_copy = QtWidgets.QPushButton("Copy")
+        self.b_dismiss = QtWidgets.QPushButton("✕")
+        self.b_dismiss.setToolTip("Hide this strip (the ⚠ counter in the "
+                                  "status bar keeps the error count).")
+        for b in (self.b_details, self.b_copy, self.b_dismiss):
+            b.setCursor(qc.POINTING_HAND)
+            row.addWidget(b)
+        v.addLayout(row)
+        self.details = QtWidgets.QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setVisible(False)
+        self.details.setMaximumHeight(140)
+        self.details.setFont(qc.QtGui.QFont("Consolas", 9))
+        v.addWidget(self.details)
+        self.b_details.clicked.connect(self._toggle_details)
+        self.b_copy.clicked.connect(self._copy)
+        self.b_dismiss.clicked.connect(lambda: self.setVisible(False))
+
+    def _toggle_details(self):
+        on = not self.details.isVisible()
+        self.details.setVisible(on)
+        self.b_details.setText("Details ▾" if on else "Details ▸")
+
+    def _copy(self):
+        qc.QtGui.QApplication.clipboard().setText(
+            self.msg_lbl.text() + "\n\n" + self._tb)
+
+    def show_error(self, message: str, tb: str = ""):
+        """Replace the strip's content (the Activity log + session.log
+        keep the full history) and make it visible."""
+        self._tb = tb or ""
+        self.msg_lbl.setText(message)
+        if self.details.isVisible():
+            self.details.setPlainText(self._tb)
+        self.setVisible(True)
+        self.raise_()
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1758,6 +1832,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._diag_panels: dict[str, tuple] = {}   # key -> (frame,canvas,cap)
         self._winner_row = None                    # cm+roc side-by-side row
         self._diag_queue: list = []                # serial auto-run chain
+        # workers that outlived their retire-timeout (stuck native
+        # call): MUST stay referenced — GC'ing a running QThread aborts
+        # the process natively (gotcha #26)
+        self._zombie_workers: list = []
         # debounced live preprocess preview (started by _schedule_preview)
         self._preview_timer = QtCore.QTimer(self)
         self._preview_timer.setSingleShot(True)
@@ -1796,6 +1874,19 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self.log_dock.setVisible(
                 not self.log_dock.isVisible()))
         self.statusBar().addWidget(b_log)
+        # ⚠ error counter (2026-09-12): every surfaced error bumps it;
+        # clicking opens the Activity log where the full history lives
+        self._err_chip = QtWidgets.QPushButton("⚠ 0")
+        self._err_chip.setFlat(True)
+        self._err_chip.setVisible(False)
+        self._err_chip.setToolTip("Errors this session — click to open "
+                                  "the Activity log with the details.")
+        self._err_chip.setCursor(qc.POINTING_HAND)
+        self._err_chip.setStyleSheet("color:#b91c1c; font-weight:800; "
+                                     "padding:0 6px;")
+        self._err_chip.clicked.connect(
+            lambda: (self.log_dock.setVisible(True), self.log_dock.raise_()))
+        self.statusBar().addPermanentWidget(self._err_chip)
 
         self.log("Ready. Open your spectra folder on the Start page.")
 
@@ -2012,6 +2103,11 @@ class MainWindow(QtWidgets.QMainWindow):
         hbody.addWidget(main_col, 1)
 
         root.addWidget(body, 1)
+        # persistent error strip (2026-09-12): every unexpected error
+        # lands HERE with its message + expandable traceback — nothing
+        # fails into session.log invisibly anymore
+        self._err_banner = ErrorBanner(self)
+        root.addWidget(self._err_banner)
         self.setCentralWidget(central)
         self.statusBar().showMessage("Start: load your data folder")
 
@@ -3114,6 +3210,24 @@ class MainWindow(QtWidgets.QMainWindow):
             "chain's inner fits and run very long.")
         lc_row.addWidget(diag(b_all, self.run_all_diagnostics))
         lc_row.addWidget(self.chk_auto_diags)
+        # ⚡Turbo (2026-09-12 speed program): approximate-but-fast
+        # protocol for exploratory runs — successive-halved tuning
+        # grids, 2 seeds, 2 learning-curve points, every-other-patient
+        # LOPO, k=2 honest inner search.  Every turbo output is
+        # captioned so it can never be mistaken for the exact protocol.
+        self.chk_turbo = QtWidgets.QCheckBox("⚡Turbo (approximate)")
+        self.chk_turbo.setChecked(False)
+        self.chk_turbo.setToolTip(
+            "Faster approximate protocol for exploratory runs:\n"
+            "• tuning grids successive-halved (first inner fold ranks, "
+            "best half finish)\n"
+            "• honest check inner search 3→2 folds\n"
+            "• seed stability 5→2 seeds · learning curve 4→2 points\n"
+            "• LOPO on every 2nd patient (reported as an estimate)\n"
+            "Parallel diagnostics run either way.  UNTICK for the exact "
+            "protocol you report.\nEvery turbo result is captioned "
+            "'TURBO (approximate)'.")
+        lc_row.addWidget(self.chk_turbo)
         # always-reachable cancel for the running analysis (2026-09-06:
         # the busy box's Cancel only appeared when clicking ANOTHER
         # analysis button — during a long chain-winner diagnostic there
@@ -5211,6 +5325,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings["last_figure_dir"] = folder
         uh.save_settings(self.settings)
         saved = []
+        failed: list[tuple[str, str]] = []
         # 2026-09-12 graph audit: calibration + DCA were shown on the
         # page and embedded in the HTML report but never made it into
         # the PNG export set
@@ -5226,11 +5341,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 canvas.figure.savefig(path, dpi=200, bbox_inches="tight")
                 saved.append(path)
             except Exception as exc:
+                failed.append((name, str(exc)))
                 self.log(f"Saving {name} failed: {exc}")
         if saved:
             self.log(f"Saved {len(saved)} result figures to {folder}")
             self.statusBar().showMessage(
                 f"Saved {len(saved)} figures to {folder}")
+        # 2026-09-12: export failures used to be log-only — a read-only
+        # folder left the user with NO on-screen sign anything failed
+        if failed:
+            names = ", ".join(n for n, _e in failed)
+            self.show_error(
+                f"{len(failed)} of {len(saved) + len(failed)} figures "
+                f"could not be saved ({names})",
+                tb="\n".join(f"{n}: {e}" for n, e in failed))
+            if not saved:
+                QtWidgets.QMessageBox.critical(
+                    self, "Saving figures failed",
+                    "NONE of the result figures could be written to "
+                    f"{folder}.\n\nIs the folder writable? Technical "
+                    "details are in session.log next to the app.")
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self, "Some figures failed",
+                    f"{len(failed)} figure(s) could not be saved "
+                    f"({names}); {len(saved)} succeeded.\n\nTechnical "
+                    "details are in session.log next to the app.")
 
 
     def _deep_eval_lines(self) -> list[str]:
@@ -6597,6 +6733,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_optimize_failed(self, tb: str):
         self.optimize_status.setText("Optimization failed — see the log.")
         self.log(f"Optimization failed:\n{tb}")
+        self.show_error("Preprocessing optimization failed", tb=tb)
         QtWidgets.QMessageBox.warning(
             self, "Optimization failed",
             "Preprocessing optimization failed.\n\nTechnical details "
@@ -7045,6 +7182,76 @@ class MainWindow(QtWidgets.QMainWindow):
         if w is not None:
             w.progress.emit(str(msg))
 
+    def _turbo(self) -> bool:
+        """⚡Turbo results toggle (2026-09-12 speed program): lighter
+        approximate diagnostics — 2 seeds, 2 learning-curve points,
+        every-other-patient LOPO, k=2 inner search.  Every turbo output
+        is captioned TURBO so it can never be mistaken for the exact
+        protocol."""
+        return (getattr(self, "chk_turbo", None) is not None
+                and self.chk_turbo.isChecked())
+
+    def _diag_jobs_for_winner(self) -> int:
+        """Worker count for the parallel diagnostics: the 3SSE-proven
+        loky recipe, RAM-capped.  Tree-like winners keep jobs=1 — their
+        fits already use every core internally (n_jobs=-1) and process
+        × thread oversubscription measured SLOWER (§16b-A4);
+        chain/3SSE/GPU-model winners stay serial for safety."""
+        if self.winner is None:
+            return 1
+        name = str(getattr(self.winner, "name", ""))
+        if any(k in name for k in ("Random Forest", "Extra Trees",
+                                   "Peak bands", "Hist Gradient",
+                                   "1D-CNN", "TabPFN", "Ensemble",
+                                   "Stacked", "3SSE", "Isolation")):
+            return 1
+        return sstats._diag_jobs(-1)
+
+    def _retire_worker(self, attr: str, worker, label: str,
+                       timeout_ms: int = 10000) -> bool:
+        """Wait for a worker QThread, then clear its slot (2026-09-12).
+        If it is STILL running after the timeout (a stuck native call),
+        the reference moves to _zombie_workers and the slot stays
+        occupied: dropping the last Python reference would let the GC
+        delete a RUNNING QThread — Qt then aborts the whole process
+        natively ('QThread: Destroyed while thread is still running').
+        Returns True when the thread is safely finished."""
+        if worker is None:
+            return True
+        worker.wait(timeout_ms)
+        if worker.isRunning():
+            if worker not in self._zombie_workers:
+                self._zombie_workers.append(worker)
+            self.log(f"WARNING: '{label}' worker still running after "
+                     f"{timeout_ms / 1000:.0f} s — kept alive in the "
+                     f"background (slot {attr} stays occupied so nothing "
+                     "can overlap it; restart when convenient).")
+            self.show_error(
+                f"A background job ('{label}') is stuck",
+                tb="It did not finish in time and is being kept alive "
+                "safely in the background. The app keeps running, but "
+                "that job's slot stays busy until you restart — save "
+                "your work.\n\nTechnical details are in the Activity "
+                "log / session.log.")
+            return False
+        if getattr(self, attr, None) is worker:
+            setattr(self, attr, None)
+            # PARK the wrapper (bounded ring): dropping the last
+            # reference lets PyQt delete the C++ QThread WHILE its
+            # queued done-callback is still executing — the next
+            # diag's QObject.sender() then reads the freed object and
+            # Qt5Core access-violates (reproduced + faulthandler-pinned
+            # 2026-09-12: crash at _run_async's sender() straight after
+            # on_honest_done retired the honest worker; same family as
+            # the 17:05 crash).  A parked, finished thread costs
+            # nothing; old entries quietly age out of the ring.
+            park = getattr(self, "_retired_workers", None)
+            if park is None:
+                park = self._retired_workers = []
+            park.append(worker)
+            del park[:-8]
+        return True
+
     def _run_async(self, label: str, fn, on_done):
         """
         Run fn() on a worker thread; on_done(result) back on the UI
@@ -7078,8 +7285,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.b_cancel_analysis.setVisible(False)
 
         def finish(result):
-            worker.wait(10000)   # thread fully done before the chain
-            self._analysis_worker = None   # reuses / GCs this worker
+            self._retire_worker("_analysis_worker", worker, label)
             _idle()
             if has_btn:
                 btn.setEnabled(True)
@@ -7094,8 +7300,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._pop_diag_queue()          # serial chain continues
 
         def fail(tb: str):
-            worker.wait(10000)   # thread fully done before the chain
-            self._analysis_worker = None
+            self._retire_worker("_analysis_worker", worker, label)
             _idle()
             if has_btn:
                 btn.setEnabled(True)
@@ -7105,6 +7310,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.train_status.setText(f"{label} failed.")
                 self.log(f"{label} failed:\n{tb}")
+                self.show_error(f"{label} failed", tb=tb)
                 QtWidgets.QMessageBox.warning(
                     self, f"{label} failed",
                     f"{label} failed.\n\nTechnical details are in "
@@ -7142,6 +7348,9 @@ class MainWindow(QtWidgets.QMainWindow):
         def fn():
             return modeling.learning_curve_by_groups(
                 X, ye, gg, winner_pl, k=k, seed=seed,
+                fractions=((0.5, 1.0) if self._turbo()
+                           else (0.25, 0.50, 0.75, 1.0)),
+                jobs=self._diag_jobs_for_winner(),
                 cancel_check=self._diag_cancel.is_set,
                 progress=self._emit_progress)
 
@@ -7163,7 +7372,9 @@ class MainWindow(QtWidgets.QMainWindow):
                        "plateaued — adding more similar patients helps little")
             self._diag_caption(
                 panel, f"F1 {means[0]:.3f} → {means[-1]:.3f} from "
-                       f"{sizes[0]} to {sizes[-1]} patients — {verdict}.")
+                       f"{sizes[0]} to {sizes[-1]} patients — {verdict}."
+                       + (" · TURBO (approximate, 2 points)"
+                          if self._turbo() else ""))
             self.log(f"Learning curve: {len(sizes)} points from "
                      f"{sizes[0]} to {sizes[-1]} patients, "
                      f"F1 {means[0]:.3f} → "
@@ -7533,7 +7744,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log("Nested honest evaluation started (preprocessing "
                  "re-chosen inside every fold)")
         self._honest_worker = PipelineWorker(
-            self.X_raw, self.grid, self.labels, self.groups, exclude)
+            self.X_raw, self.grid, self.labels, self.groups, exclude,
+            turbo=self._turbo())
         self._honest_worker.progress.connect(
             lambda m: (self.statusBar().showMessage(m),
                        self.train_status.setText(m)))
@@ -7545,11 +7757,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_honest_done(self, out: dict):
         if self.b_honest_btn is not None:
             self.b_honest_btn.setEnabled(True)
-        if self._honest_worker is not None:
-            self._honest_worker.wait(10000)  # done before chain reuses it
-            self._honest_worker = None    # 2026-09-06: waited but never
-            #                             cleared — kept a dead QThread
-            #                             alive for the whole session
+        # 2026-09-06: waited but never cleared — kept a dead QThread
+        # alive for the whole session; 2026-09-12: _retire_worker also
+        # keeps a STUCK thread referenced instead of GC-deleting it
+        self._retire_worker("_honest_worker", self._honest_worker,
+                            "Honest (nested) evaluation")
         try:
             optimistic = (self.winner.macro_f1() if self.winner
                           else float("nan"))
@@ -7575,7 +7787,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 panel, f"Honest macro-F1 {out['mean_f1']:.3f} ± "
                        f"{out['std_f1']:.3f} (optimistic single-choice "
                        f"number: {optimistic:.3f}).\n"
-                       f"Per-fold choices: {choices}")
+                       f"Per-fold choices: {choices}"
+                       + ("\n· TURBO (approximate — inner search at k=2)"
+                          if self._turbo() else ""))
         except Exception:
             # one broken result panel must never stall the serial chain
             self.log("Honest evaluation: displaying the result failed:\n"
@@ -7586,11 +7800,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_honest_failed(self, tb: str):
         if self.b_honest_btn is not None:
             self.b_honest_btn.setEnabled(True)
-        if self._honest_worker is not None:
-            self._honest_worker.wait(10000)  # done before chain reuses it
-            self._honest_worker = None       # clear on failure too
+        self._retire_worker("_honest_worker", self._honest_worker,
+                            "Honest (nested) evaluation")   # stuck-safe
         self.log(f"Honest evaluation failed:\n{tb}")
         self.train_status.setText("Honest evaluation failed — see log.")
+        self.show_error("Honest (nested) evaluation failed", tb=tb)
         QtWidgets.QMessageBox.warning(
             self, "Honest evaluation failed",
             "Nested honest evaluation failed.\n\nTechnical details are "
@@ -7772,18 +7986,23 @@ class MainWindow(QtWidgets.QMainWindow):
         def fn():
             return sstats.lopo_evaluate(
                 X, yy, gg, clone(winner_pl), {}, winner_classes,
-                seed=seed, cancel_check=self._diag_cancel.is_set,
+                seed=seed, jobs=self._diag_jobs_for_winner(),
+                stride=2 if self._turbo() else 1,
+                cancel_check=self._diag_cancel.is_set,
                 progress=self._emit_progress)
 
         def done(out):
             self._lopo_result = out
             worst = sorted(out["per_patient"], key=lambda r: r[2])[:3]
-            self.log(f"LOPO ({out['n_patients']} patients): macro-F1 "
-                     f"{out['f1']:.3f}"
+            turbo_note = (" · TURBO (estimate over every 2nd patient)"
+                          if self._turbo() else "")
+            self.log(f"LOPO ({out['n_patients']} patients"
+                     + ("" if not self._turbo() else ", sampled")
+                     + f"): macro-F1 {out['f1']:.3f}"
                      + (f", AUC {out['auc']:.3f}"
                         if np.isfinite(out["auc"]) else "")
                      + f", mean per-patient accuracy "
-                     f"{np.mean(out['accs']):.3f}")
+                     f"{np.mean(out['accs']):.3f}" + turbo_note)
             self.log("  hardest: " + ", ".join(
                 f"{p} ({a:.0%})" for p, _n, a, _pp, _t in worst))
             self.train_status.setText(
@@ -7795,7 +8014,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 + (f", AUC {out['auc']:.3f}" if np.isfinite(out["auc"])
                    else "")
                 + f", mean per-patient accuracy "
-                  f"{np.mean(out['accs']):.3f}")
+                  f"{np.mean(out['accs']):.3f}" + turbo_note)
             ax = plotting.clear(panel[1])
             pp = sorted(out["per_patient"], key=lambda r: r[2])
             names = [r[0] for r in pp]
@@ -7829,28 +8048,32 @@ class MainWindow(QtWidgets.QMainWindow):
         winner_pl, winner_classes, k = (self.winner.pipeline,
                                         list(self.winner.classes),
                                         self.spin_folds.value())
+        seeds = ((0, 1) if self._turbo() else SEED_STABILITY_SEEDS)
 
         def fn():
             return sstats.seed_stability(
                 X, yy, gg, clone(winner_pl), {}, winner_classes,
-                seeds=SEED_STABILITY_SEEDS, k=k,
+                seeds=seeds, k=k, jobs=self._diag_jobs_for_winner(),
                 cancel_check=self._diag_cancel.is_set,
                 progress=self._emit_progress)
 
         def done(f1s):
             self._seed_result = f1s
+            turbo_note = (" · TURBO (approximate, 2 seeds)"
+                          if self._turbo() else "")
             self.log(f"Seed stability: macro-F1 {np.mean(f1s):.3f} ± "
                      f"{np.std(f1s):.3f} over "
-                     f"{len(SEED_STABILITY_SEEDS)} seeds "
-                     f"(min {min(f1s):.3f}, max {max(f1s):.3f})")
+                     f"{len(seeds)} seeds "
+                     f"(min {min(f1s):.3f}, max {max(f1s):.3f})"
+                     + turbo_note)
             self.train_status.setText(
                 f"Seed stability: {np.mean(f1s):.3f} ± {np.std(f1s):.3f}")
             panel = self._diag_panel("seeds", "Seed stability")
             self._diag_caption(
                 panel, f"macro-F1 {np.mean(f1s):.3f} ± {np.std(f1s):.3f} "
-                       f"over {len(SEED_STABILITY_SEEDS)} seeds "
+                       f"over {len(seeds)} seeds "
                        f"(min {min(f1s):.3f}, "
-                       f"max {max(f1s):.3f})")
+                       f"max {max(f1s):.3f})" + turbo_note)
             ax = plotting.clear(panel[1])
             ax.boxplot([f1s], tick_labels=["winner"], showmeans=True,
                        widths=0.35, patch_artist=True,
@@ -7866,10 +8089,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ax.scatter([1] * len(f1s), f1s, color=COL_MAIN, zorder=3,
                        s=18)
             ax.set_ylabel("macro-F1 (grouped CV)")
-            ax.set_xlabel("seed re-runs (5 points)", fontsize=8)
+            ax.set_xlabel(f"seed re-runs ({len(f1s)} points)", fontsize=8)
             ax.set_title(f"Seed stability — {np.mean(f1s):.3f} ± "
                          f"{np.std(f1s):.3f} "
-                    f"({len(SEED_STABILITY_SEEDS)} seeds)", fontsize=10)
+                         f"({len(f1s)} seeds)", fontsize=10)
             panel[1].draw()       # sync: no idle timer outliving the panel
 
         self._diag_running("seeds", "Seed stability")
@@ -7954,20 +8177,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Local explanations need the optional `shap` package "
                 "(pip install shap).")
             return
-        from sklearn.ensemble import RandomForestClassifier
         X, yy, gg = self._lc_data
         wn = np.asarray(self._lc_wn)
         pred_rows = list(self._pred_rows)
         pred_spectra = list(self._pred_spectra)
 
         def fn():
-            import shap as shap_mod
-            est = RandomForestClassifier(
-                n_estimators=300, class_weight="balanced", n_jobs=-1,
-                random_state=0).fit(np.asarray(X),
-                                    modeling._encode(list(yy),
-                                                     sorted(set(yy))))
-            expl = shap_mod.TreeExplainer(est)
+            # shared surrogate cache (2026-09-12 speed program): the
+            # same RF-300 + TreeExplainer the regions/band-agreement
+            # diagnostics already fitted — ONE fit per training matrix
+            # instead of a fresh one per click (also n_jobs=1 by
+            # design, gotcha #25)
+            _est, expl = modeling.surrogate_explainer(
+                np.asarray(X), list(yy))
             # mean spectrum per predicted class
             groups_cls: dict[str, list[np.ndarray]] = {}
             for (_fname, cls, _p), spec in zip(pred_rows, pred_spectra,
@@ -8240,7 +8462,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker = TrainWorker(X, yy, names, self.spin_folds.value(),
                                   self.spin_seed.value(), groups=gg,
                                   repeats=repeats,
-                                  wavenumbers=wn_for_models)
+                                  wavenumbers=wn_for_models,
+                                  turbo=self._turbo())
         self.worker.progress.connect(self.on_train_progress)
         self.worker.done.connect(self._on_train_done_then_diags)
         self.worker.failed.connect(self.on_train_failed)
@@ -8251,9 +8474,25 @@ class MainWindow(QtWidgets.QMainWindow):
         """Training finished → normal completion handling, then the
         diagnostics battery runs automatically (each result in its own
         panel — no clicking) unless the user opted out with the
-        'Auto-run after training' checkbox (2026-09-06)."""
-        self.on_train_done(results, winner)
-        self.report_uncertainty_stats()
+        'Auto-run after training' checkbox (2026-09-06).  Each stage is
+        individually guarded (2026-09-12 stress audit): a plotting
+        error in the winner panels used to abort the WHOLE chain —
+        uncertainty stats and the entire diagnostics battery silently
+        never ran (one UNHANDLED log line was the only trace)."""
+        try:
+            self.on_train_done(results, winner)
+        except Exception:
+            self.log("Showing the training result failed:\n"
+                     + traceback.format_exc())
+            self.show_error("Showing the training result failed",
+                            tb=traceback.format_exc())
+        try:
+            self.report_uncertainty_stats()
+        except Exception:
+            self.log("Uncertainty statistics failed:\n"
+                     + traceback.format_exc())
+            self.show_error("Uncertainty statistics failed",
+                            tb=traceback.format_exc())
         if (getattr(self, "chk_auto_diags", None) is not None
                 and not self.chk_auto_diags.isChecked()):
             self.log("Auto-diagnostics skipped (checkbox unticked) — "
@@ -8434,6 +8673,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for b in getattr(self, "_diag_buttons", []):
             b.setEnabled(self.winner is not None)
         self.log("Training FAILED:\n" + err)
+        self.show_error("Training failed", tb=err)
         QtWidgets.QMessageBox.critical(
             self, "Training failed",
             "Training ran into an error:\n\n" + err.splitlines()[-1] +
@@ -8781,36 +9021,50 @@ class MainWindow(QtWidgets.QMainWindow):
             board["total"] = (len(board["singles"]) + len(board["pairs"])
                               + len(board["triples"]))
         payload = {"board": board, "validated": {}, "winner": None}
+        # 2026-09-12: corrupted persisted files used to vanish silently
+        # (except: pass) — the dialog then showed partial data with no
+        # hint anything was missing.  Log + on-screen note instead.
+        restore_notes: list[str] = []
+
+        def _load_json(path: str, what: str):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    return _json.load(fh)
+            except OSError as exc:
+                restore_notes.append(f"{what}: {exc}")
+            except Exception as exc:
+                restore_notes.append(f"{what} is unreadable "
+                                     f"({type(exc).__name__}: {exc})")
+            return None
+
         vpath = os.path.join(folder, "validated.json")
         if os.path.isfile(vpath):
-            try:
-                with open(vpath, encoding="utf-8") as fh:
-                    payload["validated"] = {
-                        int(k): v
-                        for k, v in _json.load(fh).items()}
-            except Exception:
-                pass
+            loaded = _load_json(vpath, "validated.json")
+            if loaded is not None:
+                payload["validated"] = {int(k): v
+                                        for k, v in loaded.items()}
         wpath = os.path.join(folder, "winner.json")
         if os.path.isfile(wpath):
-            try:
-                with open(wpath, encoding="utf-8") as fh:
-                    payload["winner"] = _json.load(fh)
-            except Exception:
-                pass
+            payload["winner"] = _load_json(wpath, "winner.json")
         gpath = os.path.join(folder, "significance.json")
         if os.path.isfile(gpath):
-            try:
-                with open(gpath, encoding="utf-8") as fh:
-                    payload["significance"] = _json.load(fh)
-            except Exception:
-                pass
+            sig = _load_json(gpath, "significance.json")
+            if sig is not None:
+                payload["significance"] = sig
         rpath = os.path.join(folder, "report.txt")
         if os.path.isfile(rpath):
             try:
                 with open(rpath, encoding="utf-8") as fh:
                     payload["report_text"] = fh.read()
-            except Exception:
-                pass
+            except Exception as exc:
+                restore_notes.append(f"report.txt: {exc}")
+        if restore_notes:
+            self.log("3SSE restore warnings: "
+                     + "; ".join(restore_notes)
+                     + " — showing what could be read.")
+            self.statusBar().showMessage(
+                "3SSE results restored with warnings — see the Activity "
+                "log.", 15000)
         dlg = SeqResultsDialog(payload, parent=self)
         dlg.setModal(False)
         dlg.show()
@@ -8943,6 +9197,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_3sse_run.show()
         self.b_3sse_cancel.hide()
         self.log(f"3SSE search failed:\n{tb}")
+        self.show_error("3SSE architecture search failed", tb=tb)
         QtWidgets.QMessageBox.warning(
             self, "3SSE search failed",
             "The architecture search failed.\n\nTechnical details are "
@@ -9476,6 +9731,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self, "Prediction failed",
             f"Prediction failed:\n\n{last or 'Unknown error.'}\n\n"
             "Full technical details are in session.log next to the app.")
+        self.show_error("Prediction failed", tb=tb)
 
     def _aggregate_patients(self, files: list[str], rows: list[tuple]):
         """
@@ -9666,9 +9922,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Raman Spectra Classifier"
                             + ("  —  " + " · ".join(bits) if bits else ""))
 
+    def show_error(self, what: str, exc: Exception | None = None,
+                   tb: str = "") -> None:
+        """The ONE on-screen home for every error (2026-09-12): shows
+        the persistent red strip above the status bar and bumps the ⚠
+        counter.  Logging stays the caller's job (this method never
+        writes to session.log itself); modal dialogs stay where they
+        already exist — this strip is what REMAINS visible after they
+        are dismissed."""
+        if exc is not None and not tb:
+            tb = "".join(traceback.format_exception(type(exc), exc,
+                                                    exc.__traceback__))
+        detail = (f": {exc}" if exc is not None else "")
+        banner = getattr(self, "_err_banner", None)
+        chip = getattr(self, "_err_chip", None)
+        if banner is None and chip is None:
+            return                     # UI not built yet / tearing down
+        self._err_count += 1
+        if banner is not None:
+            banner.show_error(f"{what}{detail}", tb)
+        if chip is not None:
+            chip.setText(f"⚠ {self._err_count}")
+            chip.setVisible(True)
+        self.statusBar().showMessage(
+            f"{what}{detail} — details in the Activity log / session.log",
+            15000)
+
     def friendly_error(self, what: str, exc: Exception):
         self.log(f"{what}:\n" + "".join(
             traceback.format_exception(type(exc), exc, exc.__traceback__)))
+        self.show_error(what, exc=exc)
         QtWidgets.QMessageBox.warning(
             self, what,
             f"{what}:\n\n{exc}\n\nTechnical details are in session.log "
@@ -9691,11 +9974,15 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         Last-resort net for ANY unhandled exception (Qt slots qFatal-
         abort SILENTLY on PyQt >= 5.5 otherwise — gotcha #19): log the
-        full traceback, flag it in the status bar, and keep running.
-        The dialog fires once per session so an error storm cannot
-        spam dialogs; later errors stay in session.log.
+        full traceback, show the persistent ErrorBanner + ⚠ counter,
+        and keep running.  The modal dialog fires once per session so
+        an error storm cannot spam dialogs; later errors stay visible
+        on the banner strip and in session.log.
         """
         self._excepthook_shown = False
+        self._err_count = 0             # ⚠ chip counter (init'd early:
+        #                                 the hook below can fire any
+        #                                 time after this line)
 
         def hook(exc_type, exc, tb):
             from datetime import datetime
@@ -9712,6 +9999,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage(
                     f"Unexpected error ({exc_type.__name__}) — details "
                     "in session.log; the app keeps running.", 15000)
+                # persistent strip + ⚠ counter on EVERY error; the modal
+                # box stays once-per-session so storms can't spam it
+                self.show_error(f"Unexpected error ({exc_type.__name__})",
+                                exc=exc)
                 if not self._excepthook_shown:
                     self._excepthook_shown = True
                     QtWidgets.QMessageBox.warning(
@@ -9750,6 +10041,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_folds.setValue(int(s["folds"]))
         if isinstance(s.get("seed"), int):
             self.spin_seed.setValue(int(s["seed"]))
+        if isinstance(s.get("turbo"), bool):
+            self.chk_turbo.setChecked(s["turbo"])
         models = s.get("models")
         if isinstance(models, list) and s.get("suite_version") == SUITE_VERSION:
             for name, cb in self.model_checks.items():
@@ -9810,6 +10103,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "params_version": PARAMS_VERSION,
             "folds": self.spin_folds.value(),
             "seed": self.spin_seed.value(),
+            "turbo": self.chk_turbo.isChecked(),
             "mode_kind": self.mode_kind(),
             "data_mode": self.data_mode(),
             "trainer_kind": self.trainer_kind(),

@@ -11,13 +11,24 @@ from __future__ import annotations
 import faulthandler
 import os
 import sys
+import time
 import traceback
 
-# native crashes (the Windows exit-127 family) get a Python-level
-# traceback dump instead of dying silently
-faulthandler.enable()
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+# native crashes (the Windows exit-127 family) get a Python-level
+# traceback dump instead of dying silently.  Under pythonw (run_app.bat)
+# there is NO stderr, so the dump also goes to crash.log next to main.py
+# — the 2026-09-12 Qt5Core access violation left nothing behind because
+# stderr was gone.
+try:
+    _fh = open(os.path.join(_HERE, "crash.log"), "a", encoding="utf-8")
+    _fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} session "
+              f"start (pid {os.getpid()}) ===\n")
+    _fh.flush()
+    faulthandler.enable(file=_fh, all_threads=True)
+except (OSError, ValueError):              # unwritable dir etc.
+    faulthandler.enable()
 
 
 def _show_box(tb: str) -> None:

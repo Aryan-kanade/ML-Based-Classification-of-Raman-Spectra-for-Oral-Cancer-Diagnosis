@@ -9,7 +9,22 @@
 > the matching section below. Keep the "Last updated" stamp current.
 > Keep it dense — tables and one-liners, no prose padding.
 
-Last updated: 2026-09-08 (ONE HONEST NUMBER on screen — §36;
+Last updated: 2026-09-12 (SPEED PROGRAM round 2 — parallel
+diagnostics (bit-identical, loky recipe), surrogate-SHAP cache,
+linear-model concurrent training, ⚡Turbo toggle; gotcha #26 worker
+PARKING kills the remaining Qt5Core native crash, root-caused via
+faulthandler; §16b round-2 scorecard;
+previously 2026-09-12 (WHOLE-PROJECT CRASH/ERROR AUDIT — gotcha #25
+extended: local-explain RF capped (same crash combo), zombie-worker
+guard `_retire_worker`, NEW ErrorBanner + ⚠ counter so every error is
+on screen (§14), figures-export failure dialogs, 3SSE-restore JSON
+warnings, stress_audit.py harness (§2);
+previously 2026-09-12 (CRASH POST-MORTEM + fixes — native Qt5Core
+access violation during the auto-diagnostics regions step; diagnostic
+RFs capped to n_jobs=1, faulthandler→crash.log, patient_level_metrics
+shape guard — gotcha #25;
+previously 2026-09-12 (DEEP PREPROCESSING SEARCH — §52;
+previously 2026-09-08 (ONE HONEST NUMBER on screen — §36;
 explicit Paired/Unpaired dropdowns — §35;
 3SSE FAIR SINGLES + mode honesty — §34;
 2026-09-07: FILE > CLEAR TRAINING menu action — §33;
@@ -112,6 +127,7 @@ python reproduce_study.py --data D:/BARC/Data --mode paired --out study_run_pair
 python test_all.py                              # 40 unit tests
 QT_QPA_PLATFORM=offscreen python gui_test.py    # GUI walk (writes result_report.txt in-tree!)
 QT_QPA_PLATFORM=offscreen python deep_test.py   # 18 adversarial scenarios
+python stress_audit.py                          # crash-class stress: real loky + Qt in subprocesses (§16 #25)
 ```
 
 Tests hardcode `C:\Windows\Fonts` — Linux CI would need patching (no CI
@@ -125,6 +141,7 @@ exists). `matplotlib.use("Agg")` for all headless figure writing.
 | `modeling.py` | 1346 | Model registry + nested grouped CV + bundles + importance + bootstrap/McNemar. §7-8, 12. |
 | `test_all.py` | 1054 | 47 unit tests incl. regressions for the 2026-08-30 fixes, new models, data-root discovery. |
 | `deep_test.py` | 716 | 18 adversarial GUI/CLI scenarios; `wait_analysis()` helper. |
+| `stress_audit.py` | ~430 | Crash-class stress: real loky+Qt in SUBPROCESSES (A=crash repro on real data, B=overlap guards, C=close-mid-work, D=ui-churn); B-D re-run inside deep_test. |
 | `vit_train.py` / `vit_model.py` / `vit_test.py` | 551/207/144 | Secondary ViT track (torch). §15. |
 | `plotting.py` | 439 | rcParams theme, `MatplotlibCanvas` (lazy Qt-binding pin), plot helpers. |
 | `ui_helpers.py` | 387 | QSS stylesheet, `pill()`, tooltips, HOW_TO/METRIC_HELP, settings I/O. |
@@ -135,6 +152,7 @@ exists). `matplotlib.use("Agg")` for all headless figure writing.
 | `preprocessing.py` | 254 | `PreprocessParams` + spectrum pipeline. §6. |
 | `biochemistry.py` | 250 | BANDS/RATIOS tables, NMF, keratin flags, plausibility. §11. |
 | `optimize.py` | 228 | Preprocessing auto-tune. §15. |
+| `prep_deep_search.py` | ~640 | Deep combinatorial preprocessing search (staged factorial, both modes). §52. |
 | `dataset.py` | 148 | Flat loader, `common_grid`, `to_matrix`. §5. |
 | `paired.py` | 160 | Within-patient deviation features. §4. |
 | `gui_test.py` / `main.py` / `qt_compat.py` | small | Harnesses / entry points. |
@@ -528,7 +546,16 @@ anywhere. deep_test harness: file dialogs patched to ("", "") and
 `JOBLIB_MULTIPROCESSING=0` (threading backend — loky pools + QThreads
 are the Windows access-violation race). A
 bottom **Activity-log dock** (QPlainTextEdit, 300 lines, fed by
-`log()`, status-bar toggle button) shows errors in-app; `closeEvent`
+`log()`, status-bar toggle button) shows errors in-app; **ErrorBanner
++ ⚠ counter (2026-09-12, §16 #25 follow-up)**: a persistent red strip
+at the bottom of the central layout (`ErrorBanner` class — message +
+Details ▸ traceback + Copy + ✕) plus a status-bar `⚠ N` chip (click =
+open the Activity dock). `MainWindow.show_error(what, exc|tb)` feeds
+BOTH and is wired into: the sys.excepthook net, ALL worker fail paths
+(train/predict/seq/honest/optimize/_run_async), `friendly_error`, and
+figures-export failures — nothing fails into session.log invisibly
+anymore. The once-per-session modal dialog stays (storm-safe); the
+banner is what REMAINS after dismissing it. `closeEvent`
 asks before stopping running workers (No aborts the close; 3SSE keeps
 its checkpoint).
 Menu: File = Open folder (Ctrl+O),
@@ -668,8 +695,19 @@ every training** (`_on_train_done_then_diags` → `run_all_diagnostics`
 → serial `_diag_queue`, fast→slow: regions, learning curve, seeds,
 noise, locked (`auto=True` skips its confirm dialog), LOPO, honest; a
 "Run all diagnostics" button does the same for an existing winner).
+**2026-09-12 speed round 2**: the battery stage-guards each step (one
+broken panel never kills the chain — gotcha #25j); LOPO/seeds/
+learning-curve run their tasks in the RAM-capped loky pool
+(bit-identical; `_diag_jobs_for_winner()` picks jobs — tree winners
+stay serial); the surrogate RF+SHAP is cached and shared by regions /
+band agreement / biochemistry / local explain; a **⚡Turbo
+(approximate) checkbox** (`chk_turbo`, persisted in settings)
+switches the whole protocol to halved grids/seeds/points/sampled-LOPO
+— every turbo output is captioned "TURBO (approximate)".
 Chain invariants: `_run_async.finish/fail` + `on_honest_done/failed`
-call `_pop_diag_queue()`; each finished worker is `wait()`ed before
+call `_pop_diag_queue()`; each finished worker is `wait()`ed, then
+its slot cleared and the wrapper PARKED (`_retired_workers`, gotcha
+#26 — dropping the ref mid-callback access-violates sender()) before
 the next starts; `run_honest_check` only accepts a real
 QAbstractButton as sender (the chain's sender() is the worker object —
 both were silent native aborts); `start_training` refuses to overlap
@@ -1074,12 +1112,120 @@ with default hyperparameters (identical for all 4,369 — fair).
     GUI logs `device_report()` at train start; reproduce_study prints
     it. Verified live: nvidia-smi 34–70% utilization during training
     on the RTX 3050 6GB laptop card.
+25. **2026-09-12 CRASH, post-mortem from the WER dump** (the app died
+    silently mid auto-diagnostics, 21 s into the regions step right
+    after the honest check finished; session.log just stops).
+    `CrashDumps\python.exe.19416.dmp`: access violation 0xC0000005,
+    read @ 0xFFFFFFFFFFFFFFFF, **inside Qt5Core.dll+0x1FA308 on the
+    MAIN thread** (python+Qt frames interleaved = event/signal
+    dispatch; 42 threads in-process) — the #16/#22 native-race family.
+    Trigger chain: the 2026-09-08 device-mode change made
+    `RAMAN_DEVICE` default to **auto** (gui.py setdefault), but
+    `as_env_device`'s thread caps only fire on **cpu** — so the RAW
+    diagnostic fits bypassed every cap and ran `n_jobs=-1`:
+    all-core loky children spawned from a FuncWorker QThread beside
+    the live Qt main loop, on top of in-process torch-CUDA +
+    CatBoost OpenMP threads. FIXES (same day): (a)
+    `region_importance_shap` RF300, `region_importance` RF400 and the
+    optimize.py scorer RF300 are now `n_jobs=1` (fits take seconds at
+    n≈300×780); (b) `main.py` faulthandler now ALSO writes
+    `raman_app/crash.log` — under pythonw stderr is gone, which is why
+    this crash left no Python-level trace (crash.log is gitignored);
+    (c) `study_stats.patient_level_metrics` returns None when
+    len(y)/len(groups)/len(oof) disagree (the restored-3SSE-winner
+    startup traceback: persisted y/oof 307 rows vs fresh-session
+    groups 317). Registry models inside `evaluate_models` keep their
+    n_jobs (GridSearchCV path, historically stable).
+    **Same-day WHOLE-PROJECT AUDIT extension**: (d) `run_local_explain`
+    (gui.py) had the SAME unfixed combo — RF n_jobs=-1 + TreeExplainer
+    in a FuncWorker; now n_jobs=1. (e) **Zombie-worker guard**
+    `_retire_worker(attr, worker, label)`: the old
+    `wait(10000); self._x_worker = None` pattern GC-deletes a STILL
+    RUNNING QThread if the wait times out (stuck native call) → Qt
+    aborts natively; now stuck workers move to `_zombie_workers`, the
+    slot stays occupied (nothing can overlap them), banner+log warn.
+    Used by `_run_async.finish/fail` + `on_honest_done/failed`.
+    (f) Errors ON SCREEN (user request): `ErrorBanner` + ⚠ counter —
+    see §14. (g) `save_result_figures` failures now warn on screen
+    (all-fail = critical box); 3SSE-restore JSON parse failures log +
+    status note instead of silent `except: pass`. (h) Verified safe by
+    audit: ensemble-OOF Parallel uses `prefer="threads"` (no loky),
+    LOPO serial in GUI, 3SSE pools RAM-capped, no raw
+    `threading.Thread` anywhere, `draw_idle` only on session-long
+    canvases, `prep_deep_search.py` is headless CLI (loky fine).
+    (i) `stress_audit.py`: subprocess stress harness (A crash-repro /
+    B overlap guards / C close-mid-work / D ui-churn) — deep_test pins
+    B-D; A (~20 min, real data) is manual.
+    (j) **Post-training chain is stage-guarded** (found by stress A):
+    an exception in `on_train_done` (e.g. matplotlib ValueError on a
+    zero-size canvas — offscreen/never-laid-out windows) used to abort
+    `_on_train_done_then_diags` entirely — uncertainty stats + the
+    whole auto-diagnostics battery silently never ran (one UNHANDLED
+    log line was the only trace). Now each stage (on_train_done /
+    report_uncertainty_stats / run_all_diagnostics) is individually
+    try/except-ed with log+banner: one broken panel costs one panel,
+    never the battery.
+26. **Worker PARKING (2026-09-12, root-caused via faulthandler)**:
+    dropping the last Python reference to a just-finished worker
+    QThread lets PyQt delete the C++ QThread WHILE its queued
+    done-callback is still executing — the next diagnostic's
+    `QObject.sender()` (inside that same emission context) then reads
+    the freed object and **Qt5Core access-violates on the main
+    thread**. Pinned: stress-A child died at `_run_async`'s
+    `self.sender()` ← `run_region_importance` ← `_pop_diag_queue` ←
+    `on_honest_done` (crash.log trace + exit 2816, reproduced 2/2;
+    same family as the 17:05 Qt5Core crash). FIX: `_retire_worker`
+    parks finished wrappers in `_retired_workers` (bounded ring of 8)
+    — they outlive their last queued callback. stress_audit children
+    now run with faulthandler→crash.log (native deaths leave traces).
 
 ## 16b. Speed & Accuracy program (2026-09-05) — scorecard
 Baseline before the program (bench.py, seed 42, real data, paired):
 Extra Trees F1 0.774 / AUC 0.826 · screening 500 archs (10 models) 12.5
 min · baselines 174 s. Every change below measured via `bench.py`
 (fixed seed/data; `--full` adds nested validation + LOPO).
+
+ROUND 2 (2026-09-12, "make it fast" — exact-by-default + ⚡Turbo):
+- **Parallel diagnostics (loky, 3SSE recipe)**: LOPO / seed-stability
+  / learning-curve run their independent tasks in a
+  `Parallel(prefer="processes", return_as="generator",
+  max_nbytes=100)` pool — RAM-capped by `_safe_jobs`, children pinned
+  (`_pin_child`: RAMAN_DEVICE=cpu setdefault + OMP/MKL=1) with
+  per-child thread BUDGET (`RAMAN_DIAG_THREADS` = cores//workers,
+  set/cleared by the pool parent — never leaks into the GUI process).
+  `study_stats._drain` keeps live progress + cooperative cancel.
+  BIT-IDENTICAL to serial (same folds/seeds; LOPO f1/auc/cm + seeds +
+  lc triples pinned by test_parallel_diagnostics_match_serial;
+  verified end-to-end in stress A: LOPO 0.540/0.560/0.553 unchanged).
+  GUI picks jobs via `_diag_jobs_for_winner()`: tree-like winners
+  (RF/ET/HGB/peaks/CNN/chains — internal n_jobs=-1) stay SERIAL
+  (§16b-A4 oversubscription), everything else pools.
+- **Surrogate-SHAP cache** (`_SURROGATE_CACHE`, 3 entries keyed by
+  X-hash/seed/n_estimators): regions + band agreement + biochemistry
+  + local-explain shared ONE RF-300+TreeExplainer per training matrix
+  (was 2-3 back-to-back refits per battery + one per explain click —
+  explain is now instant on the second click). Local-explain seed
+  unified to RANDOM_STATE 42 (was 0) to share the cache.
+- **Concurrent model training**: linear/algebra models (no internal
+  thread pools: PCA+SVM/LDA/LogReg/KNN/NB/MLP/PLS) run their whole CV
+  concurrently in THREADS (`_run_cv_model` is module-level +
+  picklable); RF/ET/HGB/boosters/CNN stay serial (they saturate cores
+  alone). MEASURED dead ends (bench, 5-model set): loky-per-model
+  1.0x (children pay ~2 GB torch+booster imports each); capped
+  thread-concurrency of tree models 0.94-0.96x. Machine-variance on
+  the unchanged screening stage was ±20% (770↔625 s) — training-side
+  A/B numbers below that are noise. Accuracy bit-identical
+  (test_parallel_models_match_serial + bench baselines equal).
+- **⚡Turbo toggle** (Train page, persisted): successive-halved tuning
+  grids (`_tune_inner(halve=True)`: first inner fold ranks, best half
+  finish), honest inner search k=2, seeds 5→2, learning curve 4→2
+  points, LOPO stride=2 (every 2nd patient, captioned estimate). All
+  turbo outputs captioned "TURBO (approximate)".
+- Battery wall (stress A, 3-fold CatBoost, 5.9 GB free → 2 workers):
+  5.3 → 4.2 min; scales with free RAM (3-4 workers when freer).
+  Turbo battery ≈ half again. Honest check unchanged (34 s).
+- DROPPED as not worth it: honest-scorer thread parallelism (the
+  costly part is preprocessing, already stage-cached).
 
 SPEED (all landed):
 - A1 3SSE engine: 2-fold screening ladder (`screen_folds` in board;
@@ -2680,3 +2826,92 @@ numbers in text derive from named constants (BASELINES, LITERATURE,
 SEED_STABILITY_SEEDS, NOISE_LEVELS, len(ALL_MODEL_NAMES)) — never
 hand-copied · "patient-grouped" only when self.groups exists · one
 number policy: honest first, selection values always tagged.
+
+## 52. 2026-09-12 — DEEP PREPROCESSING SEARCH (prep_deep_search.py):
+full combinatorial sweep, BOTH modes (user: "test each and every")
+
+Staged factorial search over EVERY PreprocessParams axis (~300
+configs/mode, seed 42, 5-fold grouped CV, best of {PCA+SVM, RF-300,
+PCA+LogReg} per config — optimize.py scoring semantics; `_STAGE_CACHE`
+warm, crop-major order). Standard = preprocess_matrix; paired =
+paired_features rebuilt per config. Spike-flagged excluded unless the
+config despikes (GUI parity). Stages: 1 backbone crop(10)×deriv(3)×
+norm(5)=150 → 2 baseline method/λ/p on top-2 → 3 wavelet(37)+SG(21)+
+cross(9) → 4 switches (despike z / cal-1003 / detrend + joint) →
+5 crop fine 5×5 → 6 HONEST layer: top-8 × 5 models (3 fast +
+ExtraTrees + PCA+LDA) × seeds {42,43,44}, then nested
+`evaluate_models` (hyperparams tuned inside folds) for top-2 +
+defaults. ~45 min total on the real data. Artifacts (gitignored dir):
+`vit_outputs/prep_deep_search_{standard,paired}.json` + `_report.md`
++ `_run.log`; script `raman_app/prep_deep_search.py` (`--smoke` tiny
+grids). `preprocess_best.json` NOT touched (report-only run).
+
+**WINNERS (selection → 3-seed → nested):**
+
+| Mode | Config | selection | 3-seed | nested |
+|---|---|---|---|---|
+| Standard | crop 700–1800 · deriv 2 · none · SG 11/3 · sym8 L4 · cal-1003 | 0.641 | 0.606 (ET) | **0.617** (RF) |
+| Standard defaults | crop 500–2000 · d0 · vector | 0.587 | — | 0.579 |
+| Paired | **NO-crop (full 15.5–3862) · deriv 2 · none · SG 11/4 · db6 L2** | 0.761 | 0.746 (RF ±.013) | **0.742** (ET, +cal variant) |
+| Paired defaults | crop 500–2000 · d0 · vector | 0.597 | 0.591 | 0.617 |
+
+- **Paired honest 0.742 vs 0.617 defaults (+0.125)** — beats every
+  prior record (§13 ET 0.702, §15 3SSE 0.725 nested). Winner family
+  is robust: the whole top-8 validation list = no-crop+d2 variants;
+  RF 0.746 / ET 0.714; +PQN again loses (0.738).
+- **Why no-crop+deriv2 wins**: the 155 interpolated files' padded
+  edges (gotcha #18) are linear/constant fill → 2nd derivative ≈ 0
+  there — deriv-2 nullifies the padding tradeoff and the wide axis
+  adds real signal. d2 makes baseline (skipped by design) AND norm
+  irrelevant ("none" beat every normalization; trees are scale-free
+  on deriv spectra).
+- Stage-2 baseline sweep NEVER improved a winner (winners are d2 =
+  baseline-free); als/arpls/iarpls/pspline/snip only matter for d0
+  configs, where ALS λ1e5/p.01 defaults held. Despike OFF
+  re-confirmed in both modes (z5/z7/z10 all lose). detrend/cal-1003
+  ≈ +.001–.005 (noise-level; cal-1003 carried the nested 0.742).
+  SG poly 4 with d2 (validate() allows poly ≤ w−2); wavelet db6 L2
+  beat sym8 L4 on paired, sym8 L4 held on standard.
+- Standard gain modest (+.038 nested). **2nd derivative is the
+  single biggest preprocessing lever on this dataset** — the old
+  15-config optimize grid had only one deriv-2 entry.
+- Winner's-curse ladder visible: .761 → .746 → .742 (paired);
+  .641 → .606 → .617 (standard; nested RF > 3-seed ET = model-set
+  difference, not a contradiction).
+- Winner params are all GUI-selectable (crop 0/0 = no crop, deriv 2,
+  norm none, wavelet db6 level 2, SG 11/4; §14 combo lists).
+
+**3SSE transferability check (same day, `prep_3sse_check.py`, paired,
+nested grouped 5-fold, seed 42, real registry path
+`evaluate_models`)**: §52 winner vs defaults across the registry
+panel — 11/13 families IMPROVE: Ensemble(top-3) 0.618→**0.739**
+(+.121, already beats the old 3SSE chain winner 0.725 with NO
+chaining), RF +.118, ET +.122, CatBoost +.120 (0.707!), LightGBM
++.106 (0.704 — the "boosters lose at n≈300" note NO LONGER holds on
+deriv-2 features), Spectral+band +.094, XGB +.075, HGB +.059,
+PCA+SVM +.041, LogReg +.041, Peak-bands +.001. TWO losers, both
+linear-latent: **PCA+LDA −.118 (0.459), PLS-DA −.055 (0.490)** —
+signed deriv lobes + 2000 dims defeat discriminant/PLS geometry
+while trees/boosters threshold per-dimension. 3SSE guidance: run 3SSE
+on the §52 winner; uncheck LDA/PLS-DA (or trust screening to prune);
+PCA-family (SVM/LogReg/GNB) still fine as early chain layers.
+1D-CNN/TabPFN not re-measured (SLOW_MODELS, runtime). Artifacts:
+`vit_outputs/prep_3sse_check.{json,log}`.
+
+**Locked one-shot holdout (same day, `prep_locked_check.py`,
+patient_split 70/15/15 seed 42, paired, train-on-70% → predict 15%
+ONCE, 9 unseen patients / 44 spectra)**: train-CV gap is real
+(winner ET 0.728 vs defaults RF 0.620 on the same train patients)
+but the one-shot lands in a STATISTICAL TIE: locked F1 .588 vs .597
+(−.009), acc .591 vs .614, AUC .714 vs .694 (+.020, ranking favors
+winner). n=44 spectra ⇒ CI ≈ ±.15 — one hard patient flips any
+metric by .11; a single locked split CANNOT distinguish configs at
+this n (same phenomenon as §21 open item 9's nested-0.56 finding).
+patient_acc numbers (.333/.444) are NOT meaningful for paired data
+(known §21 semantics: a paired patient contributes BOTH classes;
+dominant-class verdict mixes normal+tumor sites). **Decision rule
+that survives this test: trust the data-efficient estimates (5-fold
+3-seed 0.746, nested 0.742, 11/13 families +, train-CV +0.108) — the
+winner stays; small-batch one-shot outcomes are noise-dominated.
+Deploy with probabilities + triage zones, not hard labels.**
+Artifacts: `vit_outputs/prep_locked_check.{json,log}`.

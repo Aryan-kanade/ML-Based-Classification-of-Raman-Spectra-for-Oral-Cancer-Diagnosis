@@ -4304,6 +4304,138 @@ def test_audit_bioshift_fdr_and_ratio_guard():
     assert np.isfinite(bio.keratin_index(wn, y_ok))
 
 
+# ==========================================================================
+# Speed program (2026-09-12): parallel paths must be BIT-IDENTICAL to
+# serial, turbo must compute strictly less, the surrogate-SHAP cache
+# must be transparent.
+# ==========================================================================
+def _speed_synth(n_patients=24, n_features=12, seed=0):
+    rng = np.random.default_rng(seed)
+    X = rng.normal(0, 1, (n_patients * 5, n_features))
+    y, groups = [], []
+    for p in range(n_patients):
+        cls = f"C{p % 2}"
+        for _i in range(5):
+            y.append(cls)
+            groups.append(f"P{p:02d}")
+    X[:, 0] += np.array([1.0 if v == "C1" else 0.0 for v in y])
+    return X, y, groups
+
+
+def test_parallel_diagnostics_match_serial():
+    """LOPO / seed stability / learning curve in the loky pool return
+    EXACTLY the serial numbers (same folds, same seeds)."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    import study_stats as sstats
+
+    X, y, groups = _speed_synth()
+    est = Pipeline([("s", StandardScaler()),
+                    ("m", LogisticRegression(max_iter=2000))])
+    s = sstats.lopo_evaluate(X, y, groups, est, {}, ["C0", "C1"],
+                             jobs=1)
+    p = sstats.lopo_evaluate(X, y, groups, est, {}, ["C0", "C1"],
+                             jobs=2)
+    assert s["f1"] == p["f1"] and s["auc"] == p["auc"]
+    assert s["cm"].tolist() == p["cm"].tolist()
+    assert [r[0] for r in s["per_patient"]] == \
+        [r[0] for r in p["per_patient"]]
+
+    ss = sstats.seed_stability(X, y, groups, est, {}, ["C0", "C1"],
+                               seeds=(0, 1, 2), k=4, jobs=1)
+    sp = sstats.seed_stability(X, y, groups, est, {}, ["C0", "C1"],
+                               seeds=(0, 1, 2), k=4, jobs=3)
+    assert ss == sp
+
+    ye = [0 if v == "C0" else 1 for v in y]
+    ls = modeling.learning_curve_by_groups(X, ye, groups, est, k=4,
+                                           seed=7, jobs=1)
+    lp = modeling.learning_curve_by_groups(X, ye, groups, est, k=4,
+                                           seed=7, jobs=4)
+    assert ls == lp
+
+
+def test_parallel_models_match_serial():
+    """evaluate_models with the concurrent-models thread pool returns
+    EXACTLY the serial per-model results (fold F1s, thresholds, OOF)."""
+    X, y, groups = _speed_synth(seed=3)
+    names = ["PCA + Logistic Regression", "PLS-DA"]
+    groups_arr = np.asarray(groups)
+    classes = sorted(set(y))
+    ye = np.array([classes.index(v) for v in y])
+    from sklearn.model_selection import StratifiedGroupKFold
+    splits = list(StratifiedGroupKFold(n_splits=4, shuffle=True,
+                                       random_state=42).split(X, ye,
+                                                              groups_arr))
+    specs = [s for s in modeling.model_specs() if s["name"] in names]
+    assert len(specs) == 2
+    serial = {}
+    for spec in specs:
+        serial[spec["name"]] = modeling._run_cv_model(
+            spec["name"], spec["estimator"], spec["grid"], X, ye,
+            groups_arr, splits, classes, True, 1, 42, len(splits))
+    rp, _wp = modeling.evaluate_models(X, y, model_names=names,
+                                       k_folds=4, groups=groups)
+    assert [r.name for r in rp] == [n for n in serial]
+    for b in rp:
+        a, tpl_a = serial[b.name]
+        assert b.error is None and a.error is None
+        assert a.fold_f1 == b.fold_f1, b.name
+        assert a.threshold == b.threshold, b.name
+        assert np.allclose(a.oof_proba, b.oof_proba, equal_nan=True)
+
+
+def test_turbo_stride_and_halving_run():
+    """TURBO: LOPO stride halves the patients; halved inner tuning
+    still returns valid params; the exact path is untouched."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import StratifiedGroupKFold
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    import study_stats as sstats
+
+    X, y, groups = _speed_synth()
+    est = Pipeline([("s", StandardScaler()),
+                    ("m", LogisticRegression(max_iter=2000))])
+    full = sstats.lopo_evaluate(X, y, groups, est, {}, ["C0", "C1"])
+    half = sstats.lopo_evaluate(X, y, groups, est, {}, ["C0", "C1"],
+                                stride=2)
+    assert half["n_patients"] == (full["n_patients"] + 1) // 2
+
+    inner = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=0)
+    grid = {"m__C": [0.01, 0.1, 1.0, 10.0]}
+    params, _thr = modeling._tune_inner(
+        est, grid, X, np.array([0 if v == "C0" else 1 for v in y]),
+        inner, groups=np.asarray(groups), halve=True)
+    assert set(params) == {"m__C"} and params["m__C"] in grid["m__C"]
+
+
+def test_surrogate_shap_cache():
+    """The shared surrogate-SHAP cache: identical results on the second
+    call, explainer+RF reused by surrogate_explainer (identity)."""
+    import importlib.util as _ilu
+    if _ilu.find_spec("shap") is None:
+        print("    (shap not installed — skipped)")
+        return
+    X, y, _groups = _speed_synth(seed=5)
+    wn = np.linspace(500.0, 2000.0, X.shape[1])
+    modeling.clear_surrogate_cache()
+    _wn1, s1, b1 = modeling.region_importance_shap(X, y, None, wn)
+    est2, expl2 = modeling.surrogate_explainer(X, y)
+    est3, expl3 = modeling.surrogate_explainer(X, y)
+    assert est2 is est3 and expl2 is expl3     # cache identity, no refit
+    _wn2, s2, b2 = modeling.region_importance_shap(X, y, None, wn)
+    assert np.array_equal(s1, s2) and b1 == b2
+    # a DIFFERENT matrix must not hit the cache (translation alone is
+    # invisible to trees — flip the informative column instead)
+    X2 = X.copy()
+    X2[:, 0] *= -1.0
+    _wn3, s3, _b3 = modeling.region_importance_shap(X2, y, None, wn)
+    assert not np.array_equal(s1, s3)
+    modeling.clear_surrogate_cache()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
