@@ -54,8 +54,8 @@ import clinical_data as cdata
 import study_stats as sstats
 from preprocessing import PreprocessParams, HAS_PYWT
 import plotting
-from plotting import (COL_ANNOT, COL_MAIN, COL_RESULT, COL_SIGN_NEG,
-                               COL_SIGN_POS, COL_ZERO)
+from plotting import (COL_ANNOT, COL_MAIN, COL_RAW, COL_RESULT,
+                       COL_SIGN_NEG, COL_SIGN_POS, COL_ZERO)
 import ui_helpers as uh
 from ui_helpers import TIPS, STYLESHEET
 
@@ -750,6 +750,190 @@ def plural(n: int, word: str) -> str:
     return f"{n} {_IRREGULAR_PLURALS.get(word, word + 's')}"
 
 
+def _prep_fields(params) -> dict:
+    """PreprocessParams (or a plain dict from an old bundle) as a dict."""
+    if hasattr(params, "__dataclass_fields__"):
+        return asdict(params)
+    return dict(params or {})
+
+
+def _prep_fmt(v) -> str:
+    if isinstance(v, bool):
+        return "on" if v else "off"
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)
+
+
+def prep_param_rows(params) -> list[tuple[str, str]]:
+    """Every preprocessing parameter as a readable (name, value) row.
+    Shared by the 3SSE Winner tab, its CSV/HTML exports and the HTML
+    report so all surfaces show the same preprocessing block."""
+    return [(k, _prep_fmt(v)) for k, v in _prep_fields(params).items()]
+
+
+def prep_compact(params) -> str:
+    """One-line summary, e.g.
+    'crop 500-2000 cm-1 · despike off · wavelet sym8 L4 · SG 11/3 ·
+    baseline als · norm vector'."""
+    d = _prep_fields(params)
+    crop_lo = d.get("crop_min") or 0
+    crop_hi = d.get("crop_max") or 0
+    crop = (f"crop {_prep_fmt(crop_lo)}-{_prep_fmt(crop_hi)} cm-1"
+            if crop_lo or crop_hi else "no crop")
+    despike = (f"despike z={_prep_fmt(d.get('despike_z', 7.0))}"
+               if d.get("despike") else "despike off")
+    wavelet = (f"wavelet {d.get('wavelet_name', 'sym8')} "
+               f"L{d.get('wavelet_level', 4)}"
+               if d.get("wavelet") else "wavelet off")
+    sg = f"SG {d.get('sg_window', 11)}/{d.get('sg_poly', 3)}"
+    if d.get("sg_deriv"):
+        sg += f" d{d.get('sg_deriv')}"
+    return " · ".join([crop, despike, wavelet, sg,
+                       f"baseline {d.get('baseline_method', 'als')}",
+                       f"norm {d.get('norm', 'vector')}"])
+
+
+def wrap_scroll(page: QtWidgets.QWidget) -> QtWidgets.QScrollArea:
+    """Make a page scrollable when its content exceeds the window
+    (canonical recipe — used by the wizard pages and dialogs)."""
+    scroll = QtWidgets.QScrollArea()
+    scroll.setWidget(page)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+    return scroll
+
+
+def seq_results_html(payload: dict, params,
+                     rankings=None) -> str:
+    """Self-contained printable 3SSE results page (pure — no Qt), so a
+    saved run can be shared as one file: preprocessing parameters, the
+    overall winner with its metrics, nested best-per-level rows,
+    significance and the ranking tables. `rankings` is a list of
+    (title, rows) pairs as built by ArchTableModel._rows."""
+    from datetime import datetime
+
+    def esc(v) -> str:
+        return (str(v).replace("&", "&amp;")
+                .replace("<", "&lt;").replace(">", "&gt;"))
+
+    def _n(v) -> str:
+        return (f"{v:.3f}"
+                if isinstance(v, (int, float)) and v == v else "n/a")
+
+    def _m(m, key) -> str:
+        return _n((m or {}).get(key))
+
+    winner = payload.get("winner") or {}
+    arch = winner.get("arch") or []
+    wm = winner.get("metrics") or {}
+    mode = payload.get("mode") or ""
+    mode_txt = (" · paired margin features"
+                + (" + PQN" if "pqn" in mode else "")
+                if "paired" in mode else "")
+    parts = [
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>",
+        "<title>3SSE — Sequential Architecture Search</title>",
+        "<style>",
+        "body{font-family:'Segoe UI',system-ui,sans-serif;max-width:"
+        "960px;margin:24px auto;color:#1e293b;line-height:1.45}",
+        "h1{font-size:1.5rem;border-bottom:3px solid #2563eb;"
+        "padding-bottom:8px}h2{font-size:1.1rem;color:#1e3a8a;"
+        "margin-top:28px}table{border-collapse:collapse;width:100%;"
+        "font-size:.9rem;margin:10px 0}",
+        "th,td{border:1px solid #e2e8f0;padding:6px 9px;"
+        "text-align:left}th{background:#f1f5f9}",
+        ".muted{color:#64748b;font-size:.85rem}",
+        "@media print{body{margin:8mm}}",
+        "</style></head><body>",
+        "<h1>3SSE — Sequential Architecture Search</h1>",
+        f"<p class='muted'>Generated {datetime.now():%Y-%m-%d %H:%M}"
+        f" · Raman Classifier{mode_txt}"
+        + (f" · {payload['total']} candidates"
+           if isinstance(payload.get("total"), int) else "")
+        + "</p>",
+        "<h2>Preprocessing (as trained)</h2>",
+    ]
+    if params is not None:
+        prep_rows = "".join(
+            f"<tr><th>{esc(k)}</th><td>{esc(v)}</td></tr>"
+            for k, v in prep_param_rows(params))
+        parts.append(f"<table>{prep_rows}</table>")
+    else:
+        parts.append("<p class='muted'>not recorded (run restored "
+                     "from disk)</p>")
+    if arch:
+        parts.append(
+            "<h2>Overall winner"
+            f" ({len(arch)}-Model)</h2><table>"
+            "<tr><th>Architecture</th>"
+            f"<td><b>{esc(' → '.join(arch))}</b></td></tr>"
+            f"<tr><th>Macro-F1</th><td>{_m(wm, 'f1')}</td></tr>"
+            f"<tr><th>Sensitivity</th><td>{_m(wm, 'sens')}</td></tr>"
+            f"<tr><th>Specificity</th><td>{_m(wm, 'spec')}</td></tr>"
+            f"<tr><th>ROC-AUC</th><td>{_m(wm, 'auc')}</td></tr>"
+            f"<tr><th>Accuracy</th><td>{_m(wm, 'acc')}</td></tr>"
+            "<tr><th>Baseline</th><td>paired Extra Trees: "
+            "F1 0.702 · AUC 0.788</td></tr></table>")
+    validated = payload.get("validated") or {}
+    nest = []
+    for level in (1, 2, 3):
+        cands = validated.get(level) or []
+        if not cands:
+            continue
+        b = max(cands, key=lambda e: (
+            e.get("metrics", {}).get("f1")
+            if isinstance(e.get("metrics", {}).get("f1"),
+                          (int, float)) else -1.0))
+        bm = b.get("metrics") or {}
+        nest.append(
+            f"<tr><th>Best {level}-Model</th><td>"
+            f"{esc(' → '.join(b.get('arch') or []))}</td>"
+            f"<td>F1 {_m(bm, 'f1')} · sens {_m(bm, 'sens')} · "
+            f"spec {_m(bm, 'spec')} · AUC {_m(bm, 'auc')} · "
+            f"acc {_m(bm, 'acc')}</td></tr>")
+    if nest:
+        parts.append("<h2>Nested validation — best per level</h2>"
+                     f"<table>{''.join(nest)}</table>")
+    sig = payload.get("significance")
+    if sig:
+        f1s = [x for x in sig.get("seed_f1s", [])
+               if isinstance(x, (int, float))]
+        if f1s:
+            mean = sum(f1s) / len(f1s)
+            sd = (sum((x - mean) ** 2 for x in f1s)
+                  / max(len(f1s) - 1, 1)) ** 0.5
+            seeds = (f" Seed stability ({len(f1s)} seeds): "
+                     f"F1 {mean:.3f} ± {sd:.3f} "
+                     f"({', '.join(f'{x:.3f}' for x in f1s)}).")
+        else:
+            seeds = ""
+        verdict = ("SIGNIFICANT" if sig.get("mcnemar_p", 1) < 0.05
+                   else "NOT significant")
+        parts.append(
+            "<h2>Significance</h2><p>"
+            + esc(f"vs best single ({sig.get('baseline', '?')}, F1 "
+                  f"{_n(sig.get('baseline_f1'))}): McNemar "
+                  f"b={sig.get('mcnemar_b', '?')} "
+                  f"c={sig.get('mcnemar_c', '?')} → "
+                  f"p={_n(sig.get('mcnemar_p'))} — the chain's "
+                  f"improvement is {verdict}.") + esc(seeds) + "</p>")
+    headers = ["Rank", "Type", "Architecture", "Macro-F1", "Sens",
+               "Spec", "AUC", "Acc"]
+    for title, rows in (rankings or []):
+        if not rows:
+            continue
+        body = "".join(
+            "<tr>" + "".join(f"<td>{esc(c)}</td>" for c in row)
+            + "</tr>" for row in rows)
+        parts.append(
+            f"<h2>{esc(title)} ranking</h2><table><tr>"
+            + "".join(f"<th>{h}</th>" for h in headers)
+            + f"</tr>{body}</table>")
+    parts.append("</body></html>")
+    return "\n".join(parts)
+
+
 # ==========================================================================
 # Tumor-likelihood meter (custom-painted 0-100% gauge)
 # ==========================================================================
@@ -981,12 +1165,24 @@ class SeqResultsDialog(QtWidgets.QDialog):
         v = (m or {}).get(key, default)
         return v if isinstance(v, (int, float)) else default
 
+    def _prep_params(self):
+        """Preprocessing the 3SSE run actually used: the training-time
+        snapshot from the main window, falling back to the current
+        Preprocess-page values (None for old saved runs)."""
+        pw = self.parent()
+        if pw is not None and hasattr(pw, "read_params"):
+            return (getattr(pw, "_params_at_train", None)
+                    or pw.read_params().validate())
+        return None
+
     def __init__(self, payload, parent=None):
         super().__init__(parent)
         self.payload = payload
         board = payload["board"]
         self.setWindowTitle("3SSE — Sequential Architecture Search")
-        self.resize(880, 600)
+        # 2026-09-11: wider default + tab elide so the fourth tab label
+        # never renders clipped ("Overall Winne…")
+        self.resize(940, 620)
         lay = QtWidgets.QVBoxLayout(self)
         mode = payload.get("mode") or ""
         if "paired-pqn" in mode:
@@ -1013,6 +1209,7 @@ class SeqResultsDialog(QtWidgets.QDialog):
         note.setObjectName("CardHint")
         lay.addWidget(note)
         tabs = QtWidgets.QTabWidget()
+        tabs.setElideMode(QtCore.Qt.ElideRight)
         lay.addWidget(tabs)
         level_meta = ((1, "singles", "Single Models"),
                       (2, "pairs", "2-Model"),
@@ -1028,9 +1225,18 @@ class SeqResultsDialog(QtWidgets.QDialog):
         btn_row = QtWidgets.QHBoxLayout()
         b_csv = QtWidgets.QPushButton("Export this tab to CSV…")
         b_csv.setToolTip("Writes the currently selected ranking tab "
-                         "(as displayed, sorted) to a CSV file.")
+                         "(as displayed, sorted) to a CSV file, with "
+                         "the run's preprocessing parameters as a "
+                         "comment row on top.")
         b_csv.clicked.connect(self._export_csv)
         btn_row.addWidget(b_csv)
+        b_html = QtWidgets.QPushButton("Export results as HTML…")
+        b_html.setToolTip(
+            "Self-contained printable page: preprocessing parameters, "
+            "the overall winner with its metrics, the nested best-per-"
+            "level rows, significance and all three ranking tables.")
+        b_html.clicked.connect(self._export_html)
+        btn_row.addWidget(b_html)
         btn_row.addStretch(1)
         lay.addLayout(btn_row)
 
@@ -1076,6 +1282,12 @@ class SeqResultsDialog(QtWidgets.QDialog):
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as fh:
                 w = _csv.writer(fh)
+                prep = self._prep_params()
+                if prep is not None:
+                    # comment-prefixed metadata row: visible in every
+                    # spreadsheet, ignored by CSV parsers
+                    w.writerow(["# Preprocessing (as trained): "
+                                f"{prep_compact(prep)}"])
                 w.writerow(ArchTableModel.HEADERS)
                 w.writerows(rows)
             (self.parent().log(f"3SSE ranking exported: {path} "
@@ -1084,6 +1296,28 @@ class SeqResultsDialog(QtWidgets.QDialog):
         except Exception as exc:
             QtWidgets.QMessageBox.warning(
                 self, "Export failed", f"Could not write CSV:\n{exc}")
+
+    def _export_html(self):
+        """One self-contained printable page for the whole 3SSE run —
+        preprocessing parameters included (user request 2026-09-11)."""
+        html = seq_results_html(
+            self.payload, self._prep_params(),
+            [(title, m._rows) for title, m in self._tab_models])
+        path, _f = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export 3SSE results to HTML",
+            os.path.join(os.path.expanduser("~"), "Desktop",
+                         "3sse_results.html"),
+            "HTML (*.html)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+            (self.parent().log(f"3SSE results exported (HTML): {path}")
+             if self.parent() else None)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Export failed", f"Could not write HTML:\n{exc}")
 
     def _winner_rows(self):
         """Winner-tab CSV rows in the ranking-table format: the overall
@@ -1158,9 +1392,18 @@ class SeqResultsDialog(QtWidgets.QDialog):
                 for i, e in enumerate(scored)]
 
     def _winner_tab(self, payload):
-        w = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(w)
+        """Overall Winner tab — 2026-09-11 redesign: scrollable, app
+        design-system widgets (pills, colored metric table, collapsible
+        preprocessing) instead of one flat monospace text block."""
+        page = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        body = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(body)
+        lay.setSpacing(10)
         winner = payload.get("winner")
+
+        # ---- winner header: flow diagram + metric pills + baseline
         if winner and winner.get("arch"):
             lay.addWidget(ChainFlowWidget(winner["arch"]))
             if winner.get("metrics"):
@@ -1178,73 +1421,211 @@ class SeqResultsDialog(QtWidgets.QDialog):
                     pills.addWidget(uh.pill(
                         f"{label}: {val:.3f}" if val == val
                         else f"{label}: n/a", tone))
+                pills.addStretch(1)
                 lay.addLayout(pills)
+            base = QtWidgets.QLabel(
+                "Baseline (paired Extra Trees): F1 0.702 · AUC 0.788")
+            base.setObjectName("CardHint")
+            lay.addWidget(base)
+
+        # ---- nested validation: best per level + winner in ONE
+        # colored table (replaces the "NESTED VALIDATION" text lines)
         validated = payload.get("validated") or {}
-        if validated or winner:
-            lines = ["NESTED VALIDATION — best per level", ""]
-            for level in (1, 2, 3):
-                cands = validated.get(level, [])
-                if cands:
-                    b = max(cands, key=lambda e: self._num(
-                        e.get("metrics"), "f1", -1.0))
-                    m = b.get("metrics") or {}
-                    lines.append(f"{level}-Model:  "
-                                 f"{' → '.join(b['arch'])}")
-                    lines.append(f"          F1 {self._num(m, 'f1'):.3f} · "
-                                 f"sens {self._num(m, 'sens'):.3f} · "
-                                 f"spec {self._num(m, 'spec'):.3f} · "
-                                 f"AUC {self._num(m, 'auc'):.3f} ·"
-                                 f" acc {self._num(m, 'acc'):.3f}")
-                    lines.append("")
-            if winner:
-                m = winner.get("metrics") or {}
-                lines += ["=" * 56,
-                          f"OVERALL WINNER ({len(winner['arch'])}-Model):"
-                          f" {' → '.join(winner['arch'])}",
-                          f"  Macro-F1 {self._num(m, 'f1'):.3f} · "
-                          f"sensitivity "
-                          f"{self._num(m, 'sens'):.3f} · specificity "
-                          f"{self._num(m, 'spec'):.3f}",
-                          f"  ROC-AUC {self._num(m, 'auc'):.3f} · "
-                          f"accuracy {self._num(m, 'acc'):.3f}",
-                          "  Baseline (paired Extra Trees): F1 0.702 · "
-                          "AUC 0.788"]
-            sig = payload.get("significance")
-            if sig:
-                f1s = sig["seed_f1s"]
-                mean = sum(f1s) / len(f1s)
-                sd = (sum((x - mean) ** 2 for x in f1s)
-                      / max(len(f1s) - 1, 1)) ** 0.5
-                verdict = ("SIGNIFICANT" if sig["mcnemar_p"] < 0.05
-                           else "NOT significant")
-                lines += ["",
-                          "SIGNIFICANCE (auto)",
-                          f"  vs best single ({sig['baseline']}, F1 "
-                          f"{sig['baseline_f1']:.3f}): McNemar "
-                          f"b={sig['mcnemar_b']} c={sig['mcnemar_c']} "
-                          f"→ p={sig['mcnemar_p']:.3f} — the chain's "
-                          f"improvement is {verdict}.",
-                          f"  Seed stability ({len(f1s)} seeds): F1 "
-                          f"{mean:.3f} ± {sd:.3f} "
-                          f"({', '.join(f'{x:.3f}' for x in f1s)})"]
-        elif payload.get("report_text"):
-            # loaded from a saved run without persisted validation data
-            text = payload["report_text"]
-            start = text.find("FULL NESTED VALIDATION")
-            lines = ([text[start:].rstrip()] if start >= 0
-                     else [text])
+        if validated or (winner and winner.get("metrics") is not None):
+            lay.addWidget(self._nested_table(payload))
+            if payload.get("significance"):
+                lay.addWidget(self._significance_block(
+                    payload["significance"]))
         else:
-            lines = ["No validated winner available."]
-        lbl = QtWidgets.QLabel("\n".join(lines))
-        lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        lay.addWidget(lbl)
+            # loaded from a saved run without persisted validation data
+            text = payload.get("report_text") \
+                or "No validated winner available."
+            start = text.find("FULL NESTED VALIDATION")
+            if start >= 0:
+                text = text[start:].rstrip()
+            panel = QtWidgets.QFrame()
+            panel.setObjectName("DiagPanel")
+            pl = QtWidgets.QVBoxLayout(panel)
+            pl.setContentsMargins(10, 8, 10, 8)
+            lbl = QtWidgets.QLabel(text)
+            lbl.setFont(qc.QtGui.QFont("Consolas", 9))
+            lbl.setTextInteractionFlags(
+                QtCore.Qt.TextSelectableByMouse)
+            pl.addWidget(lbl)
+            lay.addWidget(panel)
+
+        # ---- preprocessing: chips + collapsible full table
+        lay.addWidget(self._prep_box())
         lay.addStretch(1)
         btn = QtWidgets.QPushButton("Save winner as model bundle…")
         # only live search results carry the fitted chain
         btn.setEnabled(bool(winner and winner.get("chain")))
         btn.clicked.connect(self._on_save)
         lay.addWidget(btn)
-        return w
+        outer.addWidget(wrap_scroll(body))
+        return page
+
+    @staticmethod
+    def _f3(v) -> str:
+        return f"{v:.3f}" if isinstance(v, (int, float)) and v == v \
+            else "n/a"
+
+    def _nested_table(self, payload) -> QtWidgets.QTableWidget:
+        """Best-per-level + the overall winner as one zebra table with
+        the app's metric coloring (green >= .90 / amber >= .70 — same
+        thresholds as the Train-page compare table)."""
+        winner = payload.get("winner") or {}
+        validated = payload.get("validated") or {}
+        rows = []                        # (label, arch, metrics, bold)
+        for level in (1, 2, 3):
+            cands = validated.get(level) or []
+            if cands:
+                b = max(cands, key=lambda e: self._num(
+                    e.get("metrics"), "f1", -1.0))
+                rows.append((f"Best {level}-Model", b.get("arch") or [],
+                             b.get("metrics") or {}, False))
+        if winner.get("arch"):
+            rows.append((f"★ Winner ({len(winner['arch'])}-Model)",
+                         winner["arch"], winner.get("metrics") or {},
+                         True))
+        headers = ["Level", "Architecture", "Macro-F1", "Sens", "Spec",
+                   "AUC", "Acc"]
+        keys = ("f1", "sens", "spec", "auc", "acc")
+        t = QtWidgets.QTableWidget(len(rows), len(headers))
+        t.setHorizontalHeaderLabels(headers)
+        t.verticalHeader().setVisible(False)
+        t.verticalHeader().setDefaultSectionSize(26)
+        t.setEditTriggers(EDIT_NO)
+        t.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        t.setFocusPolicy(QtCore.Qt.NoFocus)
+        t.setAlternatingRowColors(True)
+        for r, (lab, arch, m, bold) in enumerate(rows):
+            it = QtWidgets.QTableWidgetItem(lab)
+            if bold:
+                f = it.font()
+                f.setBold(True)
+                it.setFont(f)
+            t.setItem(r, 0, it)
+            it = QtWidgets.QTableWidgetItem(" → ".join(arch))
+            if bold:
+                f = it.font()
+                f.setBold(True)
+                it.setFont(f)
+            t.setItem(r, 1, it)
+            for c, key in enumerate(keys, start=2):
+                v = self._num(m, key)
+                it = QtWidgets.QTableWidgetItem(self._f3(v))
+                if bold:
+                    f = it.font()
+                    f.setBold(True)
+                    it.setFont(f)
+                if v == v:               # NaN-safe metric coloring
+                    it.setBackground(
+                        qc.QtGui.QColor(*uh.metric_bg(v)))
+                    it.setForeground(qc.QtGui.QColor(uh.metric_fg(v)))
+                t.setItem(r, c, it)
+        t.resizeColumnsToContents()
+        t.horizontalHeader().setSectionResizeMode(1, HEADER_STRETCH)
+        h = len(rows) * 26 + 34          # natural height, no inner bar
+        t.setMinimumHeight(h)
+        t.setMaximumHeight(h)
+        return t
+
+    def _significance_block(self, sig) -> QtWidgets.QGroupBox:
+        """Verdict pill + one hint line with the McNemar / seed numbers."""
+        box = QtWidgets.QGroupBox("Significance (auto)")
+        v = QtWidgets.QVBoxLayout(box)
+        v.setSpacing(6)
+        p = sig.get("mcnemar_p")
+        significant = isinstance(p, (int, float)) and p < 0.05
+        head = QtWidgets.QHBoxLayout()
+        head.addWidget(uh.pill(
+            ("✔  SIGNIFICANT" if significant
+             else "✖  NOT significant"),
+            "green" if significant else "slate"))
+        head.addStretch(1)
+        v.addLayout(head)
+        detail = (f"vs best single ({sig.get('baseline', '?')}, F1 "
+                  f"{self._f3(sig.get('baseline_f1'))}): McNemar "
+                  f"b={sig.get('mcnemar_b', '?')} "
+                  f"c={sig.get('mcnemar_c', '?')} → "
+                  f"p={self._f3(p)}")
+        f1s = [x for x in sig.get("seed_f1s", [])
+               if isinstance(x, (int, float))]
+        if f1s:
+            mean = sum(f1s) / len(f1s)
+            sd = (sum((x - mean) ** 2 for x in f1s)
+                  / max(len(f1s) - 1, 1)) ** 0.5
+            detail += (f" · Seed stability ({len(f1s)} seeds): F1 "
+                       f"{mean:.3f} ± {sd:.3f} "
+                       f"({', '.join(f'{x:.3f}' for x in f1s)})")
+        lbl = QtWidgets.QLabel(detail)
+        lbl.setObjectName("CardHint")
+        lbl.setWordWrap(True)
+        v.addWidget(lbl)
+        return box
+
+    def _prep_box(self) -> QtWidgets.QGroupBox:
+        """Preprocessing (as trained): the six summary groups as chips
+        (always visible) + the full parameter zebra table behind a
+        ▸/▾ toggle (2026-09-11 UI round)."""
+        prep = self._prep_params()
+        box = QtWidgets.QGroupBox("Preprocessing (as trained)")
+        v = QtWidgets.QVBoxLayout(box)
+        v.setSpacing(8)
+        if prep is None:
+            note = QtWidgets.QLabel(
+                "n/a (run restored from disk — preprocessing not "
+                "recorded)")
+            note.setObjectName("CardHint")
+            v.addWidget(note)
+            return box
+        grid = QtWidgets.QGridLayout()
+        grid.setSpacing(6)
+        for i, text in enumerate(prep_compact(prep).split(" · ")):
+            grid.addWidget(uh.pill(text, "slate"), i // 3, i % 3)
+        v.addLayout(grid)
+        table = self._param_table(prep)
+        table.setVisible(False)
+
+        def _flip(on: bool):
+            table.setVisible(on)
+            toggle.setText("▾  Hide parameters" if on else
+                           f"▸  Show all {table.rowCount()} parameters")
+        toggle = QtWidgets.QToolButton()
+        toggle.setCheckable(True)
+        toggle.setChecked(False)
+        toggle.setCursor(qc.POINTING_HAND)
+        toggle.setStyleSheet("border:none; font-weight:600; "
+                             "color:#475569;")
+        toggle.toggled.connect(_flip)
+        _flip(False)                     # set the collapsed label
+        v.addWidget(toggle)
+        v.addWidget(table)
+        return box
+
+    @staticmethod
+    def _param_table(params) -> QtWidgets.QTableWidget:
+        rows = prep_param_rows(params)
+        t = QtWidgets.QTableWidget(len(rows), 2)
+        t.setHorizontalHeaderLabels(["Parameter", "Value"])
+        t.verticalHeader().setVisible(False)
+        t.verticalHeader().setDefaultSectionSize(24)
+        t.setEditTriggers(EDIT_NO)
+        t.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        t.setFocusPolicy(QtCore.Qt.NoFocus)
+        t.setAlternatingRowColors(True)
+        for r, (k, val) in enumerate(rows):
+            k_it = QtWidgets.QTableWidgetItem(k)
+            k_it.setForeground(qc.QtGui.QColor("#64748b"))
+            t.setItem(r, 0, k_it)
+            t.setItem(r, 1, QtWidgets.QTableWidgetItem(val))
+        t.resizeColumnsToContents()
+        t.horizontalHeader().setSectionResizeMode(1, HEADER_STRETCH)
+        h = len(rows) * 24 + 34          # natural height, no inner bar
+        t.setMinimumHeight(h)
+        t.setMaximumHeight(h)
+        return t
 
     def _on_save(self):
         pw = self.parent()
@@ -1629,11 +2010,7 @@ class MainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _wrap_scroll(page: QtWidgets.QWidget) -> QtWidgets.QScrollArea:
         """Make a page scrollable when its content exceeds the window."""
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidget(page)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        return scroll
+        return wrap_scroll(page)
 
     @staticmethod
     def card(title: str, hint: str = ""):
@@ -2179,16 +2556,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 w.valueChanged.connect(self._schedule_preview)
 
         prev_card, cv = self.card("Preview",
-                                  "One row per class: raw (left) · after "
-                                  "the pipeline (right). The graph fills "
-                                  "the page width and updates itself "
+                                  "One row per class showing the MEAN of "
+                                  "all spectra of that class: raw (left) · "
+                                  "after the pipeline (right). The graph "
+                                  "fills the page width and updates itself "
                                   "whenever you change a parameter.")
         holder, self.prep_canvas = plotting.canvas_with_toolbar(
             width=11, height=5)
         self.prep_canvas.setMinimumHeight(400)   # keep rows readable
         cv.addWidget(holder, 1)
+        paired_card, pcv = self.card(
+            "Paired features (as trained)",
+            "What the Paired / Paired + PQN training modes feed the "
+            "model: each spectrum minus its PATIENT'S OWN normal "
+            "reference (left) — the right panel first applies PQN "
+            "scale-correction (Dieterle 2006). Up to 6 both-class "
+            "patients sampled; refreshes live with the pipeline.")
+        pholder, self.paired_canvas = plotting.canvas_with_toolbar(
+            width=11, height=3)
+        self.paired_canvas.setMinimumHeight(300)
+        pcv.addWidget(pholder, 1)
         v.addWidget(param_card)
         v.addWidget(prev_card)
+        v.addWidget(paired_card)
         self._update_pipeline_strip()
         self._draw_prep_empty_state()
         return page
@@ -2204,6 +2594,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 color=plotting.COL_RAW, fontsize=11)
         ax.set_axis_off()
         self.prep_canvas.draw_idle()
+        self._draw_paired_preview(None)
 
     def _update_pipeline_strip(self):
         """Refresh the live step chips over the parameter panels."""
@@ -5107,6 +5498,19 @@ class MainWindow(QtWidgets.QMainWindow):
                       + (f", {n_pat} patients (paired design)"
                          if n_pat else ""))
                 + "</p>")
+        try:
+            # same source and guard as the .txt report ("as trained":
+            # training-time snapshot first) — the HTML page used to
+            # omit preprocessing entirely
+            _p_train = (getattr(self, "_params_at_train", None)
+                        or self.read_params().validate())
+            _prep_rows = "".join(
+                f"<tr><th>{esc(k)}</th><td>{esc(v)}</td></tr>"
+                for k, v in prep_param_rows(_p_train))
+            parts.append("<h2>Preprocessing (as trained)</h2>"
+                         f"<table>{_prep_rows}</table>")
+        except Exception:
+            pass
         if w is not None:
             # ONE number (2026-09-08): the nested honest estimate; a
             # visible warning replaces it only if it never ran
@@ -5872,50 +6276,150 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.spectra:
             self._preview_timer.start()
 
+    def _paired_preview_subset(self, params, prefer=(),
+                               max_patients: int = 6):
+        """Deviation-feature sample for the Preprocess-page paired row:
+        the REAL paired.paired_features math (the very call training
+        makes) on up to `max_patients` patients that have both classes
+        — representative yet fast enough for the live preview. Patients
+        behind `prefer` indices (the class representatives plotted in
+        the rows above) come first. None when not patient-grouped."""
+        if not self.groups or not self.spectra:
+            return None
+        by_patient: dict[str, dict[str, list[int]]] = {}
+        for i, (g, lab) in enumerate(zip(self.groups, self.labels)):
+            by_patient.setdefault(g, {}).setdefault(lab or "", []).append(i)
+
+        def _has_both(cls_idx) -> bool:   # paired.py class convention
+            return bool((cls_idx.get("Normal") or cls_idx.get("normal"))
+                        and (cls_idx.get("Tumor") or cls_idx.get("tumor")))
+        patients = [g for g, cls in by_patient.items() if _has_both(cls)]
+        if not patients:
+            return None
+        pref = {self.groups[i] for i in prefer if i < len(self.groups)}
+        patients.sort(key=lambda g: g not in pref)   # stable: keep order
+        chosen = patients[:max_patients]
+        idx = sorted(i for g in chosen
+                     for cls in by_patient[g].values() for i in cls)
+        labels_sub = [self.labels[i] for i in idx]
+        groups_sub = [self.groups[i] for i in idx]
+        import paired as paired_mod
+        out: dict = {"n_patients": len(chosen),
+                     "n_total_patients": len(patients)}
+        for key, use_pqn in (("plain", False), ("pqn", True)):
+            pd_ = paired_mod.paired_features(
+                self.X_raw[idx], labels_sub, groups_sub, self.grid,
+                params, use_pqn=use_pqn)
+            out[key] = {"wn": pd_.wn}
+            for cls in ("Normal", "Tumor"):
+                rows = pd_.X[[j for j, lab in enumerate(pd_.y)
+                              if lab == cls]]
+                if len(rows):
+                    out[key][cls] = {"traces": list(rows),
+                                     "mean": rows.mean(axis=0)}
+        return out
+
     def preview_preprocess(self):
         if not self.spectra:
             self.log("Load data first (Start page).")
             self.statusBar().showMessage("Load data first — nothing to "
                                          "preview yet.")
             return
-        # one representative spectrum per class: a Data-page selection wins
-        # for its class, remaining classes fall back to their first spectrum
+        # one representative index per class (a Data-page selection wins,
+        # else first-of-class) — used ONLY to rank the paired-preview's
+        # patients; the graph itself shows the per-class MEAN spectrum
+        # (2026-09-12 user request: "show the mean, not one single patient")
         picks: dict[str, int] = {}
         for i in self._selected_indices():
             picks.setdefault(self.labels[i] or "?", i)
         for i, lab in enumerate(self.labels):
             picks.setdefault(lab or "?", i)
-        # the graph grows with the class count — every raw/processed row
-        # stays readable and the page scrolls as needed
-        self.prep_canvas.setMinimumHeight(
-            int(100 * max(5.0, 2.3 * len(picks) + 0.8)))
         params = self.read_params().validate()
         busy(True)
         try:
             m = preprocessing.crop_mask(self.grid, params)
             wn = self.grid[m]
-            proc = {c: preprocessing.preprocess_spectrum(self.X_raw[i][m],
-                                                         params)
-                    for c, i in picks.items()}
+            # per-class MEAN rows: raw mean over ALL spectra of the class
+            # (same pattern as the Data page's "Plot class means") and the
+            # MEAN OF PREPROCESSED spectra — pipeline-consistent with
+            # training's preprocess_matrix (normalization/baseline are
+            # nonlinear, so preprocessed(mean) would differ; mean of the
+            # cached processed matrix is both correct and fast)
+            Xp = self.get_processed_X()
+            rows = {}
+            for c in picks:
+                mask = np.array([i for i, l in enumerate(self.labels)
+                                 if (l or "?") == c])
+                raw_mean = self.X_raw[mask][:, m].mean(axis=0)
+                proc_mean = Xp[mask].mean(axis=0)
+                rows[c] = (raw_mean, proc_mean, int(len(mask)))
+            # paired deviation sample (2026-09-11): the features the
+            # Paired / Paired+PQN training modes actually build — one
+            # extra preview row, both modes side by side
+            paired_pv = self._paired_preview_subset(
+                params, prefer=picks.values())
         finally:
             busy(False)
+        # the graph grows with the class count — every raw/processed row
+        # stays readable and the page scrolls as needed
+        self.prep_canvas.setMinimumHeight(
+            int(100 * max(5.0, 2.3 * len(picks) + 0.8)))
         fig = self.prep_canvas.figure
         fig.clf()
         for r, c in enumerate(sorted(picks)):
-            i = picks[c]
-            raw = self.X_raw[i][m]
+            raw_mean, proc_mean, n_cls = rows[c]
             ax1 = fig.add_subplot(len(picks), 2, 2 * r + 1)
             ax2 = fig.add_subplot(len(picks), 2, 2 * r + 2)
-            plotting.plot_preprocess_preview(ax1, ax2, wn, raw, proc[c])
-            # basename only — the full relpath overflows the panel title
-            short = self.spectra[i].name.rsplit("/", 1)[-1]
-            ax1.set_title(f"Raw · {c} — {short}", fontsize=9)
-            ax2.set_title(f"Preprocessed · {c}", fontsize=9)
+            plotting.plot_preprocess_preview(ax1, ax2, wn, raw_mean,
+                                             proc_mean)
+            ax1.set_title(f"Raw mean · {c} (n={n_cls})", fontsize=9)
+            ax2.set_title(f"Preprocessed mean · {c}", fontsize=9)
         self.prep_canvas.draw_idle()
+        # paired / paired+PQN deviation features → their own card
+        self._draw_paired_preview(paired_pv)
         self._previewed_for = self._data_key
         self.statusBar().showMessage(
-            f"Preview of {'/'.join(sorted(picks))} spectra — adjust "
-            "settings or continue to Train.")
+            f"Preview — class means of {'/'.join(sorted(picks))} — "
+            "adjust settings or continue to Train.")
+
+    def _draw_paired_preview(self, paired_pv):
+        """Paired / Paired+PQN deviation features on their own
+        Preprocess-page card; friendly placeholder when the data is
+        not patient-grouped (or not loaded yet)."""
+        fig = self.paired_canvas.figure
+        fig.clf()
+        if not paired_pv:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5,
+                    "Paired features need patient-grouped data\n"
+                    "(clinical layout: Normal\\Patient_xx and "
+                    "Tumor\\TDOCxxx folders).\n"
+                    "Load a paired dataset to see them here.",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color=plotting.COL_RAW, fontsize=11)
+            ax.set_axis_off()
+        else:
+            sub = (f" · {paired_pv['n_patients']} patients"
+                   + (f" of {paired_pv['n_total_patients']}"
+                      if paired_pv["n_total_patients"]
+                      > paired_pv["n_patients"] else ""))
+            for c_idx, (key, ttl) in enumerate((
+                    ("plain", "Paired — minus patient's own normal"),
+                    ("pqn", "Paired + PQN (Dieterle 2006)"))):
+                ax = fig.add_subplot(1, 2, c_idx + 1)
+                series = []
+                for cls in ("Normal", "Tumor"):
+                    d = paired_pv[key].get(cls)
+                    if d:
+                        series.append({
+                            "label": cls,
+                            "color": (COL_RESULT if cls == "Tumor"
+                                      else COL_RAW),
+                            "traces": d["traces"], "mean": d["mean"]})
+                plotting.plot_paired_deviations(
+                    ax, paired_pv[key]["wn"], series, title=ttl + sub)
+        fig.tight_layout()
+        self.paired_canvas.draw_idle()
 
     # ================================================== preprocessing auto-tune
     def run_optimize(self):
@@ -8250,7 +8754,8 @@ class MainWindow(QtWidgets.QMainWindow):
             modeling.save_bundle(
                 os.path.join(out_dir, "winner.joblib"), winner,
                 self.grid,
-                self._params_at_train or self.read_params().validate(),
+                getattr(self, "_params_at_train", None)
+                or self.read_params().validate(),
                 dataset_name=self._source_folder or "",
                 paired=self._paired_mode, pqn=self._pqn_mode,
                 **({"calibrator": fin["calibrator"]}
@@ -8311,7 +8816,11 @@ class MainWindow(QtWidgets.QMainWindow):
                        "spec": (m["spec"], 0.0)})
             modeling.save_bundle(
                 path, winner_ns, self.grid,
-                self.read_params().validate(),
+                # training-time snapshot first (matches on_seq_done and
+                # the reports) so post-run GUI tweaks never leak into
+                # the bundle
+                getattr(self, "_params_at_train", None)
+                or self.read_params().validate(),
                 dataset_name=self._source_folder or "",
                 paired=self._paired_mode, pqn=self._pqn_mode, **extras)
             self.settings["last_model"] = path

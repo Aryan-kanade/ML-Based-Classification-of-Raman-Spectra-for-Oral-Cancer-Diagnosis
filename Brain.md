@@ -456,6 +456,10 @@ the stored **threshold is re-mapped through `apply_platt`** (predict-time
 space). `predict_with_bundle`: interpolate onto stored grid → stored
 preprocessing → optional paired reference subtraction → Platt →
 threshold; tolerates legacy uncropped bundles (feature-length guessing).
+`prep_params` convention: every writer passes the TRAINING-time
+snapshot `_params_at_train` when one exists (the 3SSE dialog-button
+save `on_seq_save` was the last holdout reading live spinboxes at
+click time — fixed 2026-09-11 §48).
 
 ## 13. Real study results (2026-08-30, seed 42, 5-fold grouped ×3)
 
@@ -610,6 +614,20 @@ preview time (`100·max(5, 2.3n+0.8)`); **live preview**: every param
 widget is
 connected to `_schedule_preview` → 350 ms single-shot `_preview_timer`
 → redraw (bursts from `_apply_params` collapse into one redraw).
+**Paired features card (2026-09-11 §48c; own card 2026-09-12)**:
+patient-grouped data gets a DEDICATED card "Paired features (as
+trained)" below the Preview card (`self.paired_canvas`, own toolbar,
+min height 300) — left "Paired — minus patient's own normal", right
+"Paired + PQN (Dieterle 2006)" — built by
+`MainWindow._paired_preview_subset` (≤6 both-class patients, preferred
+= the plotted representatives) calling the REAL
+`paired.paired_features` twice (`use_pqn=False/True`, the identical
+training call); drawn by `plotting.plot_paired_deviations` (faint
+traces alpha .15 + bold class means, Tumor `COL_RESULT` / Normal
+`COL_RAW`, dotted zero line, legend "… mean (n=…)"). Not grouped /
+no data → `_draw_paired_preview(None)` placeholder text on the card
+(also used by `_draw_prep_empty_state`). Class-preview canvas stays
+one-row-per-class exactly as before.
 
 **Train**: `combo_mode` = Standard / Margin (vs own normal) / Margin+PQN
 (idx ≥1 ⇒ paired, needs groups); `model_checks` 14 checkboxes from
@@ -725,7 +743,9 @@ winner, comparison, predictions+triage, plain reading, literature table
 (Han 2022 / 2025 OSCC meta / Purohit 2026 / VELscope / toluidine blue),
 PPV/NPV by setting, TRIPOD+AI reporting, deep evaluation, per-patient
 top-worst-5, FDR band stats. HTML = printable, embedded CSS + 6 base64
-PNGs @150 dpi, predictions ≤300 rows.
+PNGs @150 dpi, predictions ≤300 rows; since 2026-09-11 (§48) the HTML
+page ALSO carries the full **Preprocessing (as trained)** table right
+after Dataset (was txt-only before).
 
 **settings.json** (live UI state — drifts per session; not canonical):
 params (mirrors §6 defaults), folds, seed, models (gated by
@@ -816,7 +836,25 @@ are possible and documented.
   exact McNemar (winner OOF vs best-single OOF, identical folds) +
   3-seed stability; shown in the winner tab ("SIGNIFICANCE (auto)").
   Dialog: **"Export this tab to CSV…"** (active ranking tab →
-  utf-8-sig CSV). NOTE: ad-hoc driver scripts that call
+  utf-8-sig CSV; since 2026-09-11 every export starts with a
+  `# Preprocessing (as trained): …` comment row). **"Export results as
+  HTML…"** (new 2026-09-11 §48): pure builder `seq_results_html(payload,
+  params, rankings)` writes one self-contained printable page —
+  preprocessing table, winner + metrics, nested best-per-level,
+  significance, all three ranking tables; works for restored runs too
+  (params note degrades to "not recorded"). **Winner tab REDESIGNED
+  (2026-09-11 §48, UI round 2)**: whole tab inside a scroll area
+  (module `wrap_scroll`, `MainWindow._wrap_scroll` now delegates);
+  ChainFlowWidget + metric pills + baseline CardHint on top;
+  nested-validation as ONE zebra QTableWidget [Level | Architecture |
+  F1 | Sens | Spec | AUC | Acc] with bold "★ Winner (N-Model)" row and
+  per-cell metric coloring (`uh.metric_bg/fg`); significance =
+  green/slate verdict pill + CardHint detail; preprocessing = 6 slate
+  summary chips (from `prep_compact().split(" · ")`) + ▸/▾ collapsible
+  full 21-row zebra table (`SeqResultsDialog._param_table`);
+  restored-run `report_text` fallback in a DiagPanel; tab labels elide
+  + default size 940×620 (was 880×600 — fourth tab used to clip).
+  NOTE: ad-hoc driver scripts that call
   `sequential.search` must live IN raman_app (loky main-module
   pickling from a $TEMP __main__ segfaults; main.py is unaffected).
 - Tests (in test_all.py): space counts/order/no-repeats, search smoke,
@@ -1177,7 +1215,7 @@ snapshot ensembles (cyclic LR not worth tuning).
 
 | Suite | What it proves | Runtime |
 |---|---|---|
-| `test_all.py` (93) | loader hygiene (incl. site-token), preprocessing, grouped+repeated CV/ensembles, bundle roundtrip, optimize, ViT forward/checkpoint, clinical stats, biochem, FDR/Friedman + regressions (clinical reproduce path, paired single-preprocess, OOF repeat pooling, patient bootstrap, data-root discovery, device-portability scan; 2026-09-06: CONTIGUOUS calibration-bins regression, auc_power formula regression; 2026-09-07: clear-training menu action; 2026-09-08: 3SSE fair singles, mode roundtrip, honest-number display, 3SSE-mode respect, pqn bundle flags) | ~2 min |
+| `test_all.py` (101) | loader hygiene (incl. site-token), preprocessing, grouped+repeated CV/ensembles, bundle roundtrip, optimize, ViT forward/checkpoint, clinical stats, biochem, FDR/Friedman + regressions (clinical reproduce path, paired single-preprocess, OOF repeat pooling, patient bootstrap, data-root discovery, device-portability scan; 2026-09-06: CONTIGUOUS calibration-bins regression, auc_power formula regression; 2026-09-07: clear-training menu action; 2026-09-08: 3SSE fair singles, mode roundtrip, honest-number display, 3SSE-mode respect, pqn bundle flags; 2026-09-11 §48: prep-param render helpers, pure 3SSE HTML builder, HTML-report preprocessing section; §48b: winner-tab UI; §48c: paired preview row) | ~2 min |
 | `deep_test.py` (19) | blank-GUI guards, one-class train, predict edge paths, legacy bundles, clinical auto refs, locked eval (+`_lc_data_key` tag in hand-built scenarios), HTML report, deep diagnostics, reset-session, train-tabs layout, CLI roundtrip (cwd-safe since 2026-09-06) | ~60 s |
 | `gui_test.py` (8 steps) | 6-page walk: load→preprocess→train→save→predict→result→report (report asserted in the TEMP APP_DIR since 2026-09-06, not in-tree) | ~20 s |
 
@@ -2311,8 +2349,8 @@ plots (Data/Train `plot_spectra`, Predict/Result
 `plot_prediction_spectra`, overview `plot_prediction`) deliberately
 ran the "Raman convention" high→low (3862 left → 15.5 right) via
 three `ax.invert_xaxis()` calls (plotting.py 144/280/463). Removed
-all three → every spectrum axis reads normally: low wavenumbers on
-the LEFT rising to the right (matches the prep preview, which was
+all three → every spectrum axis reads normally: low wavenumbers on the
+LEFT rising to the right (matches the prep preview, which was
 already ascending, and the probability axes). Descending wn input
 arrays are fine (matplotlib auto-scales ascending). Band spans/
 annotations direction-neutral. Verified in isolated figures
@@ -2322,3 +2360,117 @@ high→low" note updated. UNCOMMITTED at writing; app RESTART required
 (stale running instances hold old code — that is why earlier fixes
 "didn't change" the graphs the user saw).
 Uncommitted.
+
+## 48. 2026-09-11 — preprocessing parameters VISIBLE everywhere the
+3SSE winner travels (user request: "add preprocessing parameter here
+so I can save it … as a bundle also in export html")
+
+The bundle already stored `prep_params`, but nothing SHOWED it and the
+dialog-button save read live spinboxes at click time. Shipped (gui.py
+only, additive):
+
+- **Shared helpers** `prep_param_rows(params)` (all 21 PreprocessParams
+  fields as readable rows; tolerates plain dicts from legacy bundles)
+  + `prep_compact(params)` one-line summary (`crop 500-2000 cm-1 ·
+  despike off · wavelet sym8 L4 · SG 11/3 · baseline als · norm
+  vector`). Params source = `_params_at_train` snapshot first, else
+  current Preprocess page (same rule as the .txt report).
+- **3SSE Winner tab**: "Preprocessing (as trained)" group box,
+  Consolas selectable label; restored runs without a parent window →
+  "n/a … not recorded".
+- **`on_seq_save` fix**: now `getattr(self, "_params_at_train", None)
+  or read_params()…` like `on_seq_done` — post-run GUI tweaks can no
+  longer leak into a saved 3SSE bundle (§12 updated).
+- **CSV export**: one comment row `# Preprocessing (as trained): …`
+  above the header on every tab export.
+- **NEW "Export results as HTML…" button** in the 3SSE dialog → pure
+  `seq_results_html(payload, params, rankings)`: self-contained page
+  (same CSS family as `save_result_report_html`) with preprocessing
+  table, winner + metrics + baseline, nested best-per-level,
+  significance (McNemar + seeds), all three ranking tables. Default
+  `Desktop/3sse_results.html`. Pure/no-Qt → unit-testable.
+- **Result-page HTML report** now has the "Preprocessing (as
+  trained)" table after Dataset (was txt-only).
+
+Tests: `test_prep_param_rows_and_compact`, `test_seq_results_html`
+(new) + HTML assertion added to `test_supplement_report_and_manifest`
+→ 99/99; gui_test + deep_test 19/19 PASS. §14/§15/§12 updated.
+Uncommitted.
+
+### §48b — same evening, UI round 2 (user: "improve it as UI how we
+show data")
+
+Flat-text winner tab replaced with the app design system:
+- module `wrap_scroll()` (canonical recipe; `MainWindow._wrap_scroll`
+  delegates) — the tab can never clip vertically again;
+- nested validation = one zebra table, bold ★ winner row, per-cell
+  `uh.metric_bg/fg` coloring; significance = verdict pill (✔ green /
+  ✖ slate) + CardHint detail line (also more tolerant: missing
+  seed_f1s / null metrics no longer KeyError, `_f3` NaN-safe);
+- preprocessing box = 6 slate chips (`prep_compact` groups) + ▸/▾
+  QToolButton collapsing the full 21-row zebra table (same pattern as
+  the 3SSE card toggle); restored runs show a "not recorded" CardHint;
+- `report_text` fallback (old saved runs) in a DiagPanel;
+- `tabs.setElideMode(ElideRight)` + default 940×620 fixes the clipped
+  fourth tab label.
+NOTE offscreen: metric pills/chips inflate ~2× under the offscreen
+font metrics (pills row ≈1007px min) → the scroll area h-bar shows in
+offscreen grabs; on real screens the same pills fit the old 880px
+dialog fine. Test `test_seq_dialog_winner_tab_ui` (table rows/bold,
+pill verdict, 6 chips, toggle flip, params-None path) → 100/100;
+gui_test + deep_test + ruff PASS. Uncommitted.
+
+### §48c — 2026-09-12: Paired / Paired+PQN preview graphs on the
+Preprocess page (user: "see the preprocess paired data's graph …
+after normal and tumor graph show both paired and paired + pqn")
+
+`preview_preprocess` gains ONE extra row under the per-class raw/
+processed rows when the dataset is patient-grouped: left panel
+"Paired — minus patient's own normal", right panel "Paired + PQN
+(Dieterle 2006)" — the EXACT deviation features those training modes
+build, so users can see what the model trains on. Implementation:
+`MainWindow._paired_preview_subset(params, prefer, max_patients=6)`
+groups by `self.groups` with paired.py's Normal/Tumor convention,
+prefers the patients of the plotted class representatives, then calls
+the REAL `paired.paired_features` twice (`use_pqn=False/True`) on the
+subset — single source of truth, no math duplication; ≤6 patients
+keeps the live 350 ms-debounced preview fast. New
+`plotting.plot_paired_deviations(ax, wn, series, title)`: faint
+per-spectrum traces (alpha .15) + bold per-class means, Tumor =
+`COL_RESULT` red / Normal = `COL_RAW` slate, dotted zero line,
+legend "… mean (n=…)". Flat ungrouped folders: layout unchanged
+(gui_test unaffected). Canvas height now `2.3·(classes + paired) + 0.8`.
+Verified visually offscreen (Normal mean ≈ 0 line, Tumor mean carries
+the class peak, PQN panel measurably different) +
+`test_paired_preview_row` (axes count 2·3+2, titles, legend counts,
+plain≠pqn means, ungrouped → no paired row) → 101/101; gui_test +
+deep_test 19/19 + ruff PASS. §14 updated. Uncommitted.
+**Update 2026-09-12 (user: "create separate card for it")**: moved
+out of the Preview figure into a DEDICATED card below it —
+`self.paired_canvas` (11×3, own toolbar, `_draw_paired_preview`);
+Preview canvas/hint reverted to per-class rows; not-grouped/empty →
+placeholder text on the paired card. Test updated to match
+(prep canvas 2·3 axes with no Paired titles; paired canvas 2 panels;
+flat data → "patient-grouped" placeholder). 101/101 + gui_test +
+deep_test 19/19 + ruff PASS.
+
+## 49. 2026-09-12 (b) — Preprocess preview shows per-class MEAN
+spectra (user: "show the mean, not one single patient")
+
+`preview_preprocess` rewritten: each class row plots the MEAN of ALL
+spectra of that class instead of one representative file. Raw panel =
+`X_raw[mask][:, m].mean(axis=0)` (same pattern as the Data page's
+Plot-class-means); processed panel = mean OF the preprocessed spectra
+(`Xp = get_processed_X()` cached matrix → `Xp[mask].mean(axis=0)`) —
+pipeline-consistent (normalization/baseline are nonlinear:
+mean(preprocessed) ≠ preprocessed(mean); mean-of-preprocessed matches
+training's `preprocess_matrix` + the paired preview's `rows.mean`
+semantics). Titles: "Raw mean · Normal (n=142)" / "Preprocessed mean
+· Tumor" — patient filename gone, n= shows the class count. The
+representative-index selection (Data-page selection wins, else
+first-of-class) is KEPT solely to feed `_paired_preview_subset`'s
+`prefer` ranking. Preview card text updated to say MEAN. Verified
+live on real data (titles exact, 4 titled panels + twin axes, axes
+ascending per §47) + plotting tests + gui_test + ruff. NOTE: means
+include spike-flagged spectra (exclusion is training-time — same as
+the Data page button). App RESTART required to see it.
