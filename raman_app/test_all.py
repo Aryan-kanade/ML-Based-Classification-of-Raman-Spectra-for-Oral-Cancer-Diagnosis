@@ -922,9 +922,10 @@ def test_text_audit_fixes():
     assert "paired Extra Trees" in html_paired
     assert "(paired mode)" in html_paired
 
-    # 2) How-to / hero count matches the real registry
-    n_models = len(modeling.ALL_MODEL_NAMES)
-    assert f"{n_models} model families" in uh.how_to(n_models)
+    # 2) How-to / hero count matches the SELECTABLE registry (the two
+    # BIOCHEM_MODELS are not creatable in the GUI — 2026-09-17 honesty)
+    n_models = len(modeling.ALL_MODEL_NAMES) - len(gui.BIOCHEM_MODELS)
+    assert f"{n_models} selectable model families" in uh.how_to(n_models)
 
     # 3) canonical deep-eval lines (txt and HTML render the same list)
     app, win = _isolated_main_window()

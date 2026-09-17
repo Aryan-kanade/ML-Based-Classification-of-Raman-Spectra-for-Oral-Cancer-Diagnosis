@@ -993,7 +993,7 @@ def seq_results_html(payload: dict, params,
     if arch:
         parts.append(
             "<h2>Overall winner"
-            f" ({len(arch)}-Model)</h2><table>"
+            f" ({len(arch)}-Model) — nested-validated</h2><table>"
             "<tr><th>Architecture</th>"
             f"<td><b>{esc(' → '.join(arch))}</b></td></tr>"
             f"<tr><th>Macro-F1</th><td>{_m(wm, 'f1')}</td></tr>"
@@ -1069,7 +1069,9 @@ class LikelihoodMeter(QtWidgets.QWidget):
     Slim painted gauge for binary verdicts: colored likelihood zones
     (green / amber / red), a dark marker at the mean P(positive), the
     two clinical cut-off notches (rule-out / rule-in), and a confidence
-    tier label.
+    tier label.  The zone colors and the HIGH/MODERATE/LOW word are
+    FIXED VISUAL HEURISTICS, not model-derived cut-offs — only the
+    dashed notches come from validated operating points (when present).
     """
 
     ZONES = ((0.0, 0.4, "#bbf7d0"), (0.4, 0.6, "#fde68a"),
@@ -2488,8 +2490,9 @@ class MainWindow(QtWidgets.QMainWindow):
         hleft.addWidget(title)
         sub = QtWidgets.QLabel(
             "Oral-cancer detection from SERS Raman spectra — compares "
-            f"<b>{len(modeling.ALL_MODEL_NAMES)} model families</b> and "
-            "keeps the best <b>macro-F1</b>.")
+            f"<b>{len(modeling.ALL_MODEL_NAMES) - len(BIOCHEM_MODELS)} "
+            "selectable model families</b> and keeps the best "
+            "<b>macro-F1</b>.")
         sub.setObjectName("HeroSub")
         sub.setWordWrap(True)
         hleft.addWidget(sub)
@@ -2529,7 +2532,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # the F1 walkthrough, surfaced — fills the column instead of space
         how, hov = self.card("How to use this app")
         htxt = QtWidgets.QLabel(
-            uh.how_to(len(modeling.ALL_MODEL_NAMES)))
+            uh.how_to(len(modeling.ALL_MODEL_NAMES) - len(BIOCHEM_MODELS)))
         htxt.setWordWrap(True)
         hov.addWidget(htxt)
         left_col.addWidget(how, 2)
@@ -2621,7 +2624,9 @@ class MainWindow(QtWidgets.QMainWindow):
         top.addWidget(b_browse)
         b_reload = QtWidgets.QPushButton("Reload")
         b_reload.setToolTip("Re-read the loaded folder (e.g. after adding "
-                            "more spectra).")
+                            "more spectra). WARNING: manual Class-column "
+                            "corrections are discarded — labels come "
+                            "from the files again.")
         b_reload.clicked.connect(self.reload_folder)
         top.addWidget(b_reload)
         sv.addLayout(top)
@@ -3307,9 +3312,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_3sse_fast = QtWidgets.QCheckBox(
             "Fast screening (skip slow models)")
         self.chk_3sse_fast.setToolTip(
-            "Quick preset: 2-fold screening and the three slowest "
-            "models skipped — several times faster, good for "
-            "exploration; uncheck for the full search.")
+            "Quick preset: 2-fold screening, the FOUR slowest models "
+            "skipped (both 1D-CNNs, CatBoost, XGBoost) and 8-epoch CNN "
+            "fits — several times faster, good for exploration; "
+            "uncheck for the full search.")
         self.chk_3sse_fast.toggled.connect(self._update_seq_card)
         run_row.addWidget(self.chk_3sse_fast)
         self.b_3sse_cancel = QtWidgets.QPushButton("Cancel search")
@@ -3395,14 +3401,15 @@ class MainWindow(QtWidgets.QMainWindow):
                  "none": "Uncheck every model",
                  "classical": "PCA-based classical models + PLS-DA "
                               "(interpretable chemometrics)",
-                 "proven": "The 18 model families the measured 2026-09-12 "
-                           "search proved strong on this data (it found "
-                           "the F1 0.757 winner). Excludes the measured-"
-                           "weak families (LDA, PLS-DA, sparse PLS-DA, "
-                           "the CNNs, TabPFN). Best starting point for "
-                           "a 3SSE search.",
-                 "fast": "Everything except the three slowest "
-                         "(1D-CNN, CatBoost, XGBoost)"}[preset])
+                 "proven": f"The {len(self.model_checks) - len(PROVEN_EXCLUDE)} "
+                           "strongest model families (the measured "
+                           "2026-09-12 search proved them on this data; "
+                           "it found the F1 0.757 winner). Excludes the "
+                           "measured-weak families (LDA, PLS-DA, sparse "
+                           "PLS-DA, the CNNs, TabPFN). Best starting "
+                           "point for a 3SSE search.",
+                 "fast": "Everything except the four slowest "
+                         "(both 1D-CNNs, CatBoost, XGBoost)"}[preset])
             b.clicked.connect(
                 lambda _=False, p=preset: self._apply_model_preset(p))
             sel_row.addWidget(b)
@@ -3935,6 +3942,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 1b. tumor-likelihood meter (binary verdicts)
         self.result_meter = LikelihoodMeter()
+        self.result_meter.setToolTip(
+            "Green/amber/red zones and the HIGH/MODERATE/LOW word are "
+            "fixed visual heuristics. The dashed notches are the "
+            "validated rule-out/rule-in thresholds (shown only when "
+            "they exist).")
         v.addWidget(self.result_meter)
 
         # 2. model performance card
@@ -9434,7 +9446,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{pairs:,} two-model chains · {triples:,} three-model "
             f"chains = {total_arch:,} architectures "
             f"(ordered, no repeats; probabilities chained between "
-            f"layers, patient-grouped OOF). Will run on {data_note}"
+            f"layers, patient-grouped OOF; three-model evaluation is "
+            f"beamed to the top 50 pairs). Will run on {data_note}"
             f"{fast_note}{weak_note}.")
         self.seq_estimate.setText(
             f"Rough time estimate: ≈ {est_min:.0f} min "
@@ -9507,13 +9520,16 @@ class MainWindow(QtWidgets.QMainWindow):
         rows = "".join(
             f"{i + 1}. {arch}  <b>{f1:.3f}</b><br>"
             for i, (arch, f1) in enumerate(top5))
-        self.seq_top5.setText(f"<b>Top so far</b><br>{rows}")
+        # provenance: these are quick-screening numbers — the nested
+        # validation re-ranks the survivors; say so on the label itself
+        self.seq_top5.setText(f"<b>Top so far (screening estimate)"
+                              f"</b><br>{rows}")
 
     def on_seq_search_progress(self, done: int, total: int, best: str,
                                f1: float, eta: float):
         self.seq_counter.setText(f"{done:,} / {total:,}")
-        self.seq_best.setText(f"Current best: {best}  ·  macro-F1 "
-                              f"{f1:.3f}")
+        self.seq_best.setText(f"Current best (screening): {best}  ·  "
+                              f"macro-F1 {f1:.3f}")
         self.seq_phase.setText(f"Phase: screening · ETA "
                                f"{eta / 60:.0f} min")
 
@@ -10606,7 +10622,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def show_howto(self):
         QtWidgets.QMessageBox.information(
             self, "How to use this app",
-            uh.how_to(len(modeling.ALL_MODEL_NAMES)))
+            uh.how_to(len(modeling.ALL_MODEL_NAMES) - len(BIOCHEM_MODELS)))
 
     def show_metric_help(self):
         QtWidgets.QMessageBox.information(self, "What the metrics mean",

@@ -1490,7 +1490,10 @@ class ModelResult:
     def summary_row(self) -> list[str]:
         def ms(key):
             m, s = self.macro.get(key, (float("nan"), 0.0))
-            return f"{m:.3f} \u00b1 {s:.3f}"
+            # an exactly-zero std is the placeholder for "single pooled
+            # value, no fold spread" (3SSE/restored winners) — show a
+            # dash rather than implying zero variance
+            return f"{m:.3f} ± {s:.3f}" if s else f"{m:.3f} ± –"
         return [self.name, ms("sens"), ms("spec"), ms("f1")]
 
 

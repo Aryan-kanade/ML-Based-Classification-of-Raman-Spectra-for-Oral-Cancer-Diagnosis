@@ -389,7 +389,9 @@ a sample positive. Instead of the default 0.5, it is tuned inside each
 cross-validation fold to maximize F1, without peeking at the test data.</p>
 <p><b>Cross-validation</b> — the spectra are split into k folds; every
 spectrum gets predicted by a model that never saw it. The reported numbers
-are what you can expect on NEW spectra.</p>"""
+are the best cross-validated estimate; expect SOME DROP on truly new
+spectra, because the winner itself was picked on this same data (the
+Honest check and the locked one-shot evaluation quantify that gap).</p>"""
 
 def how_to(n_models: int = 24) -> str:
     return f"""<h3>How to use this app</h3>
@@ -402,9 +404,13 @@ fixed by double-clicking the Class column.</li>
 ALS baseline correction and normalization. The defaults suit most Raman
 data; press <i>Preview spectrum</i> to see the effect.</li>
 <li><b>Train &amp; Evaluate</b> — press <i>Start training</i>. The app
-compares {n_models} model families (PCA+SVM, Random Forest, PLS-DA,
-XGBoost, 1D-CNN, …) under patient-grouped cross-validation and keeps
-the best macro-F1. Then <i>Save best model…</i>.</li>
+compares {n_models} selectable model families (PCA+SVM, Random Forest,
+PLS-DA, XGBoost, 1D-CNN, …) under patient-grouped cross-validation and
+keeps the best macro-F1 — or pick the <i>3SSE architecture search</i>
+trainer to test every single/paired/chained model combination. The
+⚡Turbo and Fast-screening toggles are LABELED approximations: every
+number they produce is captioned as such. Then
+<i>Save best model…</i>.</li>
 <li><b>Predict</b> — load the saved model once, then choose the folder
 with new spectra and press <i>Predict</i>.</li>
 </ol>"""
