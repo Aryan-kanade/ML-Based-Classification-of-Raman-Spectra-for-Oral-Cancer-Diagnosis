@@ -4094,3 +4094,32 @@ BATCH 3 — text truthing (commit 63bbf1a):
   LikelihoodMeter documents fixed visual zones.
 All three batches: ruff clean, test_all 132/132 (one text pin updated
 to the honest count), gui_test PASS, deep_test 23/23.
+
+## 79. 2026-09-18 — all-model 3SSE at TRUE 5-fold (23-model space,
+## current tree)
+
+First full search under the §77 honest-folds regime: 23 selectable
+models (registry minus BIOCHEM_MODELS), 11,155 architectures, paired
+mode, seed 42, k=5 screening AND k_outer=5 nested validation —
+`sequential.py --out study_run_3sse_k5`.  Tree: the CURRENT 237
+spectra / 55 patients (smaller than every record tree — Data changed
+2026-09-17 ~18:58, unresolved).
+
+WINNER: **PCA + XGBoost → Extra Trees → Random Forest** — F1 0.743 /
+sens 0.740 / spec 0.740 / AUC 0.798 / acc 0.755 (nested, tuned).
+Best single: Random Forest 0.718 (AUC 0.764).  Best 2-model:
+PCA + XGBoost → RF 0.729.  Screening bests: RF 0.718 single /
+RF → Ensemble → ET 0.750 triple.  724 archs early-abandoned.
+
+SIGNIFICANCE: vs best single McNemar b=17 c=11 p=0.345 — NOT
+significant (the fourth independent chaining-verdict repetition: d2,
+d3, method bank, now k5).  Seed stability 0.734 ± 0.009 (0.743 /
+0.734 / 0.725) — tight.
+
+CAVEAT: 0.743 is NOT comparable to the d2 champion 0.757 (measured on
+287/64).  On the current tree 0.743 IS the honest state of the art;
+whether the d2 chain would still beat it requires re-measuring d2 on
+this tree.  Artifacts: study_run_3sse_k5/{report.txt, validated.json,
+winner.json, winner.joblib, significance.json, screening.jsonl,
+run_meta.json}.  GUI auto-restore still prefers d2 (0.757 > 0.743) —
+different-tree comparison, restore labels it.
