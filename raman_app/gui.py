@@ -3345,10 +3345,12 @@ class MainWindow(QtWidgets.QMainWindow):
         bv.addWidget(self.banner_title)
         stats_row = QtWidgets.QHBoxLayout()
         self.stat_values: dict[str, QtWidgets.QLabel] = {}
+        self.stat_notes: dict[str, QtWidgets.QLabel] = {}
         for key, name, note in (
                 ("sens", "SENSITIVITY", "of positive cases caught"),
                 ("spec", "SPECIFICITY", "of negatives ruled out"),
-                ("f1", "F1 SCORE", "balance of both")):
+                ("f1", "F1 SCORE", "balance of both"),
+                ("dec", "DECIDED F1", "confident cases; rest deferred")):
             block = QtWidgets.QWidget()
             bvx = QtWidgets.QVBoxLayout(block)
             bvx.setContentsMargins(0, 0, 0, 0)
@@ -3367,6 +3369,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bvx.addWidget(nt)
             stats_row.addWidget(block)
             self.stat_values[key] = val
+            self.stat_notes[key] = nt
         bv.addLayout(stats_row)
         self.banner_plain = QtWidgets.QLabel("")
         self.banner_plain.setObjectName("CardHint")
@@ -4788,22 +4791,10 @@ class MainWindow(QtWidgets.QMainWindow):
         0.8x numbers this program measured (Brain.md §60).  [] for
         multiclass winners or when no OOF probabilities exist.
         """
-        w = self.winner
-        if (w is None or len(w.classes) != 2
-                or getattr(w, "oof_proba", None) is None
-                or getattr(w, "y_true_encoded", None) is None):
+        s = self._decided_summary()
+        if s is None:
             return []
-        lo, hi, s_at, sp_at = self._op_points_full()
-        if lo is None or hi is None or lo >= hi:
-            return []
-        valid = ~np.isnan(w.oof_proba[:, 1])
-        if not valid.any():
-            return []
-        yv = np.asarray(w.y_true_encoded[valid])
-        pv = w.oof_proba[valid, 1]
-        cal = self._fresh_calibrator()
-        if cal:
-            pv = clin.apply_platt(pv, cal)
+        lo, hi, s_at, sp_at = s["lo"], s["hi"], s["sens_at"], s["spec_at"]
         lines: list[str] = []
         if s_at is not None:
             lines.append(f"Rule-out tier clears negatives with "
@@ -4811,17 +4802,48 @@ class MainWindow(QtWidgets.QMainWindow):
         if sp_at is not None:
             lines.append(f"Rule-in tier acts on positives with "
                          f"spec {sp_at:.3f} (p≥{hi:.2f})")
-        try:
-            conf = clin.decided_case(yv, pv, lo, hi)
-            if conf["n_decided"]:
-                lines.append(
-                    f"Decided-case (two-tier rule): F1 {conf['f1']:.3f} "
-                    f"(sens {conf['sens']:.3f} / spec {conf['spec']:.3f}) "
-                    f"on {conf['coverage']:.0%} of cases — the "
-                    f"indeterminate band is deferred, not scored")
-        except Exception:
-            pass
+        conf = s["conf"]
+        if conf is not None:
+            lines.append(
+                f"Decided-case (two-tier rule): F1 {conf['f1']:.3f} "
+                f"(sens {conf['sens']:.3f} / spec {conf['spec']:.3f}) "
+                f"on {conf['coverage']:.0%} of cases — the "
+                f"indeterminate band is deferred, not scored")
         return lines
+
+    def _decided_summary(self) -> dict | None:
+        """
+        The winner's selective-prediction numbers in one structure:
+        {lo, hi, sens_at, spec_at, conf} where conf is the
+        decided_case dict (f1/sens/spec/coverage) or None.  None when
+        the winner is not binary / has no OOF / has no usable
+        rule-out/rule-in pair.
+        """
+        w = self.winner
+        if (w is None or len(w.classes) != 2
+                or getattr(w, "oof_proba", None) is None
+                or getattr(w, "y_true_encoded", None) is None):
+            return None
+        lo, hi, s_at, sp_at = self._op_points_full()
+        if lo is None or hi is None or lo >= hi:
+            return None
+        valid = ~np.isnan(w.oof_proba[:, 1])
+        if not valid.any():
+            return None
+        yv = np.asarray(w.y_true_encoded[valid])
+        pv = w.oof_proba[valid, 1]
+        cal = self._fresh_calibrator()
+        if cal:
+            pv = clin.apply_platt(pv, cal)
+        conf = None
+        try:
+            c = clin.decided_case(yv, pv, lo, hi)
+            if c["n_decided"]:
+                conf = c
+        except Exception:
+            conf = None
+        return {"lo": lo, "hi": hi, "sens_at": s_at, "spec_at": sp_at,
+                "conf": conf}
 
     def render_result_page(self):
         """Fill the Result page from the current state (called on entry)."""
@@ -4996,6 +5018,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if lo is not None and hi is not None:
                 bits.append(f"rule-out p≤{lo:.2f} (sens ≥90%) · "
                             f"rule-in p≥{hi:.2f} (spec ≥90%)")
+            _ds = self._decided_summary()
+            if _ds and _ds["conf"] is not None:
+                _c = _ds["conf"]
+                bits.append(f"decided-case F1 {_c['f1']:.3f} "
+                            f"({_c['coverage']:.0%} of cases)")
             # Wilson CIs from the pooled confusion matrix (binary)
             try:
                 if w.cm is not None and len(w.classes) == 2:
@@ -5849,6 +5876,14 @@ class MainWindow(QtWidgets.QMainWindow):
             lines.append(f"  Selection CV (old display style — picked "
                          f"the winner, optimistic): "
                          f"{w.macro_f1():.3f}")
+            _ds = self._decided_summary()
+            if _ds and _ds["conf"] is not None:
+                _c = _ds["conf"]
+                lines.append(
+                    f"  Decided-case (confident cases): F1 {_c['f1']:.3f} "
+                    f"(sens {_c['sens']:.3f} / spec {_c['spec']:.3f}) on "
+                    f"{_c['coverage']:.0%} of cases — indeterminate band "
+                    "deferred")
             if w.threshold is not None:
                 lines.append(f"  decision threshold {w.threshold:.3f}")
             if self._region_bands:
@@ -6166,6 +6201,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 "<tr><th>Selection CV (old display style)</th>"
                 f"<td>{w.macro_f1():.3f} — picked the winner, "
                 "optimistic</td></tr>")
+            _ds = self._decided_summary()
+            if _ds and _ds["conf"] is not None:
+                _c = _ds["conf"]
+                parts.append(
+                    "<tr><th>Decided-case (confident cases)</th>"
+                    f"<td>F1 {_c['f1']:.3f} (sens {_c['sens']:.3f} / "
+                    f"spec {_c['spec']:.3f}) on {_c['coverage']:.0%} of "
+                    "cases — indeterminate band deferred</td></tr>")
             lo_r, hi_r = self._op_points_now()
             if lo_r is not None and hi_r is not None:
                 parts.append(
@@ -6564,6 +6607,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for val in self.stat_values.values():
             val.setText("–")
             val.setStyleSheet("")
+        for nt in self.stat_notes.values():
+            nt.setText(nt.text())      # static captions stay
+        self.stat_notes["dec"].setText("confident cases; rest deferred")
         self.banner_plain.setText("")
         self.compare_table.setRowCount(0)
         self.perclass_table.setRowCount(0)
@@ -8835,6 +8881,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.banner_plain.text()
                 + "\nOld display style (selection CV — picked the "
                   f"winner, optimistic): F1 {w.macro_f1():.3f}")
+        except Exception:
+            pass
+        # DECIDED F1 pill (2026-09-17: the honest 0.8 as a headline
+        # number) — the two-tier rule's F1 on confident cases, with the
+        # deferred fraction stated; "–" for multiclass/no-OOF winners
+        try:
+            dec = self.stat_values["dec"]
+            dec_note = self.stat_notes["dec"]
+            s = self._decided_summary()
+            conf = s["conf"] if s else None
+            if conf is not None:
+                dec.setText(f"{conf['f1']:.3f}")
+                dec.setStyleSheet(
+                    f"color:{uh.metric_fg(conf['f1'])};")
+                dec_note.setText(f"on {conf['coverage']:.0%} of cases")
+            else:
+                dec.setText("–")
+                dec.setStyleSheet("")
+                dec_note.setText("binary only")
         except Exception:
             pass
 

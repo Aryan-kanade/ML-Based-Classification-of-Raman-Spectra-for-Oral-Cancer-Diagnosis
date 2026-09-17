@@ -3701,3 +3701,20 @@ Gates: test_all 132/132 (+test_legacy_record_artifact, then-now pin
 extended to 3 rows), gui_test PASS (+[5c]), deep_test 23/23, ruff
 clean, real-workspace e2e: historical card visible, selection stat
 live (0.757), legacy button present.
+
+## 65. 2026-09-17 — DECIDED F1 promoted to a banner headline pill
+
+User: "strictly 0.8+ now, do whatever you can."  Position held: no
+fake all-cases number (asymptote 0.723 / 130 methods / cleaning null
+— §60).  The honest 0.8 promoted instead: the Train banner gains a
+4TH STAT PILL "DECIDED F1" beside Sens/Spec/F1 — value 0.800 with
+dynamic note "on 56% of cases" for the d2 winner; "– / binary only"
+for multiclass/no-OOF.  Refactor: `_decided_summary()` (single source
+for the decided math; `_decided_lines` renders from it); note labels
+now tracked in `stat_notes`.  Also added: Result-page model note +
+txt/HTML "Winning model" rows carry the decided-case line.  Gates:
+132/132, gui PASS (+[5b] pill pins: binary fills, multiclass "–"),
+deep 23/23, ruff clean, e2e: pills {0.753/0.753/0.757/0.800}.
+settings.json observation: the user's live session shows the ⏳
+Legacy button in active use (legacy params + all-25 saved) — their
+state, untouched.

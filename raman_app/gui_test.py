@@ -181,6 +181,15 @@ def main() -> int:
     assert any("Rule-out" in d or "Rule-in" in d for d in dlines), dlines
     banner_txt = win.banner_plain.text()
     assert "of cases" in banner_txt, "decided-case line must reach banner"
+    # DECIDED F1 pill: binary winner → value + coverage note
+    assert win.stat_values["dec"].text() != "–", \
+        "DECIDED F1 pill must fill for a binary winner"
+    assert "% of cases" in win.stat_notes["dec"].text()
+    win.winner = winner                    # restore for the sections below
+    win._set_result_banner()
+    # multiclass winner → the pill must show "–" with the binary note
+    assert win.stat_values["dec"].text() == "–"
+    assert win.stat_notes["dec"].text() == "binary only"
     win.winner = winner                    # restore for the sections below
     win._set_result_banner()
     print(f"[5b] then-vs-now card + selective-prediction lines OK "
