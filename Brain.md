@@ -4014,3 +4014,29 @@ degenerate-metric fallbacks.  Gotcha #10 updated accordingly.
 Tree: 35,847 → 29,109 lines.  §3 file map refreshed.
 Gates (all green, same session): ruff clean, test_all 132/132,
 gui_test PASS, deep_test 23/23 (incl. stress B/C/D subprocesses).
+
+## 77. 2026-09-17 — HONEST FOLDS: the silent 2-fold screening cap is
+## gone (user directive: "what we show from GUI should be as it is in
+## backend")
+
+User confronted the discrepancy: the Train spinner says N folds but
+`search()`'s successive-halving rule `k_s = min(k, 2)` silently
+screened at 2 folds for every space > 600 architectures — i.e. EVERY
+real GUI search in project history screened at 2 folds while the card
+estimated with the spinner's k.  Verdict: unethical; fixed:
+- `sequential.search`: `k_s = k` — screening runs at EXACTLY the
+  requested folds, all callers (the GUI spinner, CLI --k, drivers).
+- `SeqSearchWorker`: `validate_top(..., k_outer=self.k)` — nested
+  validation outer folds now follow the spinner too (was pinned 5).
+- 3SSE card estimate divisor 240 → 160: the old constant was
+  calibrated on capped (2-fold) runs, so it under-predicted the now-
+  honest cost (~0.38 s/arch·fold measured).  Fast screening keeps its
+  DISCLOSED opt-in "2-fold, slow models skipped" label — explicit and
+  labeled is honest; silent is not.
+Cost of honesty: a default GUI search (16 models, 3,616 archs) at
+k=5 now screens 2.5× more fits than before (~45-60 min screening);
+the beam + early-abandon remain the speed engines.  Background
+all-model runs launched 2026-09-17 evening (23 models / 11,155 archs,
+k=10 then k=5, study_run_3sse_k10 paused @ 149 archs, k5 running)
+were unaffected semantically (both already screened at true k).
+Gates: ruff clean, test_all 132/132, gui_test PASS.
