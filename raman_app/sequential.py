@@ -628,8 +628,9 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
 
     # successive-halving: big spaces screen at 2-fold — validate_top()
     # re-ranks the survivors at full fidelity, so cheap screening noise
-    # never reaches the winner
-    k_s = min(k, 2) if total > 600 else k
+    # never reaches the winner.  An explicit deep-sweep k > 3 is
+    # honored as-is (all stock callers pass k <= 3).
+    k_s = k if k > 3 else (min(k, 2) if total > 600 else k)
 
     def _metrics_from_rec(rec):
         return {m: v for m, v in rec.items()
@@ -1475,6 +1476,8 @@ def main(argv=None) -> int:
                     choices=["standard", "paired", "paired-pqn"])
     ap.add_argument("--k", type=int, default=3,
                     help="screening CV folds (default 3)")
+    ap.add_argument("--k-outer", type=int, default=5,
+                    help="nested-validation outer folds (default 5)")
     ap.add_argument("--top", type=int, default=20,
                     help="full-validation candidates per level")
     ap.add_argument("--jobs", type=int, default=-2)
@@ -1540,7 +1543,7 @@ def main(argv=None) -> int:
     validated: dict[int, list] = {}
     if not args.skip_validation:
         validated = validate_top(board, X, y, g, wn, top=args.top,
-                                 seed=args.seed,
+                                 seed=args.seed, k_outer=args.k_outer,
                                  model_names=model_names,
                                  progress=lambda m: print(f"[3sse] {m}",
                                                           flush=True))
@@ -1583,7 +1586,8 @@ def main(argv=None) -> int:
     with open(os.path.join(out_dir, "run_meta.json"), "w",
               encoding="utf-8") as fh:
         json.dump({"seed": args.seed, "mode": args.mode, "k": args.k,
-                   "top": args.top, **meta}, fh, indent=2)
+                   "k_outer": args.k_outer, "top": args.top, **meta},
+                  fh, indent=2)
 
     winner = pick_overall(validated)
     if winner is not None:
