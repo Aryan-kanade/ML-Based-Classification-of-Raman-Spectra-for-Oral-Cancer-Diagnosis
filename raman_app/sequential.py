@@ -497,9 +497,11 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
     {"arch", "level", "pruned_bound"} for early-abandoned triples).
 
     Speed engine (2026-09-05 program):
-      * SUCCESSIVE-HALVING FIDELITY — big spaces screen at 2-fold
-        (k_s = min(k, 2)); the nested validate_top() re-ranks the top-N
-        at full fidelity, so screening noise never reaches the winner.
+      * HONEST FIDELITY (2026-09-17, user directive: the UI must never
+        promise folds the backend doesn't run) — screening runs at
+        EXACTLY the requested k folds; the old silent min(k, 2) cap for
+        big spaces is GONE.  The nested validate_top() still re-ranks
+        the top-N with tuning, so the winner numbers stay full-fidelity.
       * BEAM (prune_pairs, default 50) — triples only for the top-K
         pairs (~8x fewer third-model evaluations).
       * EARLY-ABANDON cutoff from completed triples' f1_mean — the
@@ -626,11 +628,11 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
             ckpt.flush()
         print(f"3SSE: {_fmt_arch(tuple(arch))} failed — {msg}")
 
-    # successive-halving: big spaces screen at 2-fold — validate_top()
-    # re-ranks the survivors at full fidelity, so cheap screening noise
-    # never reaches the winner.  An explicit deep-sweep k > 3 is
-    # honored as-is (all stock callers pass k <= 3).
-    k_s = k if k > 3 else (min(k, 2) if total > 600 else k)
+    # screening fidelity is HONEST: exactly the requested k, no silent
+    # cap (user directive 2026-09-17 — the GUI spinner says N folds, so
+    # N folds is what runs; the beam + early-abandon remain the speed
+    # engines)
+    k_s = k
 
     def _metrics_from_rec(rec):
         return {m: v for m, v in rec.items()

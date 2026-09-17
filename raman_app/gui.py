@@ -475,7 +475,7 @@ class SeqSearchWorker(QtCore.QThread):
         try:
             validated = sequential.validate_top(
                 board, self.X, self.y, self.groups, self.wavenumbers,
-                top=self.top, seed=self.seed,
+                top=self.top, seed=self.seed, k_outer=self.k,
                 progress=lambda m: self.progress.emit(-1, m))
             winner = sequential.finalize_winner(
                 validated, self.X, self.y, self.groups,
@@ -9235,9 +9235,11 @@ class MainWindow(QtWidgets.QMainWindow):
         k = 2 if self.chk_3sse_fast.isChecked() else (
             self.spin_folds.value()
             if hasattr(self, "spin_folds") else 5)
-        # calibrated on the measured full run (4,369 @ k=3 ≈ 55 min
-        # screening + ~25 min validation) — rough by design
-        est_min = total_arch * k / 240 + 60 * 0.4
+        # calibrated on the measured full run (4,369 @ 2-FOLD screening
+        # ≈ 55 min → ~0.38 s per arch·fold) — screening now runs at the
+        # TRUE selected k (the old silent 2-fold cap is gone), so the
+        # honest divisor is 159, rounded to 160.  Validation adds ~25.
+        est_min = total_arch * k / 160 + 60 * 0.4
         data_note = {
             "standard": "UNPAIRED standard spectra",
             "paired": "PAIRED (vs patient's own normal)",
