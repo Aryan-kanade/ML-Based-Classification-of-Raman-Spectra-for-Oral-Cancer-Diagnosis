@@ -3842,3 +3842,24 @@ selective numbers; acquisition upgrades (§60) unchanged as the
 road to 0.8 all-cases.
 Gates: ruff clean, gui_test PASS, deep pending at commit time
 (ran green post-§66; no GUI behavior change beyond constants).
+
+## 71. 2026-09-17 — d3 FINAL SEARCH: the ceiling is confirmed
+
+run_3sse_d3.py: 5,220 architectures on the recovered 287-row tree
+(proven 18 models, winner params, k=5, --top 30 nested validation).
+Winner: **Hist Gradient Boosting -> RF -> Extra Trees, F1 0.760 /
+AUC 0.797 single-seed** — but 3-seed adjudication
+(eval_d3_adjudicate.py, identical folds): **d3 mean 0.730 vs d2 mean
+0.734, McNemar b=5 c=1 p=0.219 -> NOT adopted** (the 0.760 was a
+single-seed draw).  The proven d2 chain (0.757 draw / 0.734 ± 0.017
+mean) remains the champion.
+
+THE CEILING IS NOW CONFIRMED FOUR INDEPENDENT WAYS on this dataset:
+(1) ~130-method bank (best 0.765, not significant);
+(2) push-0.8 noise/cleaning program (null);
+(3) label-fix simulation (both fixes LOWER the number);
+(4) d3 exhaustive search (best new chain ties the old one).
+All-cases honest maximum: **0.731-0.757** depending on seed draw.
+The 0.8+ that exists: decided F1 0.800 @ 56% / screen 0.907 @ 23% /
+rule-out-in 90/91 (selective prediction with stated coverage).
+Beyond that: acquisition upgrades + ~2x cohort (§60 dossier).

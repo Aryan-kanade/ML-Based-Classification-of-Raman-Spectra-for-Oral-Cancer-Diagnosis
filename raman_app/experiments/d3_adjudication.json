@@ -1,0 +1,29 @@
+{
+  "when": "2026-09-17 17:35:57",
+  "d3_arch": [
+    "Hist Gradient Boosting",
+    "Random Forest",
+    "Extra Trees"
+  ],
+  "d2_arch": [
+    "PLS + XGBoost",
+    "Random Forest",
+    "Extra Trees"
+  ],
+  "d3_f1s": [
+    0.7411349345428306,
+    0.7168743509865005,
+    0.7327746741154562
+  ],
+  "d2_f1s": [
+    0.7567796610169493,
+    0.7263426450881352,
+    0.7179288226774261
+  ],
+  "d3_mean": 0.7302613198815958,
+  "d2_mean": 0.7336837095941702,
+  "mcnemar_b": 5,
+  "mcnemar_c": 1,
+  "mcnemar_p": 0.21875,
+  "verdict": "d3 NOT adopted (selection optimism / tie)"
+}
