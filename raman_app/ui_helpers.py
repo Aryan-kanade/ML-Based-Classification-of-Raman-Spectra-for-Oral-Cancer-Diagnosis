@@ -339,13 +339,17 @@ TIPS = {
     "als_lambda": "Baseline stiffness: 10^5 is a good start. Increase "
                   "(10^6-10^7) for very broad humps.",
     "als_p": "Asymmetry: 0.001–0.05. Smaller p keeps the baseline stiff and under the peaks; larger p lets it climb onto peaks.",
-    "als_niter": "Internal iterations — 10 is plenty.",
+    "als_niter": "Internal ALS iterations (10 is plenty). arPLS runs "
+                 "5× THIS NUMBER as its max_iter — shown 10 means up "
+                 "to 50 arPLS iterations.",
     "norm": "vector: scales each spectrum to unit length (default). "
             "snv: standardize each spectrum (mean 0, std 1). none: skip.",
     "folds": "Cross-validation folds: each spectrum is predicted by a model "
              "trained on the others — with clinical (patient-grouped) data "
              "that means the OTHER PATIENTS, so the score reflects new people. "
-             "5 is standard.",
+             "5 is standard. If the data cannot support this count (tiny "
+             "class, few patients), training runs at the largest possible "
+             "fold count and says so in the banner.",
     "seed": "Random seed for the fold shuffle — same seed, same split, "
             "reproducible results.",
     "sens": "Sensitivity (recall): of all truly positive samples (e.g. "

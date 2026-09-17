@@ -91,33 +91,67 @@ class PreprocessParams:
                    wavelet_name="sym8", wavelet_level=4, sg_poly=3,
                    sg_deriv=2, norm="none", wn_calibrate=True)
 
-    def validate(self) -> "PreprocessParams":
+    def validate(self, notes: list[str] | None = None
+                 ) -> "PreprocessParams":
+        """Validated copy (never mutates self).  When `notes` is a list,
+        every clamp/fallback is appended to it in human-readable form so
+        the GUI can show the EFFECTIVE parameters instead of quietly
+        deviating from what the user entered (2026-09-17 honesty)."""
+        def _note(what, old, new):
+            if notes is not None and old != new:
+                notes.append(f"{what} {old} → {new}")
+
         p = PreprocessParams(**asdict(self))
-        p.crop_min = max(0.0, float(p.crop_min))
-        p.crop_max = max(0.0, float(p.crop_max))
+        new = max(0.0, float(p.crop_min))
+        _note("crop min", p.crop_min, new)
+        p.crop_min = new
+        new = max(0.0, float(p.crop_max))
+        _note("crop max", p.crop_max, new)
+        p.crop_max = new
         if p.crop_min and p.crop_max and p.crop_min >= p.crop_max:
+            _note("crop (invalid range)",
+                  f"{p.crop_min:.0f}–{p.crop_max:.0f}", "no crop")
             p.crop_min = p.crop_max = 0.0     # invalid range -> no crop
-        p.despike_z = float(np.clip(p.despike_z, 3.0, 20.0))
-        p.despike_window = int(max(3, p.despike_window))
-        if p.despike_window % 2 == 0:
-            p.despike_window += 1
-        p.wavelet_threshold = (p.wavelet_threshold.lower()
-                               if p.wavelet_threshold.lower() in
-                               ("universal", "bayes", "sure")
-                               else "universal")
-        p.wavelet_mode = (p.wavelet_mode.lower()
-                          if p.wavelet_mode.lower() in
-                          ("soft", "hard", "garrote") else "soft")
-        p.wavelet_cycle = int(np.clip(p.wavelet_cycle, 0, 5))
+        new = float(np.clip(p.despike_z, 3.0, 20.0))
+        _note("despike z", p.despike_z, new)
+        p.despike_z = new
+        new = int(max(3, p.despike_window))
+        if new % 2 == 0:
+            new += 1
+        _note("despike window", p.despike_window, new)
+        p.despike_window = new
+        new = (p.wavelet_threshold.lower()
+               if p.wavelet_threshold.lower() in
+               ("universal", "bayes", "sure") else "universal")
+        _note("wavelet threshold", p.wavelet_threshold, new)
+        p.wavelet_threshold = new
+        new = (p.wavelet_mode.lower()
+               if p.wavelet_mode.lower() in ("soft", "hard", "garrote")
+               else "soft")
+        _note("wavelet mode", p.wavelet_mode, new)
+        p.wavelet_mode = new
+        new = int(np.clip(p.wavelet_cycle, 0, 5))
+        _note("wavelet cycling", p.wavelet_cycle, new)
+        p.wavelet_cycle = new
         if p.baseline_method != "als" and not HAS_PYBASELINES:
+            _note("baseline", p.baseline_method, "als (pybaselines "
+                  "missing)")
             p.baseline_method = "als"          # graceful fallback
-        p.norm = (p.norm.lower() if p.norm.lower() in
-                  ("vector", "snv", "area", "minmax", "none") else "vector")
-        p.sg_window = int(max(5, p.sg_window))
-        if p.sg_window % 2 == 0:
-            p.sg_window += 1
-        p.sg_poly = int(np.clip(p.sg_poly, 1, p.sg_window - 2))
-        p.sg_deriv = int(np.clip(p.sg_deriv, 0, 2))
+        new = (p.norm.lower() if p.norm.lower() in
+               ("vector", "snv", "area", "minmax", "none") else "vector")
+        _note("normalization", p.norm, new)
+        p.norm = new
+        new = int(max(5, p.sg_window))
+        if new % 2 == 0:
+            new += 1
+        _note("SG window", p.sg_window, new)
+        p.sg_window = new
+        new = int(np.clip(p.sg_poly, 1, p.sg_window - 2))
+        _note("SG poly", p.sg_poly, new)
+        p.sg_poly = new
+        new = int(np.clip(p.sg_deriv, 0, 2))
+        _note("SG derivative", p.sg_deriv, new)
+        p.sg_deriv = new
         if not HAS_PYWT:
             p.wavelet = False
         return p

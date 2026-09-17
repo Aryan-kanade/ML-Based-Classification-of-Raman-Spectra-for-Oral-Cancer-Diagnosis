@@ -2978,6 +2978,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.combo_wavelet.setEnabled(on and HAS_PYWT),
             self.spin_level.setEnabled(on and HAS_PYWT)))
 
+        # honesty: baseline correction is SKIPPED when sg_deriv != 0 —
+        # the panel's widgets gray out so the dead controls can't read
+        # as active (mirrors the wavelet enable pattern)
+        def _baseline_enabled():
+            on = self.combo_deriv.currentIndex() == 0
+            for w in (self.combo_baseline, self.spin_lambda_exp,
+                      self.spin_als_p, self.spin_als_iter):
+                w.setEnabled(on)
+        self.combo_deriv.currentIndexChanged.connect(
+            lambda _i: _baseline_enabled())
+        _baseline_enabled()
+
         # ---- actions: full-width row BELOW the panels --------------------
         pv.addLayout(grid)
         btns = QtWidgets.QHBoxLayout()
@@ -2994,9 +3006,12 @@ class MainWindow(QtWidgets.QMainWindow):
         btns.addWidget(b_preview, 1)
         b_optimize = QtWidgets.QPushButton("Optimize preprocessing")
         b_optimize.setToolTip(
-            "Tries crop-range / derivative / normalization combinations "
-            "under cross-validation (patient-grouped when the loaded "
-            "data has patient folders) and applies the best one. "
+            "Searches a FIXED 15-configuration grid (crop ranges × "
+            "derivative × normalization × baseline/alignment variants) "
+            "under 5-fold CV with seed 42 — patient-grouped only when ≥5 "
+            "patients are loaded, else spectrum-level. Non-swept "
+            "parameters are RESET TO DEFAULTS in the applied best set, "
+            "and your CV folds/seed/repeat settings are not used. "
             "Typically 1–3 minutes.")
         b_optimize.clicked.connect(self.run_optimize)
         btns.addWidget(b_optimize, 1)
@@ -3157,9 +3172,21 @@ class MainWindow(QtWidgets.QMainWindow):
                     "als_lambda": "baseline", "als_p": "baseline",
                     "als_niter": "baseline", "norm": "normalization"}
             changed = sorted({nice.get(k, k) for k in diff})
-            lbl.setText("Modified vs defaults: " + ", ".join(changed)
+            # honesty (2026-09-17): show the values validate() actually
+            # applies — a silent clamp (poly raised, level capped, crop
+            # zeroed) is a "shows X, backend does Y" bug otherwise
+            clamp_notes: list[str] = []
+            try:
+                self.read_params().validate(clamp_notes)
+            except Exception:
+                clamp_notes = []
+            base_txt = ("Modified vs defaults: " + ", ".join(changed)
                         if changed else
                         "All parameters match the defaults.")
+            lbl.setText(base_txt
+                        + ("  ·  Effective after clamping: "
+                           + "; ".join(clamp_notes)
+                           if clamp_notes else ""))
 
     def reset_params(self):
         """Restore the BEST measured preprocessing set — the §52
@@ -3422,6 +3449,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "Repeats the whole cross-validation with three different fold "
             "shuffles and pools the folds — the winner is picked on the "
             "pooled mean, so fold luck matters less. Takes 3x longer. "
+            "In 3SSE / Model Lab mode this affects the Single-Models "
+            "fair re-score only, not the search itself. "
             "ON by default: pick winners on stable numbers, not noise.")
         cv.addWidget(self.chk_repeat)
         self.chk_exclude_flagged = QtWidgets.QCheckBox(
@@ -3458,8 +3487,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "Runs the whole optimization program unattended: paired "
             "preprocessing sweep → fast 3SSE architecture search → "
             "per-layer tuning of the winning chain → seed-averaged "
-            "deployable bundle. Results appear in the Model Lab panel "
-            "on the Train page.")
+            "deployable bundle. Uses ITS OWN fixed protocol (5-fold, "
+            "top-10 candidates, ×1 repeat) — the Train-page CV "
+            "folds/seed/repeat controls do NOT apply. Results appear "
+            "in the Model Lab panel on the Train page.")
         self.b_model_lab.setEnabled(False)      # until data is loaded
         self.b_model_lab.clicked.connect(self.run_model_lab)
         cv.addWidget(self.b_model_lab)
@@ -4560,7 +4591,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Split-conformal set (90% coverage, calibrated on the "
                     "winner's out-of-fold probabilities). Two classes = "
                     "ambiguous; empty = the model abstains — treat as "
-                    "INDETERMINATE.")
+                    "INDETERMINATE."
+                    if q is not None else
+                    "Unavailable: conformal calibration needs an in-app "
+                    "TRAINING run (it calibrates on that run's "
+                    "out-of-fold probabilities). A loaded saved model "
+                    "alone cannot produce it.")
                 table.setItem(r, 4, it4)
 
     def _toggle_live_watch(self, on: bool):
@@ -10645,6 +10681,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_settings(self):
         s = self.settings
+        # honesty (2026-09-17): when version gates silently DROP saved
+        # state, say so on the status bar — the user must not wonder
+        # why their last session's parameters vanished
+        dropped = []
+        if "params" in s and s.get("params_version") != PARAMS_VERSION:
+            dropped.append("preprocessing parameters")
+        models = s.get("models")
+        if (isinstance(models, list)
+                and s.get("suite_version") != SUITE_VERSION):
+            dropped.append("model selection")
+        if dropped:
+            self.statusBar().showMessage(
+                "Saved settings from an older app version were reset ("
+                + ", ".join(dropped) + ") — current defaults apply.",
+                8000)
+            self.log("Settings restore: dropped " + ", ".join(dropped)
+                     + f" (params_version "
+                     f"{s.get('params_version')} vs {PARAMS_VERSION}, "
+                     f"suite_version {s.get('suite_version')} vs "
+                     f"{SUITE_VERSION})")
         if s.get("params_version") == PARAMS_VERSION:
             self._apply_params(s.get("params"))
         if isinstance(s.get("folds"), int):
