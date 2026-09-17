@@ -3770,3 +3770,23 @@ experiments/label_review_checklist.md — its row-map is stale for the
 new tree, re-run eval_label_errors.py AFTER a fresh winner OOF).
 Also this hour: label review sheet written; screen-band test pin;
 README policy/workflow updates.
+
+## 68. 2026-09-17 — best-combination sweep (k × seed) and the app set
+## to it
+
+eval_best_combo.py: proven d2 chain on the current 237-row/55-patient
+tree, paired §52 winner params, honest nested validate_arch,
+k ∈ {5, 8, 10} × seeds {42..46} (15 runs, ~5 min):
+
+  k=5:  MEAN 0.699 ± 0.008 (best draw seed 46: 0.709)
+  k=8:  MEAN 0.698 ± 0.017 (best draw seed 45: 0.721)
+  k=10: MEAN 0.703 ± 0.017 (best draw seed 42: 0.731)
+
+BEST: **k=10, seed 42 — F1 0.731** (single-seed draw; the honest
+estimate at k=10 is 0.703 ± 0.017).  More training data per outer
+fold (90% at k=10 vs 80% at k=5) is the classic small-data win.
+App SET (settings.json, user request): paired + 3SSE trainer +
+winner params + folds 10 + seed 42 + proven 18 models.  Next "Run
+3SSE" screens at k=10 — expect ~0.70 mean / up to ~0.73 best chain,
+NOT 0.757 (that was the old 287-row tree).  Sweep artifact:
+experiments/best_combo.json.
