@@ -3901,3 +3901,40 @@ behind the proven 0.757 chain) and distinguishes it from the
 the same.  Pin: gui_test [5c-bis] — reset right after the legacy
 combo yields exactly PreprocessParams().validate().  Gates: ruff
 clean, gui_test PASS.
+
+## 74. 2026-09-17 — Two Train-page buttons hidden (user request)
+
+User showed screenshots of "⭐ Restore proven winner (F1 0.757)" and
+"What the metrics mean" and asked them off the screen.  Both widgets
+are now setVisible(False) right after construction (gui.py ~3199 /
+~3403) instead of deleted: b_3sse_restore must keep existing because
+gui_test asserts its label and startup calls restore_last_3sse()
+(gui.py:2003) regardless of the button; the metrics-help dialog stays
+reachable via Help menu.  Handlers untouched; layouts reserve no
+space for hidden widgets.  Gates: gui_test PASS (incl. [6b] restore
+pick + label assertion).
+
+## 75. 2026-09-17 — Biochemistry removed from the app (user request)
+
+Context: user hit "3SSE: … Spectral + band features failed — ValueError:
+The wavenumber range does not cover all Raman bands" (band models
+refuse to fit when the crop cuts a ±30 cm-1 window; guard at
+modeling.py PeakIntensityFeatures.fit).  User: "I don't use
+biochemistry anymore — remove whole."
+
+Removed (GUI surface only; modeling.py/biochemistry.py registries stay
+so module tests, CLI baselines, bench.py keep passing):
+- Train page: no checkboxes are created for "Peak bands + RF" and
+  "Spectral + band features" (gui.BIOCHEM_MODELS frozenset filters the
+  creation loop) — no preset ("All"/"Classical"/legacy) or
+  settings-restore can ever check them, so the wavenumber-range
+  failures cannot recur.  Startup default = 16 of 23 checkboxes.
+- Check page: "Band agreement" button deleted; run_band_agreement kept
+  (unreachable); dropped from the run_all_diagnostics battery + log.
+- Data load: "Biochemical shift (top bands…)" log line removed;
+  Dataset QC (SNR/spikes) kept — data quality, not interpretation.
+- Classical preset no longer picks/references Peak bands.
+
+Tests updated: §57 startup-default expected set minus BIOCHEM_MODELS;
+diag-queue order without run_band_agreement (plain + chain branches).
+Gates: test_all 132/132, gui_test PASS, ruff clean.

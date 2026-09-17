@@ -119,6 +119,16 @@ PROVEN_EXCLUDE = frozenset({
     "TabPFN (foundation model)",
 })
 
+# Biochemistry removed from the app (user request 2026-09-17: "I don't
+# use biochemistry anymore").  No checkboxes are created for these, so
+# no preset or settings-restore can ever check them — the band-model
+# "wavenumber range does not cover all Raman bands" failures cannot
+# recur.  The modeling.py registry itself stays untouched (module-level
+# tests, CLI baselines and bench.py keep passing).
+BIOCHEM_MODELS = frozenset({
+    "Peak bands + RF", "Spectral + band features",
+})
+
 # "Then vs now" record (2026-09-17, user: "make the score high like
 # before Sept 9").  The pre-Sept-9 headline numbers were inflated by
 # evaluation bugs/leakage fixed 2026-09-05..12 (Brain.md §36, §55, §59);
@@ -3197,6 +3207,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "lower.")
         self.b_3sse_restore.clicked.connect(self.restore_last_3sse)
         sb.addWidget(self.b_3sse_restore)
+        # hidden (user request 2026-09-17): still constructed because
+        # gui_test asserts its label and startup calls restore_last_3sse
+        self.b_3sse_restore.setVisible(False)
         run_row = QtWidgets.QHBoxLayout()
         self.chk_3sse_fast = QtWidgets.QCheckBox(
             "Fast screening (skip slow models)")
@@ -3263,11 +3276,12 @@ class MainWindow(QtWidgets.QMainWindow):
         grid = QtWidgets.QGridLayout()
         grid.setVerticalSpacing(2)
         grid.setHorizontalSpacing(12)
-        for i, name in enumerate(modeling.ALL_MODEL_NAMES):
+        for i, name in enumerate(n for n in modeling.ALL_MODEL_NAMES
+                                  if n not in BIOCHEM_MODELS):
             cb = QtWidgets.QCheckBox(name)
-            # ⭐ Proven default (2026-09-17): the 18 families the
-            # measured search proved strong; the 7 measured-weak/slow
-            # ones unchecked.  All-25 searches wasted budget on the
+            # ⭐ Proven default (2026-09-17): the strong families the
+            # measured search proved; the measured-weak/slow ones
+            # unchecked.  All-model searches wasted budget on the
             # CNNs/TabPFN and picked a 0.63 chain (§57).  "All" is one
             # click away; new registry models stay checked (exclude-set)
             cb.setChecked(name not in PROVEN_EXCLUDE)
@@ -3286,8 +3300,8 @@ class MainWindow(QtWidgets.QMainWindow):
             b.setToolTip(
                 {"all": "Check every model",
                  "none": "Uncheck every model",
-                 "classical": "PCA-based classical models + PLS-DA + "
-                              "Peak bands (interpretable chemometrics)",
+                 "classical": "PCA-based classical models + PLS-DA "
+                              "(interpretable chemometrics)",
                  "proven": "The 18 model families the measured 2026-09-12 "
                            "search proved strong on this data (it found "
                            "the F1 0.757 winner). Excludes the measured-"
@@ -3401,6 +3415,9 @@ class MainWindow(QtWidgets.QMainWindow):
         b_metrics.setFlat(True)
         b_metrics.clicked.connect(self.show_metric_help)
         cv.addWidget(b_metrics)
+        # hidden (user request 2026-09-17): the Help menu entry for the
+        # same dialog stays available
+        b_metrics.setVisible(False)
         cv.addSpacing(6)
         # 3SSE power feature sits BELOW the everyday train flow
         cv.addWidget(seq_card)
@@ -3490,13 +3507,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "axis, overlaid on the class-mean spectra — shows WHERE the "
             "discriminative signal lives. The result appears directly "
             "below.")
-        b_band = QtWidgets.QPushButton("Band agreement")
-        b_band.setToolTip(
-            "Checks the winner's discriminative wavenumbers (SHAP for "
-            "trees, VIP for PLS models, Grad-CAM for the CNN) against "
-            "the literature band table AND the internship report's "
-            "significant bands — does the model rediscover the known "
-            "biochemistry?")
+        # "Band agreement" removed (2026-09-17): user no longer uses the
+        # biochemistry interpretation — handler run_band_agreement kept.
         self._diag_buttons: list[QtWidgets.QPushButton] = []
 
         def diag(button, handler):
@@ -3557,7 +3569,6 @@ class MainWindow(QtWidgets.QMainWindow):
         lc_row.addWidget(self.b_cancel_analysis)
         lc_row.addWidget(diag(b_lc, self.run_learning_curve))
         lc_row.addWidget(diag(b_regions, self.run_region_importance))
-        lc_row.addWidget(diag(b_band, self.run_band_agreement))
         lc_row.addStretch(1)
         chv.addLayout(lc_row)
         chv.addWidget(self.section_label("HONEST EVALUATION & STABILITY"))
@@ -7671,8 +7682,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # banner shows — land it within seconds of training, before
         # the slower supplementary diagnostics
         queue = [self.run_honest_check,
-                 self.run_region_importance,
-                 self.run_band_agreement]
+                 self.run_region_importance]
         if self._is_chain_winner():
             self.log("Chain winner detected: learning curve / seeds / "
                      "noise / locked / LOPO multiply the chain's inner "
@@ -7687,7 +7697,7 @@ class MainWindow(QtWidgets.QMainWindow):
                       self.run_lopo]
         self._diag_queue = queue
         self.log("Auto-running diagnostics (honest estimate first, "
-                 "then regions, band agreement"
+                 "then regions"
                  + (", learning curve, seeds, noise, locked, LOPO"
                     if len(queue) > 4 else "")
                  + ") — results appear one by one below.")
@@ -9183,8 +9193,8 @@ class MainWindow(QtWidgets.QMainWindow):
         import sequential
         if preset == "classical":
             def pick(n):
-                return ((n.startswith("PCA +") and "MLP" not in n)
-                        or n == "PLS-DA" or n == "Peak bands + RF")
+                return (n.startswith("PCA +") and "MLP" not in n) \
+                    or n == "PLS-DA"
         else:                                   # fast
             def pick(n):
                 return n not in sequential.SLOW_MODELS
@@ -10354,20 +10364,8 @@ class MainWindow(QtWidgets.QMainWindow):
                          + (" · thiocyanate band in range (saliva "
                             "preset usable)" if q["thiocyanate_band"]
                             else ""))
-                labels = np.array([l if l else "" for l in self.labels])
-                if len(set(labels[labels != ""])) == 2:
-                    m = preprocessing.crop_mask(wn_full,
-                                                self.read_params())
-                    rows = bio.biochemical_shift(self.X_raw[:, m],
-                                                 wn_full[m], labels)
-                    top = sorted(rows, key=lambda r: -abs(r[3]))[:3]
-                    txt = " · ".join(
-                        f"{r[1]} {r[3]:+.2f}" +
-                        (" (FDR p<.05)" if r[5] < 0.05 else "")
-                        for r in top if r[0])
-                    _cls = sorted(set(labels[labels != '']))
-                    self.log(f"Biochemical shift (top bands, "
-                             f"{_cls[-1]} minus {_cls[0]}): {txt}")
+                # biochemical-shift narrative removed (2026-09-17):
+                # user no longer uses the biochemistry interpretation
             except Exception:
                 pass                     # QC never blocks the workflow
 

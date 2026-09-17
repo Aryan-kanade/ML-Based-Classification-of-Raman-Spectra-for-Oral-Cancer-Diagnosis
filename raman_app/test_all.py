@@ -3111,7 +3111,8 @@ def test_proven_preset_and_stability_defaults():
     import gui
     app, win = _isolated_main_window()
     try:
-        expected = set(modeling.ALL_MODEL_NAMES) - gui.PROVEN_EXCLUDE
+        expected = (set(modeling.ALL_MODEL_NAMES) - gui.PROVEN_EXCLUDE
+                    - gui.BIOCHEM_MODELS)   # biochem removed (§75)
         startup = {n for n, cb in win.model_checks.items()
                    if cb.isChecked()}
         assert startup == expected, "Proven must be the startup default"
@@ -3773,10 +3774,9 @@ def test_diag_queue_order_and_chain_guard():
                                                   else "") or None))
     try:
         order = []
-        names = ("run_region_importance", "run_band_agreement",
-                 "run_learning_curve", "run_seed_stability",
-                 "run_noise_check", "run_locked_eval", "run_lopo",
-                 "run_honest_check")
+        names = ("run_region_importance", "run_learning_curve",
+                 "run_seed_stability", "run_noise_check",
+                 "run_locked_eval", "run_lopo", "run_honest_check")
         for n in names:
             setattr(win, n, (lambda nm: lambda *a, **k: order.append(nm))(
                 n))
@@ -3788,9 +3788,9 @@ def test_diag_queue_order_and_chain_guard():
                                         ("lr", LogisticRegression())])
         win.run_all_diagnostics()
         assert order == ["run_honest_check", "run_region_importance",
-                         "run_band_agreement", "run_learning_curve",
-                         "run_seed_stability", "run_noise_check",
-                         "run_locked_eval", "run_lopo"], order
+                         "run_learning_curve", "run_seed_stability",
+                         "run_noise_check", "run_locked_eval",
+                         "run_lopo"], order
         # chain winner: heavy items skipped, honest + light items only
         import sequential as seq
         order.clear()
@@ -3801,8 +3801,8 @@ def test_diag_queue_order_and_chain_guard():
             [Pipeline([("sc", StandardScaler()),
                        ("lr", LogisticRegression())])], n_seeds=1)
         win.run_all_diagnostics()
-        assert order == ["run_honest_check", "run_region_importance",
-                         "run_band_agreement"], order
+        assert order == ["run_honest_check", "run_region_importance"], \
+            order  # band agreement removed from the battery (§75)
         # auto-diagnostics checkbox off -> _on_train_done_then_diags skips
         order.clear()
         win._diag_queue = []
