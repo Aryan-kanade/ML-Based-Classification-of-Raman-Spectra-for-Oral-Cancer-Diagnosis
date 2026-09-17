@@ -24,9 +24,16 @@ from qt_compat import QtWidgets            # noqa: E402
 import ui_helpers as uh                    # noqa: E402
 
 ROOT = sys.argv[1] if len(sys.argv) > 1 else r"D:\BARC\Data\Tumor"
+_HERE = os.path.dirname(os.path.abspath(__file__))
 BUNDLE = (sys.argv[2] if len(sys.argv) > 2
-          else os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "model_3SSE__Extra_Trees___Ensemble__top-3_.joblib"))
+          else next((os.path.join(_HERE, d, "winner.joblib")
+                     for d in ("study_run_3sse", "study_run_3sse_d2")
+                     if os.path.isfile(os.path.join(_HERE, d,
+                                                    "winner.joblib"))),
+                    os.path.join(_HERE, "study_run_3sse", "winner.joblib")))
+if not os.path.isfile(BUNDLE):
+    sys.exit(f"bundle not found: {BUNDLE}\nUsage: python "
+             f"verify_worker_refs.py [data_root] [bundle.joblib]")
 
 app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 app.setStyle("Fusion")

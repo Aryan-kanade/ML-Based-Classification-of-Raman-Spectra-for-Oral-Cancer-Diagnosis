@@ -1,0 +1,6 @@
+label-error review — 10:15:25
+arch: PLS + XGBoost -> Random Forest -> Extra Trees
+rows: 287 · flagged: 2
+
+REVIEW  Tumor/TDOC083 Spectra pro/22042026TDOC083TH02.csv given=0 p_self=0.168  looks like 1 p=0.832
+REVIEW  Tumor/TDOC085 Spectra pro/29042026TDOC085TH0.csv given=0 p_self=0.236  looks like 1 p=0.764

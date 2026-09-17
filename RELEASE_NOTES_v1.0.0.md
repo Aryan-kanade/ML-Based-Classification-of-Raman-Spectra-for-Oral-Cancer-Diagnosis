@@ -59,6 +59,14 @@ Scientific invariance: all validated baselines bit-identical after
                    GPU work)
 ```
 
+> **Note (2026-09-17):** the counts above are the v1.0.0 release-day
+> snapshot (2026-09-08). The current suite has grown to
+> **131 unit tests / 23 deep scenarios** (still all green); the
+> proven-best model is now the 3SSE-d2 chain (F1 0.757 / AUC 0.791),
+> not the v1.0.0 Extra Trees baseline. The per-round audit report
+> files named at the bottom were removed in the 2026-09-06 workspace
+> cleanup — the round-by-round record lives in `Brain.md`.
+
 ## GPU environment actually tested
 
 NVIDIA GeForce RTX 3050 6GB Laptop GPU, driver 581.86, CUDA 13.0,

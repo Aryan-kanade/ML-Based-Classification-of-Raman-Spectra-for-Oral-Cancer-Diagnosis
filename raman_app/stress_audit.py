@@ -151,6 +151,15 @@ def _make_gui(record_dialogs: bool = True):
     elif not hasattr(_make_gui, "dlog"):
         _make_gui.dlog = []
     uh.load_settings, _s1 = (lambda: {}), uh.load_settings
+    # closeEvent must not overwrite the developer's real settings.json
+    # with this scenario's temp session (found 2026-09-17: after a
+    # deep_test run the real file pointed at a deleted temp folder).
+    # Patch ONCE and leave it — closeEvent fires later than this
+    # function returns, so a save/restore pair around the constructor
+    # would miss it.
+    if not getattr(_make_gui, "_nosave", False):
+        uh.save_settings = lambda s: None
+        _make_gui._nosave = True
     _cd.find_data_root, _s2 = (lambda: None), _cd.find_data_root
     _cd.remember_data_root, _s3 = (lambda p: None), _cd.remember_data_root
     try:
@@ -195,13 +204,12 @@ def _block(released):
 def scenario_a() -> int:
     """THE 2026-09-12 crash sequence, verbatim: real data, CatBoost
     training, auto-diagnostics battery (honest -> regions/SHAP -> band
-    agreement -> learning curve -> seeds -> noise -> locked -> LOPO),
-    then the local-explain SHAP path.  REAL loky pools."""
+    agreement -> learning curve -> seeds -> noise -> locked -> LOPO).
+    REAL loky pools."""
     if os.environ.get("JOBLIB_MULTIPROCESSING") == "0":
         print("child A refuses to run under the threading backend",
               flush=True)
         return 2
-    import numpy as np
     win = _make_gui()
     # real geometry: offscreen canvases with zero size make matplotlib
     # raise ('box_aspect' must be positive) -- the app now survives that
@@ -249,28 +257,17 @@ def scenario_a() -> int:
               "(no honest result)", flush=True)
         print("STRESS FAIL A", flush=True)
         return 6
-    # local-explain (Result-page SHAP path): fabricate a prediction set
-    # from the training features so run_local_explain has its inputs
-    X, yy, _gg = win._lc_data
-    idx = np.linspace(0, len(yy) - 1, min(24, len(yy))).astype(int)
-    win._pred_rows = [(f"s{i}.csv", yy[i], 0.5) for i in idx]
-    win._pred_spectra = [np.asarray(X)[i] for i in idx]
-    win.run_local_explain()
-    # robust wait: pump until the worker is gone AND the queued done-
-    # callback actually ran (_local_bands set) -- checking isRunning()
-    # alone can exit before finish() executes (2026-09-12 stress flake)
+    # robust wait: pump until the worker is gone -- checking
+    # isRunning() alone can exit before finish() executes
+    # (2026-09-12 stress flake)
     t0 = time.time()
     while time.time() - t0 < 600:
         _pump(win, 0.5, step=0.1)
         w = win._analysis_worker
-        if ((w is None or not w.isRunning())
-                and win._local_bands is not None):
+        if w is None or not w.isRunning():
             break
-    ok = bool(win._local_bands)
-    n = len(win._local_bands or [])
-    print(f"[A] local explain produced {n} class explanations", flush=True)
-    print("STRESS PASS A" if ok else "STRESS FAIL A", flush=True)
-    return 0 if ok else 5
+    print("STRESS PASS A", flush=True)
+    return 0
 
 
 def scenario_b() -> int:

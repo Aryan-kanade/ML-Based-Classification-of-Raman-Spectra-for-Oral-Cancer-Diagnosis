@@ -13,6 +13,10 @@ catboost==1.2.10
 # Research-grade extras (the app falls back gracefully when missing)
 pybaselines==1.2.1   # arPLS baseline correction (Baek 2015)
 shap==0.52.0         # signed SHAP region importance
+# optuna: used ONLY by experiment scripts (eval_deep_arms.py), guarded
+# by try/except there — the script falls back to random/grid search
+# without it.  Unpinned: not part of the validated app environment.
+# optuna
 
 # torch: 1D-CNN (modeling.py) + ViT scripts. GPU since 2026-09-04
 # (RTX 3050, CUDA 13.0): 1D-CNN/ViT train on cuda under AMP/TF32.

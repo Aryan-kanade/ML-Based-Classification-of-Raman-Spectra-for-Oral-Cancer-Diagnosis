@@ -63,19 +63,80 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # bump when the model suite changes so saved checkbox states don't hide
 # newly added models
-SUITE_VERSION = 7          # 24 models today (len(ALL_MODEL_NAMES) is
-                           # authoritative; v7: +Spectral + band features;
+SUITE_VERSION = 9          # 25 models today (len(ALL_MODEL_NAMES) is
+                           # authoritative; v9 (2026-09-17): ⭐ Proven
+                           # becomes the STARTUP default checked set;
+                           # v8: +Spectral + band features;
                            # v6 stage-2: +Sparse PLS-DA, PLS/PCA/t-test+XGB)
 
 # bump when PreprocessParams defaults change so old saved values (e.g.
-# crop 400/1800) don't silently override the new defaults
-PARAMS_VERSION = 3
+# the pre-2026-09-12 crop 500/2000 + sym8/vector session) don't silently
+# override the deep-search winner defaults (no-crop/db6 L2/d2/none).
+# v5 (2026-09-16): v4 sessions still carried crop 500/1800 + deriv 0 +
+# vector + sym8 L4 + despike ON (the 2026-09-01 tuned session) — the
+# cause of a fresh GUI train scoring ~0.60 instead of the d2 0.75 line.
+PARAMS_VERSION = 5
+
+# The known-bad 2026-09-01 legacy session (crop 500/1800 + deriv 0 +
+# vector + sym8 L4 + despike ON) is worth ~0.12-0.15 F1 less than the
+# §52 winner chain.  PARAMS_VERSION discards it at LOAD time; this
+# guard also blocks it at SAVE time, so a GUI process that started
+# before the v5 fix can never resurrect it (user request 2026-09-16:
+# "remove fully").
+_LEGACY_BAD_PARAMS = {
+    "crop_min": 500.0, "crop_max": 1800.0, "sg_deriv": 0,
+    "norm": "vector", "wavelet_name": "sym8", "wavelet_level": 4,
+    "despike": True,
+}
+
+
+def _sanitize_params(p: dict) -> dict:
+    """Swap the exact legacy-bad combination for the winner defaults."""
+    try:
+        if all(p.get(k) == v for k, v in _LEGACY_BAD_PARAMS.items()):
+            from dataclasses import asdict as _asdict
+            import preprocessing as _pp
+            return _asdict(_pp.PreprocessParams().validate())
+    except Exception:
+        pass
+    return p
 
 # diagnostics constants — ONE home; every on-screen "(5 seeds)" /
 # "at 5% noise" mention derives from these, so text can never drift
 # from the computation (text-audit 2026-09-12)
 SEED_STABILITY_SEEDS = (0, 1, 2, 3, 4)
 NOISE_LEVELS = (0.0, 0.01, 0.02, 0.05)
+
+# the "⭐ Proven" model preset — the 18 families the 2026-09-12
+# measured 3SSE-d2 search proved strong on this data (it found the
+# 0.757 winner); excludes the measured-weak/slow families (LDA,
+# PLS-DA, sparse PLS-DA, the three CNNs, TabPFN).  Kept as an EXCLUDE
+# set so registry additions stay checked by default.
+PROVEN_EXCLUDE = frozenset({
+    "PCA + LDA", "PLS-DA", "Sparse PLS-DA",
+    "1D-CNN", "1D-CNN (attention)", "1D-CNN ensemble (5 seeds)",
+    "TabPFN (foundation model)",
+})
+
+# "Then vs now" record (2026-09-17, user: "make the score high like
+# before Sept 9").  The pre-Sept-9 headline numbers were inflated by
+# evaluation bugs/leakage fixed 2026-09-05..12 (Brain.md §36, §55, §59);
+# the EXACT old configuration re-measured under the honest protocol on
+# 2026-09-16 (experiments/presept9.json) scores far BELOW what was
+# reported then — and below today's winner.  Rows: (label, f1, auc,
+# triage_note); shown on the Result page + reports next to the LIVE
+# winner row so "today vs before" is always answerable on screen.
+THEN_NOW_RECORD = (
+    ("Old record AS REPORTED (pre-2026-09-09)", 0.702, 0.788,
+     "rule-out sens 0.91 / rule-in spec 0.91"),
+    ("Same old config, honest protocol (2026-09-16)", 0.639, 0.682,
+     "old 3SSE chain: 0.725 reported → 0.572 honest"),
+)
+THEN_NOW_TAKEAWAY = (
+    "The pre-Sept-9 numbers were optimistic: evaluation bugs and leakage "
+    "fixed 2026-09-05→12. Measured fairly, the old configuration scores "
+    "LOWER than today's model — the current winner beats the old record "
+    "under the same honest protocol.")
 
 # every GUI log line is mirrored to a rotating session log on disk
 import logging                                    # noqa: E402
@@ -784,8 +845,8 @@ def prep_param_rows(params) -> list[tuple[str, str]]:
 
 def prep_compact(params) -> str:
     """One-line summary, e.g.
-    'crop 500–2000 cm⁻¹ · despike off · wavelet sym8 L4 · SG 11/3 ·
-    baseline als · norm vector'."""
+    'no crop · despike off · wavelet db6 L2 · SG 11/4 ·
+    baseline als · norm none'."""
     d = _prep_fields(params)
     crop_lo = d.get("crop_min") or 0
     crop_hi = d.get("crop_max") or 0
@@ -1806,13 +1867,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._seed_result: list | None = None    # F1 across seeds
         self._noise_result: list | None = None   # (noise, f1) curve
         self._friedman_result: dict | None = None  # model comparison test
-        self._local_bands: list | None = None    # per-prediction SHAP rows
-        self._band_stats: list | None = None     # FDR band statistics
         self._paired_mode = False              # last training mode
+        # honest-display staleness guard (2026-09-15): the saved bundle
+        # may speak for the banner only while no NEWER training exists
+        self._train_epoch = 0
+        self._bundle_epoch = 0
         self._pqn_mode = False                 # last training used PQN
         self._honest_worker = None
         self._honest_result: dict | None = None
-        self._honest_btn = None
+        self.b_honest_btn = None   # was the dead _honest_btn
         self.grid: np.ndarray | None = None
         self.X_raw: np.ndarray | None = None
         self._data_key: str | None = None
@@ -1904,32 +1967,85 @@ class MainWindow(QtWidgets.QMainWindow):
         # a completed 3SSE search fills the Train page immediately
         self.restore_last_3sse()
 
+    def _best_3sse_folder(self) -> str | None:
+        """
+        The study_run_3sse*/ folder with the highest valid completed
+        winner (numeric metrics.f1); None when no run qualifies.
+        Ties break to the newest winner.json so a re-run of the same
+        winning arch replaces its predecessor deterministically.
+        """
+        import glob
+        import json as _json
+        best: tuple[float, float, str] | None = None
+        for wpath in glob.glob(os.path.join(
+                APP_DIR, "study_run_3sse*", "winner.json")):
+            try:
+                with open(wpath, encoding="utf-8") as fh:
+                    m = (_json.load(fh).get("metrics") or {})
+                f1 = m.get("f1")
+                if (not isinstance(f1, (int, float))
+                        or isinstance(f1, bool) or not np.isfinite(f1)):
+                    continue
+                mt = os.path.getmtime(wpath)
+                if best is None or (f1, mt) > (best[0], best[1]):
+                    best = (float(f1), mt, os.path.dirname(wpath))
+            except Exception:
+                continue
+        return best[2] if best else None
+
     def restore_last_3sse(self):
         """
-        Load the last completed 3SSE run (study_run_3sse) into the
-        Train page: banner stats, model-comparison table, per-class
-        table, confusion/ROC plots, Save + diagnostics — exactly like a
-        fresh training, so results are never 'blank' after a restart.
+        Load the BEST completed 3SSE run (any study_run_3sse*/ folder,
+        highest valid winner F1) into the Train page: banner stats,
+        model-comparison table, per-class table, confusion/ROC plots,
+        Save + diagnostics — exactly like a fresh training, so results
+        are never 'blank' after a restart.  Best-not-last (2026-09-17):
+        a fresh weak search (e.g. the 0.632 TabPFN chain) must not
+        drag the startup display below the proven 0.757 winner.
         """
         import json as _json
-        folder = os.path.join(APP_DIR, "study_run_3sse")
-        wpath = os.path.join(folder, "winner.json")
-        if not os.path.isfile(wpath):
+        folder = self._best_3sse_folder()
+        if folder is None:
             return
+        wpath = os.path.join(folder, "winner.json")
         try:
             with open(wpath, encoding="utf-8") as fh:
                 data = _json.load(fh)
             m = data.get("metrics") or {}
-            # null f1 (NaN sanitized to None at persist time) must bail
-            # BEFORE any formatting, not half-way through the restore
-            if not isinstance(m.get("f1"), (int, float)):
+            # null/NaN f1 (NaN sanitized to None at persist time; a
+            # hand-edited NaN literal also parses) must bail BEFORE any
+            # formatting — same validation as _best_3sse_folder
+            if (not isinstance(m.get("f1"), (int, float))
+                    or isinstance(m.get("f1"), bool)
+                    or not np.isfinite(m["f1"])):
                 return
-            # persisted classes first: sorted(labels) is empty at
-            # startup before any dataset loads — a 3-class run then
-            # crashed the cm reshape (2026-09-06)
-            classes = (data.get("classes")
-                       or sorted(set(self.labels))
-                       or ["Normal", "Tumor"])
+            self.log(
+                f"Restoring best 3SSE winner (F1 {m['f1']:.3f}) from "
+                f"{os.path.basename(folder)}")
+            # persisted classes are authoritative; the cm itself decides
+            # the class COUNT — a session with different classes (e.g.
+            # 3-class synthetic) must never reshape a 2-class run's cm
+            # (found live 2026-09-17: restore bailed on the reshape and
+            # the startup stayed blank)
+            cm = m.get("cm")
+            # cm is n_classes x n_classes — the class count is its row
+            # count (verify square before trusting it)
+            n_cm = 0
+            if (isinstance(cm, list) and cm
+                    and isinstance(cm[0], list)
+                    and len(cm) == len(cm[0])):
+                n_cm = len(cm)
+            session_classes = sorted(set(l for l in self.labels if l))
+            if data.get("classes"):
+                classes = list(data["classes"])
+            elif not cm:
+                classes = (session_classes or ["Normal", "Tumor"])
+            elif n_cm == len(session_classes):
+                classes = session_classes
+            elif n_cm == 2:
+                classes = ["Normal", "Tumor"]
+            else:
+                classes = [f"Class {i}" for i in range(n_cm)]
             n_cls = len(classes)
             winner = modeling.ModelResult(
                 name="3SSE: " + " → ".join(data["arch"]),
@@ -1938,7 +2054,6 @@ class MainWindow(QtWidgets.QMainWindow):
                             "spec": (m.get("spec", 0.0), 0.0),
                             "f1": (m.get("f1", 0.0), 0.0),
                             "prec": (m.get("prec", 0.0), 0.0)}
-            cm = m.get("cm")
             if cm:
                 winner.cm = np.asarray(cm, dtype=int).reshape(
                     n_cls, n_cls)
@@ -1952,8 +2067,50 @@ class MainWindow(QtWidgets.QMainWindow):
                 winner.oof_proba = np.asarray(oof, dtype=float)
                 winner.y_true_encoded = np.asarray(
                     m.get("y_true"), dtype=int)
-                winner.groups = self.groups
+                # the OOF belongs to the RUN's dataset; the session's
+                # groups (a different row count) must not feed
+                # patient-level metrics a mismatched array — but never
+                # silently: say why the patient-level line is missing
+                if (self.groups is not None
+                        and len(self.groups) == len(winner.oof_proba)):
+                    winner.groups = list(self.groups)
+                else:
+                    n_sess = (len(self.groups)
+                              if self.groups is not None else 0)
+                    self.log(
+                        "3SSE restore: winner OOF has "
+                        f"{len(winner.oof_proba)} rows but the session "
+                        f"dataset has {n_sess} — patient-level line "
+                        "hidden (the run was measured on a different "
+                        "data tree; retrain to regenerate it)")
             winner.threshold = data.get("threshold")
+            # the 2026-09-13 d2 artifact persisted threshold=null (its
+            # threshold pass never ran) — derive the F1-optimal
+            # threshold from the run's OWN out-of-fold predictions so
+            # the meter/fallback have a real operating value; nothing
+            # outside the run's data is used
+            if (winner.threshold is None
+                    and winner.oof_proba is not None
+                    and len(winner.classes) == 2
+                    and winner.y_true_encoded is not None):
+                try:
+                    _t, _f1best, _j = modeling.best_f1_threshold(
+                        winner.y_true_encoded, winner.oof_proba[:, 1])
+                    winner.threshold = _t
+                    self.log(f"3SSE restore: threshold was null — "
+                             f"derived F1-optimal {_t:.3f} from the "
+                             "run's own OOF")
+                except Exception:
+                    pass
+            # run provenance for honest protocol text (folds/grouped/
+            # repeat describe the RUN, not the current GUI widgets)
+            metapath = os.path.join(folder, "run_meta.json")
+            if os.path.isfile(metapath):
+                try:
+                    with open(metapath, encoding="utf-8") as fh:
+                        winner.train_meta = _json.load(fh)
+                except Exception:
+                    pass
             # the fitted SequentialChain from the run's bundle
             bpath = os.path.join(folder, "winner.joblib")
             want_name = "3SSE: " + " → ".join(data["arch"])
@@ -2032,13 +2189,13 @@ class MainWindow(QtWidgets.QMainWindow):
                                         "acc") if k in m}},
                 "significance": sig}
             self.seq_phase.setText(
-                f"Last 3SSE winner restored: {' → '.join(data['arch'])} "
+                f"Best 3SSE winner restored: {' → '.join(data['arch'])} "
                 f"(nested F1 {m['f1']:.3f}).")
-            self.log("Restored last 3SSE winner "
+            self.log("Restored best 3SSE winner "
                      f"({' → '.join(data['arch'])}, F1 {m['f1']:.3f}) "
                      "into the Train page")
         except Exception as exc:
-            self.log(f"Could not restore last 3SSE run: {exc}")
+            self.log(f"Could not restore best 3SSE run: {exc}")
 
     # ================================================================= UI
     def _build_ui(self):
@@ -2462,17 +2619,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_crop_min.setRange(0, 5000)
         self.spin_crop_min.setDecimals(0)
         self.spin_crop_min.setSingleStep(50)
-        self.spin_crop_min.setValue(500)
+        self.spin_crop_min.setValue(0)
         self.spin_crop_min.setToolTip(
             "Keep only this wavenumber range (0 = no limit). The default "
-            "500–2000 is the tuned working range — widen to the loaded "
-            "data's full range (see the grid extents on the Data page) "
-            "to use the whole spectrum.")
+            "no-crop pairs with the 2nd derivative, which zeroes the "
+            "padded edges; for Standard mode use the Standard preset "
+            "(crop 700–1800).")
         self.spin_crop_max = QtWidgets.QDoubleSpinBox()
         self.spin_crop_max.setRange(0, 5000)
         self.spin_crop_max.setDecimals(0)
         self.spin_crop_max.setSingleStep(50)
-        self.spin_crop_max.setValue(2000)
+        self.spin_crop_max.setValue(0)
         self.spin_crop_max.setToolTip(
             "Upper end of the kept range (0 = no limit).")
         grid.addWidget(panel(
@@ -2506,13 +2663,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_wavelet.addItems(["sym4", "sym6", "sym8", "db4", "db6",
                                      "coif5"])
         self.combo_wavelet.setCurrentIndex(
-            self.combo_wavelet.findText("sym8"))  # match PreprocessParams
+            self.combo_wavelet.findText("db6"))  # match PreprocessParams
         self.combo_wavelet.setToolTip(TIPS["wavelet_name"]
                                       + "\ncoif5: the internship report's "
                                         "choice (good on peak mixtures).")
         self.spin_level = QtWidgets.QSpinBox()
         self.spin_level.setRange(1, 8)
-        self.spin_level.setValue(4)
+        self.spin_level.setValue(2)
         self.spin_level.setToolTip(TIPS["level"])
         self.combo_wthresh = QtWidgets.QComboBox()
         self.combo_wthresh.addItems(["universal", "bayes", "sure"])
@@ -2555,10 +2712,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_sg_window.setToolTip(TIPS["sg_window"])
         self.spin_sg_poly = QtWidgets.QSpinBox()
         self.spin_sg_poly.setRange(1, 5)
-        self.spin_sg_poly.setValue(3)
+        self.spin_sg_poly.setValue(4)
         self.spin_sg_poly.setToolTip(TIPS["sg_poly"])
         self.combo_deriv = QtWidgets.QComboBox()
         self.combo_deriv.addItems(["0", "1", "2"])
+        self.combo_deriv.setCurrentIndex(2)   # match PreprocessParams
         self.combo_deriv.setToolTip(
             TIPS["deriv"] + "\n0 = smooth only · 1 = 1st derivative · "
             "2 = 2nd derivative")
@@ -2594,6 +2752,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_als_iter.setToolTip(TIPS["als_niter"])
         self.combo_norm = QtWidgets.QComboBox()
         self.combo_norm.addItems(["vector", "snv", "area", "minmax", "none"])
+        self.combo_norm.setCurrentIndex(
+            self.combo_norm.findText("none"))  # match PreprocessParams
         self.combo_norm.setToolTip(TIPS["norm"]
                                    + "\narea: unit integrated intensity.\n"
                                      "minmax: rescale to [0,1] (sensitive "
@@ -2654,6 +2814,15 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self._apply_params(
                 asdict(preprocessing.PreprocessParams.saliva())))
         rp.addWidget(b_saliva)
+        b_std = QtWidgets.QPushButton("Standard preset")
+        b_std.setToolTip(
+            "Deep-search winner for STANDARD mode (absolute spectra, no "
+            "patient reference): crop 700–1800, wavelet sym8 L4, SG "
+            "11/3, derivative 2, no normalization, Phe-1003 alignment.")
+        b_std.clicked.connect(
+            lambda: self._apply_params(
+                asdict(preprocessing.PreprocessParams.standard_tuned())))
+        rp.addWidget(b_std)
         rp.addStretch(1)
         reset_frame.setMinimumWidth(300)
         grid.addWidget(reset_frame, 2, 1)
@@ -2988,7 +3157,12 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.setHorizontalSpacing(12)
         for i, name in enumerate(modeling.ALL_MODEL_NAMES):
             cb = QtWidgets.QCheckBox(name)
-            cb.setChecked(True)
+            # ⭐ Proven default (2026-09-17): the 18 families the
+            # measured search proved strong; the 7 measured-weak/slow
+            # ones unchecked.  All-25 searches wasted budget on the
+            # CNNs/TabPFN and picked a 0.63 chain (§57).  "All" is one
+            # click away; new registry models stay checked (exclude-set)
+            cb.setChecked(name not in PROVEN_EXCLUDE)
             self.model_checks[name] = cb
             grid.addWidget(cb, i // 2, i % 2)          # 2 columns: keeps
             cb.toggled.connect(self._models_changed)   # the card narrow
@@ -2996,6 +3170,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sel_row = QtWidgets.QHBoxLayout()
         for label, preset in (("All", "all"), ("None", "none"),
                               ("Classical", "classical"),
+                              ("⭐ Proven", "proven"),
                               ("Fast", "fast")):
             b = QtWidgets.QPushButton(label)
             b.setFlat(True)
@@ -3005,6 +3180,12 @@ class MainWindow(QtWidgets.QMainWindow):
                  "none": "Uncheck every model",
                  "classical": "PCA-based classical models + PLS-DA + "
                               "Peak bands (interpretable chemometrics)",
+                 "proven": "The 18 model families the measured 2026-09-12 "
+                           "search proved strong on this data (it found "
+                           "the F1 0.757 winner). Excludes the measured-"
+                           "weak families (LDA, PLS-DA, sparse PLS-DA, "
+                           "the CNNs, TabPFN). Best starting point for "
+                           "a 3SSE search.",
                  "fast": "Everything except the three slowest "
                          "(1D-CNN, CatBoost, XGBoost)"}[preset])
             b.clicked.connect(
@@ -3031,10 +3212,12 @@ class MainWindow(QtWidgets.QMainWindow):
         cv_row.addStretch(1)
         cv.addLayout(cv_row)
         self.chk_repeat = QtWidgets.QCheckBox("Repeat CV ×3 (more stable winner)")
+        self.chk_repeat.setChecked(True)   # stability default (2026-09-15)
         self.chk_repeat.setToolTip(
             "Repeats the whole cross-validation with three different fold "
             "shuffles and pools the folds — the winner is picked on the "
-            "pooled mean, so fold luck matters less. Takes 3x longer.")
+            "pooled mean, so fold luck matters less. Takes 3x longer. "
+            "ON by default: pick winners on stable numbers, not noise.")
         cv.addWidget(self.chk_repeat)
         self.chk_exclude_flagged = QtWidgets.QCheckBox(
             "Exclude spiked spectra (quality flag)")
@@ -3047,10 +3230,13 @@ class MainWindow(QtWidgets.QMainWindow):
         cv.addWidget(self.chk_exclude_flagged)
         self.chk_avg_replicates = QtWidgets.QCheckBox(
             "Average replicate spectra per patient")
+        self.chk_avg_replicates.setChecked(True)   # stability default
         self.chk_avg_replicates.setToolTip(
             "Patients with several spectra of the same class are averaged "
             "into one spectrum per (patient, class). Slightly fewer rows, "
-            "much less noise — makes cross-validation more stable.")
+            "much less noise — the pilot measured ~4x lower fold "
+            "variance. Standard mode only (paired mode already works "
+            "per patient). ON by default; needs clinical folders.")
         self.chk_avg_replicates.setEnabled(False)
         cv.addWidget(self.chk_avg_replicates)
         self.b_train = QtWidgets.QPushButton("Start training")
@@ -3146,9 +3332,9 @@ class MainWindow(QtWidgets.QMainWindow):
         cmp_card, cpv = self.card(
             "Model comparison",
             "SELECTION ranking (internal CV, used to PICK the winner). "
-            "The performance to report is the NESTED HONEST estimate in "
-            "the banner above. Cells color-coded (green ≥ 0.90, amber ≥ "
-            "0.70, red < 0.70). ★ = winner.")
+            "The performance to report is the banner above — the trained "
+            "winner's validated numbers. Cells color-coded (green ≥ 0.90, "
+            "amber ≥ 0.70, red < 0.70). ★ = winner.")
         self.compare_table = QtWidgets.QTableWidget(0, 4)
         self.compare_table.setHorizontalHeaderLabels(
             ["Model", "Sensitivity (macro)", "Specificity (macro)",
@@ -3250,8 +3436,8 @@ class MainWindow(QtWidgets.QMainWindow):
         lc2_row = QtWidgets.QHBoxLayout()
         # (2026-09-08) the "Honest check" BUTTON is gone: the honest
         # estimate is the number the app SHOWS — it runs automatically
-        # right after every training (and after a restore), first in
-        # the diagnostics queue
+        # right after every TRAINING, first in the diagnostics queue
+        # (a startup restore shows the run's own numbers; no battery)
         b_locked = QtWidgets.QPushButton("Locked test-set eval")
         b_locked.setToolTip(
             "TRIPOD-style final exam: splits the PATIENTS 70/15/15 "
@@ -3317,51 +3503,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.diag_stack.setSpacing(10)
         chv.addLayout(self.diag_stack)
 
-        # biochemistry: what the signal is MADE of (proteins, nucleic
-        # acids, collagen, keratin) and whether the model's bands match
-        # the medical literature
-        bio_card, bcv = self.card(
-            "Biochemistry",
-            "The signal is a sum of molecular signatures. Tumor tissue "
-            "raises nucleic-acid and protein bands and loses collagen "
-            "(literature direction); keratin varies by site and is "
-            "flagged as a confounder.")
-        bio_row = QtWidgets.QHBoxLayout()
-        b_bio = QtWidgets.QPushButton("Analyze biochemistry")
-        b_bio.setToolTip(
-            "Band-ratio markers with paired patient deltas, NMF "
-            "unmixing into biochemical components, a keratin "
-            "site-effect check, and a plausibility check of the "
-            "model's discriminative bands against the literature. "
-            "Uses the last training data (train first).")
-        diag(b_bio, self.run_biochemistry)
-        bio_row.addWidget(b_bio)
-        bio_row.addStretch(1)
-        bcv.addLayout(bio_row)
-        self.bio_label = QtWidgets.QLabel("")
-        self.bio_label.setObjectName("CardHint")
-        self.bio_label.setWordWrap(True)
-        bcv.addWidget(self.bio_label)
-        bio_plots = QtWidgets.QSplitter(QT_HORIZONTAL)
-        bh1, self.bio_canvas = plotting.canvas_with_toolbar(width=5,
-                                                            height=3.4)
-        bh2, self.bio_comp_canvas = plotting.canvas_with_toolbar(width=5,
-                                                                 height=3.4)
-        bio_plots.addWidget(bh1)
-        bio_plots.addWidget(bh2)
-        bcv.addWidget(bio_plots, 1)
-        self.bio_table = QtWidgets.QTableWidget(0, 6)
-        self.bio_table.setHorizontalHeaderLabels(
-            ["Band", "Molecule", "Assignment", "Literature", "Model",
-             "Verdict"])
-        self.bio_table.horizontalHeader().setSectionResizeMode(
-            2, HEADER_STRETCH)
-        self.bio_table.verticalHeader().setVisible(False)
-        self.bio_table.setEditTriggers(EDIT_NO)
-        self.bio_table.setAlternatingRowColors(True)
-        self.bio_table.setMaximumHeight(220)
-        bcv.addWidget(self.bio_table)
-
         pc_card, pcv = self.card("Per-class metrics")
         self.perclass_table = QtWidgets.QTableWidget(0, 6)
         self.perclass_table.setHorizontalHeaderLabels(
@@ -3379,7 +3520,6 @@ class MainWindow(QtWidgets.QMainWindow):
         rv.addWidget(charts)
         rv.addWidget(cmp_card)
         rv.addWidget(pc_card)
-        rv.addWidget(bio_card)
         rv.addStretch(1)
         h.addWidget(right, 3)
         return page
@@ -3696,31 +3836,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self.r_pp_table.setAlternatingRowColors(True)
         self.r_pp_table.setMaximumHeight(240)
         pmapv.addWidget(self.r_pp_table)
+        self.r_pp_hint = QtWidgets.QLabel("")
+        self.r_pp_hint.setObjectName("CardHint")
+        self.r_pp_hint.setWordWrap(True)
+        pmapv.addWidget(self.r_pp_hint)
         self.r_pp_card = pmap
         v.addWidget(pmap)
-        # local (per-prediction) explanation
-        local, localv = self.card(
-            "Why this call",
-            "Signed band contributions behind each predicted class "
-            "(tree-surrogate SHAP on the mean spectrum of each predicted "
-            "group). Red pushes toward the positive class, blue away.")
-        lo_row = QtWidgets.QHBoxLayout()
-        b_local = QtWidgets.QPushButton("Explain this prediction")
-        b_local.setToolTip(
-            "Computes per-spectrum SHAP band contributions for the mean "
-            "spectrum of every predicted class. Uses a tree surrogate "
-            "over the training features — an honest approximation, not "
-            "the winner's internal weights.")
-        b_local.clicked.connect(self.run_local_explain)
-        lo_row.addWidget(b_local)
-        lo_row.addStretch(1)
-        localv.addLayout(lo_row)
-        lh, self.r_local_canvas = plotting.canvas_with_toolbar(width=7,
-                                                               height=3.2)
-        lh.setMinimumHeight(240)
-        localv.addWidget(lh, 1)
-        self.r_local_card = local
-        v.addWidget(local)
+
+        # 2b. "Then vs now" — the pre-Sept-9 record vs the honest protocol
+        # vs the LIVE winner (user request 2026-09-17: show why today's
+        # honest numbers are higher than "before" really was)
+        tnow, tnowv = self.card(
+            "Then vs now (pre-Sept-9 record, honest re-measurement, "
+            "this winner)",
+            "The pre-Sept-9 headline numbers came from the old evaluation "
+            "with known bugs; the same old configuration re-measured "
+            "under today's honest protocol scores LOWER than the current "
+            "winner.")
+        self.r_tnow_table = QtWidgets.QTableWidget(
+            len(THEN_NOW_RECORD) + 1, 4)
+        self.r_tnow_table.setHorizontalHeaderLabels(
+            ["Configuration", "Macro-F1", "ROC AUC", "Triage / note"])
+        self.r_tnow_table.horizontalHeader().setSectionResizeMode(
+            0, HEADER_STRETCH)
+        self.r_tnow_table.verticalHeader().setVisible(False)
+        self.r_tnow_table.setEditTriggers(EDIT_NO)
+        self.r_tnow_table.setAlternatingRowColors(True)
+        self.r_tnow_table.setMaximumHeight(140)
+        self.r_tnow_table.setToolTip(
+            "Old record: paired Extra Trees, 2026-08-30 study. Honest "
+            "re-measurement: experiments/presept9.json (2026-09-16). "
+            "Winner row: live values of the currently loaded/trained "
+            "model.")
+        tnowv.addWidget(self.r_tnow_table)
+        self.r_tnow_hint = QtWidgets.QLabel(THEN_NOW_TAKEAWAY)
+        self.r_tnow_hint.setObjectName("CardHint")
+        self.r_tnow_hint.setWordWrap(True)
+        tnowv.addWidget(self.r_tnow_hint)
+        self.r_tnow_card = tnow
+        v.addWidget(tnow)
 
         # 3. prediction details + distribution chart
         mid = QtWidgets.QSplitter(QT_HORIZONTAL)
@@ -3831,30 +3985,6 @@ class MainWindow(QtWidgets.QMainWindow):
         chv.addWidget(grid, 1)
         v.addWidget(charts, 1)
 
-        # 4b. biochemistry of this prediction (markers + confounders)
-        bioc, biocv = self.card(
-            "Biochemistry of this prediction",
-            "Classical intensity markers of the classified spectra; with "
-            "a paired normal reference, deltas vs the patient's own "
-            "normal. High keratin can indicate a site effect, not "
-            "disease.")
-        self.r_bio_table = QtWidgets.QTableWidget(0, 4)
-        self.r_bio_table.setHorizontalHeaderLabels(
-            ["Marker", "Predicted", "Reference", "Delta"])
-        self.r_bio_table.horizontalHeader().setSectionResizeMode(
-            0, HEADER_STRETCH)
-        self.r_bio_table.verticalHeader().setVisible(False)
-        self.r_bio_table.setEditTriggers(EDIT_NO)
-        self.r_bio_table.setAlternatingRowColors(True)
-        self.r_bio_table.setMaximumHeight(240)
-        biocv.addWidget(self.r_bio_table)
-        self.r_bio_hint = QtWidgets.QLabel("")
-        self.r_bio_hint.setObjectName("CardHint")
-        self.r_bio_hint.setWordWrap(True)
-        biocv.addWidget(self.r_bio_hint)
-        self.r_bio_card = bioc
-        v.addWidget(bioc, 1)
-
         # 5. plain-language reading + save report
         read, readv = self.card("What this means")
         self.r_reading = QtWidgets.QLabel("Train a model and run a "
@@ -3887,9 +4017,8 @@ class MainWindow(QtWidgets.QMainWindow):
         b_html.setToolTip(
             "One self-contained, printable HTML file with the model "
             "metrics, predictions and all validation figures — share it "
-            "or print it as-is. (The patient rollup, triage-per-1000 "
-            "and biochemistry tables stay on this page / the txt "
-            "report.)")
+            "or print it as-is. (The patient rollup and triage-per-1000 "
+            "tables stay on this page / the txt report.)")
         b_html.clicked.connect(self.save_result_report_html)
         row.addStretch(1)
         row.addWidget(b_freeze)
@@ -3908,7 +4037,6 @@ class MainWindow(QtWidgets.QMainWindow):
                    ("Verdicts", "Patient verdicts"),
                    ("Spectra", "Predicted spectra"),
                    ("Validation", "Validation of the winning model"),
-                   ("Biochemistry", "Biochemistry of this prediction"),
                    ("Reading", "What this means")]
         by_title = {lbl.text(): lbl.parentWidget()
                     for lbl in page.findChildren(QtWidgets.QLabel)
@@ -4074,6 +4202,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return len(self.bundle.get("classes") or [])
         return len(set(l for l in self.labels if l))
 
+    def _fresh_calibrator(self):
+        """
+        The loaded bundle's Platt calibrator, ONLY when the bundle
+        belongs to the current winner (saved/restored no earlier than
+        the last training — same epoch guard as the honest display).
+        A STALE bundle's calibrator would map a NEW winner's raw
+        probabilities into the wrong space.
+        """
+        if self.bundle is None or self._bundle_epoch < self._train_epoch:
+            return None
+        return self.bundle.get("calibrator")
+
     def _threshold_now(self) -> float | None:
         """Decision threshold from the winner or the loaded bundle, shown
         in the Platt-calibrated probability space when a calibrator
@@ -4081,7 +4221,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if (self.winner is not None
                 and getattr(self.winner, "threshold", None) is not None):
             t = float(self.winner.threshold)
-            cal = (self.bundle or {}).get("calibrator")
+            cal = self._fresh_calibrator()
             if cal and self._n_classes() == 2:
                 t = clin.apply_platt(t, cal)
             return t
@@ -4371,6 +4511,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.groups:
             self.log("Covariate fusion needs patient IDs on the data.")
             return
+        # the OOF belongs to the TRAINING rows; spike exclusion /
+        # replicate averaging / a startup-restored run make the
+        # session's row count diverge — indexing w.oof_proba with
+        # session indices is then out-of-range or silently wrong
+        # (same guard class as run_permutation_auc)
+        if len(self.groups) != len(w.oof_proba):
+            self.log(
+                "Covariate fusion: the data changed since training "
+                f"({len(self.groups)} rows now vs {len(w.oof_proba)} "
+                "OOF rows) — retrain on the current data first.")
+            return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Clinical covariates CSV", "",
             "CSV (*.csv);;All files (*)")
@@ -4488,13 +4639,33 @@ class MainWindow(QtWidgets.QMainWindow):
         for s, source, mol, assign in rep["matches"][:8]:
             self.log(f"  {s:7.1f} cm⁻¹ ← {source}: {mol} ({assign})")
 
-    def _op_points_now(self) -> tuple[float | None, float | None]:
+    def _protocol_text(self, w) -> str:
         """
-        Clinical operating points (rule-out, rule-in) from the winner's
-        pooled out-of-fold probabilities, mapped through the bundle's
-        Platt calibrator when present so the cut-offs live in the SAME
-        probability space as predict-time outputs; falls back to the
-        points persisted in a loaded bundle.  (None, None) otherwise.
+        The CV protocol sentence for the winner's numbers.  For a
+        startup-restored run it comes from the run's own run_meta.json
+        (the current widgets describe the SESSION, not the run that
+        produced these numbers); live trains keep the widget values.
+        """
+        meta = getattr(w, "train_meta", None)
+        if isinstance(meta, dict) and isinstance(meta.get("k"), int):
+            grouped = bool(meta.get("n_patients")
+                           or meta.get("mode", "").startswith("paired"))
+            return (f"{meta['k']}-fold "
+                    + ("patient-grouped CV" if grouped
+                       else "CV (spectrum-level)"))
+        return (f"{self.spin_folds.value()}-fold "
+                + ("patient-grouped CV"
+                   if getattr(w, "groups", None) or self.groups
+                   else "CV (spectrum-level)"))
+
+    def _op_points_full(self) -> tuple:
+        """
+        (rule-out, rule-in, sens_at_ruleout, spec_at_rulein) from the
+        winner's pooled out-of-fold probabilities, mapped through the
+        bundle's Platt calibrator when present so the cut-offs live in
+        the SAME probability space as predict-time outputs; falls back
+        to the 2-tuple persisted in a loaded bundle (sens/spec None).
+        (None, None, None, None) when unavailable.
         """
         w = self.winner
         if (w is not None and len(w.classes) == 2
@@ -4504,18 +4675,69 @@ class MainWindow(QtWidgets.QMainWindow):
             if valid.any():
                 yv = np.asarray(w.y_true_encoded[valid])
                 pv = w.oof_proba[valid, 1]
-                cal = (self.bundle or {}).get("calibrator")
+                cal = self._fresh_calibrator()
                 if cal:
                     pv = clin.apply_platt(pv, cal)
                 try:
-                    lo, hi, _s, _sp = clin.operating_points(yv, pv)
-                    return lo, hi
+                    return tuple(clin.operating_points(yv, pv))
                 except Exception:
-                    return None, None
+                    return None, None, None, None
         if self._op_points:
             lo, hi = self._op_points
-            return lo, hi
-        return None, None
+            return lo, hi, None, None
+        return None, None, None, None
+
+    def _op_points_now(self) -> tuple[float | None, float | None]:
+        """
+        Clinical operating points (rule-out, rule-in); see
+        `_op_points_full` for the variant that also carries the achieved
+        sens/spec at those cut-offs.
+        """
+        lo, hi, _s, _sp = self._op_points_full()
+        return lo, hi
+
+    def _decided_lines(self) -> list[str]:
+        """
+        Selective-prediction lines for the banner/reports: the winner's
+        own rule-out/rule-in operating points (sens/spec achieved) and
+        decided-case F1 at stated coverage — the honest way to show the
+        0.8x numbers this program measured (Brain.md §60).  [] for
+        multiclass winners or when no OOF probabilities exist.
+        """
+        w = self.winner
+        if (w is None or len(w.classes) != 2
+                or getattr(w, "oof_proba", None) is None
+                or getattr(w, "y_true_encoded", None) is None):
+            return []
+        lo, hi, s_at, sp_at = self._op_points_full()
+        if lo is None or hi is None or lo >= hi:
+            return []
+        valid = ~np.isnan(w.oof_proba[:, 1])
+        if not valid.any():
+            return []
+        yv = np.asarray(w.y_true_encoded[valid])
+        pv = w.oof_proba[valid, 1]
+        cal = self._fresh_calibrator()
+        if cal:
+            pv = clin.apply_platt(pv, cal)
+        lines: list[str] = []
+        if s_at is not None:
+            lines.append(f"Rule-out tier clears negatives with "
+                         f"sens {s_at:.3f} (p≤{lo:.2f})")
+        if sp_at is not None:
+            lines.append(f"Rule-in tier acts on positives with "
+                         f"spec {sp_at:.3f} (p≥{hi:.2f})")
+        try:
+            conf = clin.decided_case(yv, pv, lo, hi)
+            if conf["n_decided"]:
+                lines.append(
+                    f"Decided-case (two-tier rule): F1 {conf['f1']:.3f} "
+                    f"(sens {conf['sens']:.3f} / spec {conf['spec']:.3f}) "
+                    f"on {conf['coverage']:.0%} of cases — the "
+                    f"indeterminate band is deferred, not scored")
+        except Exception:
+            pass
+        return lines
 
     def render_result_page(self):
         """Fill the Result page from the current state (called on entry)."""
@@ -4599,7 +4821,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 p.setVisible(False)
 
         # ---- clinical operating points (rule-out / rule-in) ---------------
-        lo, hi = self._op_points_now()
+        lo, hi, op_sens, op_spec = self._op_points_full()
 
         # ---- tumor-likelihood meter (binary models with full probs) --------
         mean_p_all: float | None = None
@@ -4639,28 +4861,23 @@ class MainWindow(QtWidgets.QMainWindow):
         w = self.winner
         if w is not None:
             self.r_model_title.setText(f"Winner: {w.name}")
-            # ONE number on screen (2026-09-08): the nested honest
-            # estimate; selection-CV values only as a tagged fallback
+            # ONE number on screen (2026-09-15): the TRAINED WINNER's
+            # validated numbers; the single-model benchmark only adds
+            # context inside the note
             hs, hp, hf1, hnote = self._honest_display_numbers()
-            honest = hnote.startswith(("NESTED", "Nested"))
             auc_val = None
-            if honest and isinstance(self._honest_result, dict):
-                h_auc = self._honest_result.get("auc")
-                if isinstance(h_auc, (int, float)) and np.isfinite(h_auc):
-                    auc_val = float(h_auc)
-            if auc_val is None:
-                try:
-                    if (len(w.classes) == 2
-                            and getattr(w, "oof_proba", None) is not None
-                            and getattr(w, "y_true_encoded", None)
-                            is not None):
-                        valid = ~np.isnan(w.oof_proba[:, 1])
-                        if valid.any():
-                            _fpr, _tpr, auc_val = modeling.roc_points(
-                                w.y_true_encoded[valid],
-                                w.oof_proba[valid, 1])
-                except Exception:
-                    auc_val = None
+            try:
+                if (len(w.classes) == 2
+                        and getattr(w, "oof_proba", None) is not None
+                        and getattr(w, "y_true_encoded", None)
+                        is not None):
+                    valid = ~np.isnan(w.oof_proba[:, 1])
+                    if valid.any():
+                        _fpr, _tpr, auc_val = modeling.roc_points(
+                            w.y_true_encoded[valid],
+                            w.oof_proba[valid, 1])
+            except Exception:
+                auc_val = None
             for key, val in (("sens", hs), ("spec", hp), ("f1", hf1),
                              ("auc", auc_val)):
                 lbl = self.r_stats[key]
@@ -4670,70 +4887,71 @@ class MainWindow(QtWidgets.QMainWindow):
                 if val is not None and np.isfinite(val):
                     lbl.setStyleSheet(f"color:{uh.metric_fg(val)};")
             bits = [hnote] if hnote else []
-            if not honest:
+            # restored runs describe themselves (run_meta.json); live
+            # trains keep the widget-derived protocol bits
+            if getattr(w, "train_meta", None):
+                bits.append(self._protocol_text(w))
+            else:
                 bits.append(f"{self.spin_folds.value()}-fold CV")
                 if self.chk_repeat.isChecked():
                     bits.append("repeated ×3")
                 if self.groups:
                     bits.append(
                         f"grouped by {len(set(self.groups))} patients")
-                if w.threshold is not None:
-                    _cal = bool((self.bundle or {}).get("calibrator"))
-                    bits.append(f"decision threshold {w.threshold:.3f}"
-                                + (" (calibrated)" if _cal else ""))
-                if lo is not None and hi is not None:
-                    bits.append(f"rule-out p≤{lo:.2f} (sens ≥90%) · "
-                                f"rule-in p≥{hi:.2f} (spec ≥90%)")
-                # Wilson CIs from the pooled confusion matrix (binary)
+            if w.threshold is not None:
+                # show the threshold in the probability space the tiers
+                # actually use (Platt-mapped when a fresh calibrator
+                # exists) — the raw CV value misled under a "(calibrated)"
+                # label
+                _thr = self._threshold_now()
+                _cal = self._fresh_calibrator() is not None
+                bits.append(f"decision threshold {_thr:.3f}"
+                            + (" (calibrated)" if _cal else ""))
+            if lo is not None and hi is not None:
+                bits.append(f"rule-out p≤{lo:.2f} (sens ≥90%) · "
+                            f"rule-in p≥{hi:.2f} (spec ≥90%)")
+            # Wilson CIs from the pooled confusion matrix (binary)
+            try:
+                if w.cm is not None and len(w.classes) == 2:
+                    tp = int(w.cm[1, 1])
+                    fn_ = int(w.cm[1].sum()) - tp
+                    tn = int(w.cm[0, 0])
+                    fp_ = int(w.cm[0].sum()) - tn
+                    s_lo_, s_hi_ = clin.wilson_ci(tp, tp + fn_)
+                    p_lo_, p_hi_ = clin.wilson_ci(tn, tn + fp_)
+                    bits.append(f"sens {tp / (tp + fn_):.2f} "
+                                f"[{s_lo_:.2f}–{s_hi_:.2f}] · "
+                                f"spec {tn / (tn + fp_):.2f} "
+                                f"[{p_lo_:.2f}–{p_hi_:.2f}] (Wilson)")
+            except Exception:
+                pass
+            if auc_val is not None:
                 try:
-                    if w.cm is not None and len(w.classes) == 2:
-                        tp = int(w.cm[1, 1])
-                        fn_ = int(w.cm[1].sum()) - tp
-                        tn = int(w.cm[0, 0])
-                        fp_ = int(w.cm[0].sum()) - tn
-                        s_lo_, s_hi_ = clin.wilson_ci(tp, tp + fn_)
-                        p_lo_, p_hi_ = clin.wilson_ci(tn, tn + fp_)
-                        bits.append(f"sens {tp / (tp + fn_):.2f} "
-                                    f"[{s_lo_:.2f}–{s_hi_:.2f}] · "
-                                    f"spec {tn / (tn + fp_):.2f} "
-                                    f"[{p_lo_:.2f}–{p_hi_:.2f}] (Wilson)")
+                    _a, _se, d_lo, d_hi = clin.delong_auc_ci(
+                        (np.asarray(w.y_true_encoded[valid]) == 1),
+                        w.oof_proba[valid, 1])
+                    if np.isfinite(d_lo):
+                        bits.append(f"AUC {auc_val:.3f} "
+                                    f"(DeLong 95% CI "
+                                    f"{d_lo:.2f}–{d_hi:.2f})")
                 except Exception:
                     pass
-                if auc_val is not None:
-                    try:
-                        _a, _se, d_lo, d_hi = clin.delong_auc_ci(
-                            (np.asarray(w.y_true_encoded[valid]) == 1),
-                            w.oof_proba[valid, 1])
-                        if np.isfinite(d_lo):
-                            bits.append(f"AUC {auc_val:.3f} "
-                                        f"(DeLong 95% CI "
-                                        f"{d_lo:.2f}–{d_hi:.2f})")
-                    except Exception:
-                        pass
-                # 95% bootstrap CI for the pooled out-of-fold macro-F1
-                try:
-                    if (getattr(w, "oof_proba", None) is not None
-                            and getattr(w, "y_true_encoded", None)
-                            is not None):
-                        valid = ~np.isnan(w.oof_proba).any(axis=1)
-                        pred_oof = np.argmax(w.oof_proba[valid], axis=1)
-                        w_groups = (np.asarray(w.groups)[valid]
-                                    if getattr(w, "groups", None) else None)
-                        ci_lo, ci_hi = modeling.bootstrap_ci(
-                            w.y_true_encoded[valid], pred_oof,
-                            groups=w_groups)
-                        bits.append(f"macro-F1 95% CI "
-                                    f"[{ci_lo:.2f}–{ci_hi:.2f}]")
-                except Exception:
-                    pass
-            else:
-                if isinstance(self._honest_result, dict):
-                    std = self._honest_result.get("std_f1")
-                    if isinstance(std, (int, float)) and np.isfinite(std):
-                        bits.append(f"fold spread ±{std:.3f}")
-                if lo is not None and hi is not None:
-                    bits.append(f"rule-out p≤{lo:.2f} (sens ≥90%) · "
-                                f"rule-in p≥{hi:.2f} (spec ≥90%)")
+            # 95% bootstrap CI for the pooled out-of-fold macro-F1
+            try:
+                if (getattr(w, "oof_proba", None) is not None
+                        and getattr(w, "y_true_encoded", None)
+                        is not None):
+                    valid = ~np.isnan(w.oof_proba).any(axis=1)
+                    pred_oof = np.argmax(w.oof_proba[valid], axis=1)
+                    w_groups = (np.asarray(w.groups)[valid]
+                                if getattr(w, "groups", None) else None)
+                    ci_lo, ci_hi = modeling.bootstrap_ci(
+                        w.y_true_encoded[valid], pred_oof,
+                        groups=w_groups)
+                    bits.append(f"macro-F1 95% CI "
+                                f"[{ci_lo:.2f}–{ci_hi:.2f}]")
+            except Exception:
+                pass
             self.r_model_note.setText(" · ".join(bits))
         else:
             self.r_model_title.setText("No model trained yet")
@@ -4770,7 +4988,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 valid = ~np.isnan(w.oof_proba[:, 1])
                 yv_t = (np.asarray(w.y_true_encoded[valid]) == 1)
                 pv_t = w.oof_proba[valid, 1]
-                cal_c = (self.bundle or {}).get("calibrator")
+                cal_c = self._fresh_calibrator()
                 if cal_c:
                     pv_t = clin.apply_platt(pv_t, cal_c)
                 tiers = [clin.triage(v, lo, hi) for v in pv_t]
@@ -4802,6 +5020,40 @@ class MainWindow(QtWidgets.QMainWindow):
                     if c_i:
                         it.setTextAlignment(ALIGN_CENTER)
                     self.r_triage_table.setItem(r_i, c_i, it)
+
+        # ---- "Then vs now": old record / honest re-measurement / live ----
+        tnow_rows: list[tuple[str, str, str, str]] = [
+            (label, f"{f1:.3f}", f"{auc:.3f}", note)
+            for label, f1, auc, note in THEN_NOW_RECORD]
+        live_f1 = live_auc = None
+        if w is not None:
+            hs, _hp, hf1, _hn = self._honest_display_numbers()
+            live_f1 = hf1
+            try:
+                if (len(w.classes) == 2
+                        and getattr(w, "oof_proba", None) is not None
+                        and getattr(w, "y_true_encoded", None) is not None):
+                    valid = ~np.isnan(w.oof_proba[:, 1])
+                    if valid.any():
+                        _fpr, _tpr, live_auc = modeling.roc_points(
+                            w.y_true_encoded[valid],
+                            w.oof_proba[valid, 1])
+            except Exception:
+                live_auc = None
+        tnow_rows.append((
+            "This winner (live, honest protocol)",
+            f"{live_f1:.3f}" if live_f1 is not None
+            and np.isfinite(live_f1) else "–",
+            f"{live_auc:.3f}" if live_auc is not None
+            and np.isfinite(live_auc) else "–",
+            (f"rule-out sens {op_sens:.3f} / rule-in spec {op_spec:.3f}"
+             if op_sens is not None and op_spec is not None else "")))
+        for r_i, (c0, c1, c2, c3) in enumerate(tnow_rows):
+            for c_i, txt in enumerate((c0, c1, c2, c3)):
+                it = QtWidgets.QTableWidgetItem(txt)
+                if c_i:
+                    it.setTextAlignment(ALIGN_CENTER)
+                self.r_tnow_table.setItem(r_i, c_i, it)
 
         # ---- deep evaluation summary ---------------------------------------
         bits = []
@@ -4951,11 +5203,28 @@ class MainWindow(QtWidgets.QMainWindow):
                             f_.setBold(True)
                             it.setFont(f_)
                         self.r_pp_table.setItem(r_i, c_i, it)
+                pm = (sstats.patient_level_metrics(
+                    w.y_true_encoded, w.groups, w.oof_proba)
+                    if (getattr(w, "y_true_encoded", None) is not None
+                        and getattr(w, "oof_proba", None) is not None
+                        and w.groups is not None) else None)
+                if pm is not None:
+                    self.r_pp_hint.setText(
+                        f"Deployment view — one verdict per patient "
+                        f"(mean-P majority vote): "
+                        f"{pm.get('n_correct', 0)} of "
+                        f"{pm['n_patients']} patients correct · "
+                        f"patient-level F1 {pm['f1']:.3f}"
+                        + (f", AUC {pm['auc']:.3f}"
+                           if np.isfinite(pm.get("auc", float("nan")))
+                           else "")
+                        + ". At the clinic each patient contributes "
+                          "several spectra — this is the number that "
+                          "operates.")
             except Exception:
                 self.r_pp_card.setVisible(False)
         else:
             self.r_pp_card.setVisible(False)
-        self.r_local_card.setVisible(bool(self._pred_spectra))
 
         # ---- prediction table + distribution -------------------------------
         tri_color = self.TRI_COLOR
@@ -4966,10 +5235,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.r_pat_table.setRowCount(len(pats))
         for r, (patient, n_spec, votes, mean_p, verdict) in enumerate(pats):
             tier = None
-            if (pos and n_classes == 2 and mean_p):
+            if (pos and n_classes == 2 and mean_p is not None):
                 tier = clin.triage(mean_p, lo, hi, fallback=threshold)
             for c, txt in enumerate((patient, str(n_spec), votes,
-                                     f"{mean_p:.3f}" if mean_p else "–",
+                                     f"{mean_p:.3f}"
+                                     if mean_p is not None else "–",
                                      verdict, tier or "–")):
                 it = QtWidgets.QTableWidgetItem(txt)
                 if c:
@@ -4984,7 +5254,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     f = it.font()
                     f.setBold(True)
                     it.setFont(f)
-                if c == 3 and mean_p:
+                if c == 3 and mean_p is not None:
                     col = ("#b91c1c" if mean_p >= 0.6 else
                            "#b45309" if mean_p >= 0.4 else "#15803d")
                     it.setForeground(qc.QtGui.QColor(col))
@@ -5109,7 +5379,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 yv = (np.asarray(w.y_true_encoded[valid]) == 1)
                 pv = w.oof_proba[valid, 1]
                 cal_bins_raw = clin.calibration_bins(yv, pv)
-                cal_c = (self.bundle or {}).get("calibrator")
+                cal_c = self._fresh_calibrator()
                 brier_raw = float(np.mean((pv - yv.astype(float)) ** 2))
                 cal_bins_cal = None
                 title = f"Calibration — Brier {brier_raw:.3f}"
@@ -5142,69 +5412,6 @@ class MainWindow(QtWidgets.QMainWindow):
                          fontsize=9)
                 axp.set_axis_off()
                 canvas.draw_idle()
-
-        # ---- biochemistry of this prediction --------------------------------
-        if self._pred_spectra and self._pred_wn is not None:
-            self.r_bio_card.setVisible(True)
-            wn_p = self._pred_wn
-            mean_spec = np.mean(np.vstack(self._pred_spectra), axis=0)
-            pred_r = bio.band_ratios(wn_p, mean_spec)
-            ref_r = (bio.band_ratios(wn_p, self._pred_reference)
-                     if self._pred_reference is not None else None)
-            meanings = {key: meaning
-                        for key, _n, _d, meaning in bio.RATIOS}
-            bio_rows = []
-            for key, _num, _den, _meaning in bio.RATIOS:
-                v = pred_r.get(key, float("nan"))
-                rv = (ref_r or {}).get(key, float("nan"))
-                dv = (v - rv) if (np.isfinite(v) and np.isfinite(rv)) \
-                    else float("nan")
-                bio_rows.append((f"{key} — {meanings[key]}", v, rv, dv))
-            ker_med, _ker_mad, ker_flag, ker_tot = bio.keratin_flags(
-                wn_p, self._pred_spectra)
-            self.r_bio_table.setRowCount(len(bio_rows) + 1)
-            for r_i, (name, v, rv, dv) in enumerate(bio_rows):
-                for c_i, txt in enumerate((
-                        name,
-                        f"{v:.3f}" if np.isfinite(v) else "–",
-                        f"{rv:.3f}" if np.isfinite(rv) else "–",
-                        f"{dv:+.3f}" if np.isfinite(dv) else "–")):
-                    it = QtWidgets.QTableWidgetItem(txt)
-                    if c_i:
-                        it.setTextAlignment(ALIGN_CENTER)
-                    if c_i == 3 and np.isfinite(dv) and dv != 0:
-                        it.setForeground(qc.QtGui.QColor(
-                            "#b91c1c" if dv > 0 else "#2563eb"))
-                        fnt = it.font()
-                        fnt.setBold(True)
-                        it.setFont(fnt)
-                    self.r_bio_table.setItem(r_i, c_i, it)
-            ker_txt = (f"{ker_flag} of {ker_tot} flagged"
-                       if ker_tot else "–")
-            for c_i, txt in enumerate(("Keratin index (site-effect guard)",
-                                       f"{ker_med:.3f}"
-                                       if np.isfinite(ker_med) else "–",
-                                       "", ker_txt)):
-                it = QtWidgets.QTableWidgetItem(txt)
-                if c_i:
-                    it.setTextAlignment(ALIGN_CENTER)
-                self.r_bio_table.setItem(len(bio_rows), c_i, it)
-            delta_hint = ("Red = higher than the patient's own normal, "
-                          "blue = lower. "
-                          if ref_r is not None else "")
-            hint = (delta_hint
-                    + "Literature: nucleic/protein and amide I/III "
-                    "rise in tumor, collagen/protein falls.")
-            if ref_r is None:
-                hint = ("No paired reference — absolute marker values. "
-                        + hint)
-            if ker_flag:
-                hint += (f" {ker_flag} keratin-high spectrum(s): the "
-                         "site (keratinised vs not) may explain part of "
-                         "the difference — interpret with care.")
-            self.r_bio_hint.setText(hint)
-        else:
-            self.r_bio_card.setVisible(False)
 
         # ---- plain-language reading -----------------------------------------
         self.r_reading.setText(self._result_reading(pos))
@@ -5461,6 +5668,44 @@ class MainWindow(QtWidgets.QMainWindow):
                         "metrics with caution.")
         return lines
 
+    def _then_now_report_lines(self) -> list[str]:
+        """'Then vs now' block shared by the txt and HTML reports
+        (2026-09-17): the pre-Sept-9 record as reported, the same old
+        configuration re-measured under the honest protocol, and the
+        live winner — plus the selective-prediction lines (rule-out /
+        rule-in tiers, decided-case F1 at stated coverage)."""
+        lines = ["Then vs now (pre-Sept-9 record vs honest protocol):"]
+        for label, f1, auc, note in THEN_NOW_RECORD:
+            lines.append(f"  {label}: F1 {f1:.3f} · AUC {auc:.3f}"
+                         + (f" · {note}" if note else ""))
+        w = self.winner
+        if w is not None:
+            _hs, _hp, hf1, _hn = self._honest_display_numbers()
+            auc_v = None
+            try:
+                if (len(w.classes) == 2
+                        and getattr(w, "oof_proba", None) is not None
+                        and getattr(w, "y_true_encoded", None) is not None):
+                    valid = ~np.isnan(w.oof_proba[:, 1])
+                    if valid.any():
+                        _fpr, _tpr, auc_v = modeling.roc_points(
+                            w.y_true_encoded[valid],
+                            w.oof_proba[valid, 1])
+            except Exception:
+                auc_v = None
+            f1_txt = (f"{hf1:.3f}"
+                      if hf1 is not None and np.isfinite(hf1) else "n/a")
+            row = (f"  This winner (live, honest protocol): F1 {f1_txt}")
+            if auc_v is not None:
+                row += f" · AUC {auc_v:.3f}"
+            lines.append(row)
+        lines.append("  " + THEN_NOW_TAKEAWAY)
+        dlines = self._decided_lines()
+        if dlines:
+            lines.append("Selective prediction (binary winners):")
+            lines.extend(f"  {d}" for d in dlines)
+        return lines
+
     def save_result_report(self):
         """Write everything on the Result page to result_report.txt."""
         from datetime import datetime
@@ -5511,6 +5756,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if supp:
                 lines.append("")
                 lines.extend(supp)
+            tnow = self._then_now_report_lines()
+            if tnow:
+                lines.append("")
+                lines.extend(tnow)
         lines.append("")
         if self._pred_rows:
             pos = self._positive_class()
@@ -5563,18 +5812,19 @@ class MainWindow(QtWidgets.QMainWindow):
                      replace("<br><br>", "\n\n"))
         # honest literature context (meta-analyses, spectrum-level splits)
         if w is not None:
-            # the study row must carry the NESTED HONEST numbers when
-            # they exist (selection-CV values were silently used here
-            # while the headline said "report the honest number")
+            # the study row carries the TRAINED WINNER's validated
+            # numbers (2026-09-15 — selection-CV values were silently
+            # used here while the headline said "report the honest
+            # number"; now screen and report share one source)
             hs, hp, _hf1, hnote = self._honest_display_numbers()
             use_honest = np.isfinite(hs) and np.isfinite(hp)
             row_sens = hs if use_honest \
                 else w.macro.get("sens", (0.0,))[0]
             row_spec = hp if use_honest \
                 else w.macro.get("spec", (0.0,))[0]
-            study_lab = ("This study (nested honest, patient-grouped CV)"
+            study_lab = ("This study (winner, patient-grouped CV)"
                          if use_honest and self.groups else
-                         "This study (nested honest CV)" if use_honest
+                         "This study (winner CV)" if use_honest
                          else
                          "This study (patient-grouped CV, preliminary)"
                          if self.groups else
@@ -5598,6 +5848,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 "directly comparable. Adjunct devices (VELscope, "
                 "toluidine blue) are shown for clinical context.",
             ])
+            # the SAME winner scored under the literature-standard
+            # split, so the honest number can be read next to the
+            # published ones (2026-09-16 user request)
+            lit_cmp = self._literature_comparison()
+            if lit_cmp is not None:
+                f1g, f1s = lit_cmp
+                lines.extend([
+                    "", "Literature-protocol comparison (this model)",
+                    "-" * 60,
+                    f"PATIENT-GROUPED CV (honest — the number we "
+                    f"report):  F1 {f1g:.3f}",
+                    f"SPECTRUM-LEVEL split (literature standard, "
+                    f"INFLATED):  F1 {f1s:.3f}",
+                    "The spectrum-level split lets the same patient's "
+                    "spectra land on both sides of the split, so the "
+                    "model partly recognizes patients, not cancer — "
+                    "most published Raman papers report under it. The "
+                    "grouped number is the real performance; the "
+                    "spectrum-level number exists here only to make "
+                    "the comparison with published papers fair.",
+                ])
             # predictive values at plausible prevalence — same source
             # as the screen table and the HTML report (_ppv_source)
             sens_r, spec_r, pv_note = self._ppv_source()
@@ -5680,16 +5951,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         + ", ".join(f"{r[0]} {r[2]:.0%}" for r in hard))
             except Exception:
                 pass
-        # FDR-corrected band statistics
-        if self._band_stats:
-            lines += ["", "Band statistics (patient-paired, BH-FDR)",
-                      "-" * 60,
-                      f"{'band':>6} {'molecule':<16} {'median Δ':>9} "
-                      f"{'p(FDR)':>8}  significant"]
-            for center, mol, _assign, _dir, med, _p_raw, sig, p_fdr in \
-                    self._band_stats:
-                lines.append(f"{center:>6.0f} {mol:<16} {med:>+9.3f} "
-                             f"{p_fdr:>8.4f}  {'*' if sig else ''}")
         path = os.path.join(APP_DIR, "result_report.txt")
         try:
             with open(path, "w", encoding="utf-8") as fh:
@@ -5775,10 +6036,11 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         if w is not None:
-            # ONE number (2026-09-08): the nested honest estimate; a
-            # visible warning replaces it only if it never ran
+            # ONE number (2026-09-15): the trained winner's validated
+            # numbers; a visible warning appears only if even those
+            # are missing
             hs, hp, hf1, hnote = self._honest_display_numbers()
-            honest = hnote.startswith(("NESTED", "Nested"))
+            honest = hnote.startswith(("WINNER", "3SSE"))
 
             def _n(v):
                 return f"{v:.3f}" if np.isfinite(v) else "n/a"
@@ -5795,17 +6057,16 @@ class MainWindow(QtWidgets.QMainWindow):
                     "<tr><th>Clinical cut-offs</th><td>"
                     f"rule-out p≤{lo_r:.2f} (sens ≥90%) · rule-in "
                     f"p≥{hi_r:.2f} (spec ≥90%)</td></tr>")
-            if (self.bundle or {}).get("calibrator"):
+            if self._fresh_calibrator():
                 parts.append("<tr><th>Probabilities</th><td>Platt-"
                              "calibrated (out-of-fold fit)</td></tr>")
             parts.append("</table>")
             if not honest:
                 parts.append(
-                    "<p class='warn'><b>Honest estimate pending:</b> the "
-                    "numbers above are the PRELIMINARY selection-CV "
-                    "values. Run the diagnostics on the Train page (or "
-                    "retrain) so the nested honest estimate replaces "
-                    "them before citing this report.</p>")
+                    "<p class='warn'><b>Validated numbers pending:</b> "
+                    "the numbers above could not be tied to a trained "
+                    "winner's validation. Retrain (or restore a saved "
+                    "model) before citing this report.</p>")
             # predictive values (deployment calibration) — same source
             # as the screen table and the txt report (_ppv_source)
             _ps, _pp, _pnote = self._ppv_source()
@@ -5845,6 +6106,43 @@ class MainWindow(QtWidgets.QMainWindow):
         if supp:
             parts.append("<h2>Supplementary scientific metrics</h2><p>"
                          + "<br>".join(esc(s) for s in supp)
+                         + "</p>")
+        tnow_rows = [(esc(label), f"{f1:.3f}", f"{auc:.3f}", esc(note))
+                     for label, f1, auc, note in THEN_NOW_RECORD]
+        if w is not None:
+            _hs, _hp, hf1, _hn = self._honest_display_numbers()
+            auc_v = None
+            try:
+                if (len(w.classes) == 2
+                        and getattr(w, "oof_proba", None) is not None
+                        and getattr(w, "y_true_encoded", None) is not None):
+                    valid = ~np.isnan(w.oof_proba[:, 1])
+                    if valid.any():
+                        _fpr, _tpr, auc_v = modeling.roc_points(
+                            w.y_true_encoded[valid],
+                            w.oof_proba[valid, 1])
+            except Exception:
+                auc_v = None
+            f1_txt = (f"{hf1:.3f}"
+                      if hf1 is not None and np.isfinite(hf1) else "n/a")
+            tnow_rows.append(("This winner (live, honest protocol)",
+                              f1_txt,
+                              f"{auc_v:.3f}" if auc_v is not None
+                              else "n/a", ""))
+        parts.append(
+            "<h2>Then vs now (pre-Sept-9 record, honest re-measurement,"
+            " this winner)</h2>"
+            "<table><tr><th>Configuration</th><th>Macro-F1</th>"
+            "<th>ROC AUC</th><th>Note</th></tr>"
+            + "".join(f"<tr><td>{c0}</td><td>{c1}</td><td>{c2}</td>"
+                      f"<td>{c3}</td></tr>"
+                      for c0, c1, c2, c3 in tnow_rows)
+            + "</table><p class='muted'>"
+            + esc(THEN_NOW_TAKEAWAY) + "</p>")
+        dlines = self._decided_lines()
+        if dlines:
+            parts.append("<h2>Selective prediction (binary winners)</h2>"
+                         "<p>" + "<br>".join(esc(d) for d in dlines)
                          + "</p>")
         if self._pred_rows:
             pos = self._positive_class()
@@ -5897,6 +6195,23 @@ class MainWindow(QtWidgets.QMainWindow):
             "specificity but mostly under spectrum-level splits, which "
             "inflate them. Single-centre data (as loaded); no external "
             "validation; PPV/NPV move with prevalence.</p>")
+        lit_cmp = self._literature_comparison()
+        if lit_cmp is not None:
+            f1g, f1s = lit_cmp
+            parts.append(
+                "<h2>Literature-protocol comparison (this model)</h2>"
+                "<table><tr><th>Protocol</th><th>macro-F1</th></tr>"
+                f"<tr><td>PATIENT-GROUPED CV (honest — the number we "
+                f"report)</td><td><b>{f1g:.3f}</b></td></tr>"
+                f"<tr><td>SPECTRUM-LEVEL split (literature standard, "
+                f"INFLATED)</td><td>{f1s:.3f}</td></tr></table>"
+                "<p class='warn'>The spectrum-level split lets the "
+                "same patient's spectra land on both sides of the "
+                "split, so the model partly recognizes patients, not "
+                "cancer — most published Raman papers report under "
+                "it. The grouped number is the real performance; the "
+                "spectrum-level number exists only to make the "
+                "comparison with published papers fair.</p>")
         parts.append("</body></html>")
         path = os.path.join(APP_DIR, "result_report.html")
         try:
@@ -6028,7 +6343,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pred_wn = None
         self._pred_reference = None
         self._patient_rows = []
-        self._local_bands = None
         self.spec_path_edit.clear()
         self.pred_table.setRowCount(0)
         plotting.clear(self.pred_canvas)
@@ -6114,9 +6428,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._seed_result = None
         self._noise_result = None
         self._friedman_result = None
-        self._band_stats = None
         self._honest_result = None
-        self._honest_btn = None
+        self.b_honest_btn = None   # was the dead _honest_btn
         # ---- Train page widgets → the initial, untrained look ----
         for _key, (frame, _cv, _cap) in list(self._diag_panels.items()):
             self.diag_stack.removeWidget(frame)
@@ -6152,19 +6465,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Training cleared — data kept.")
         # ---- optional: stop the saved 3SSE winner from restoring ----
         if delete_saved:
-            run_dir = os.path.join(APP_DIR, "study_run_3sse")
+            # restore scans ALL study_run_3sse*/ folders (best-winner
+            # restore, §62) — cleaning only the unsuffixed one would
+            # leave e.g. study_run_3sse_d2 to come back at next start
+            import glob as _glob
             removed = []
-            for name in ("winner.json", "winner.joblib", "validated.json",
-                         "screening.jsonl"):
-                path = os.path.join(run_dir, name)
-                try:
-                    if os.path.isfile(path):
-                        os.remove(path)
-                        removed.append(name)
-                except OSError as exc:
-                    self.log(f"Could not delete {name}: {exc}")
+            for run_dir in _glob.glob(os.path.join(APP_DIR,
+                                                   "study_run_3sse*")):
+                for name in ("winner.json", "winner.joblib",
+                             "validated.json", "screening.jsonl",
+                             "significance.json", "archs.jsonl"):
+                    path = os.path.join(run_dir, name)
+                    try:
+                        if os.path.isfile(path):
+                            os.remove(path)
+                            removed.append(os.path.join(
+                                os.path.basename(run_dir), name))
+                    except OSError as exc:
+                        self.log(f"Could not delete {path}: {exc}")
             if removed:
-                self.log("Saved 3SSE run deleted: " + ", ".join(removed))
+                self.log("Saved 3SSE run(s) deleted: "
+                         + ", ".join(removed))
         self.update_welcome()
         self.refresh_nav()
         self.render_result_page()      # drop the stale trained-model view
@@ -6215,6 +6536,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _install_dataset(self, spectra: list, source_folder: str,
                          quiet: bool = False, groups: list[str] | None = None,
                          spike_flags: list[bool] | None = None):
+        # a dataset swap while the honest/analysis workers run would let
+        # their on_*_done attach results computed on the OLD data to the
+        # NEW dataset (start_training refuses for the same reason)
+        for w_attr in ("_honest_worker", "_analysis_worker"):
+            wrk = getattr(self, w_attr, None)
+            if wrk is not None and wrk.isRunning():
+                self.log("Cannot load data — diagnostics are still "
+                         "running. Wait for them to finish, then load "
+                         "the folder again.")
+                self.statusBar().showMessage(
+                    "Load cancelled: diagnostics in flight")
+                return
         try:
             busy(True)
             self.grid = dataset.common_grid(spectra)
@@ -7509,210 +7842,6 @@ class MainWindow(QtWidgets.QMainWindow):
                                       "matter")
         self._run_async("Computing region importance", fn, done)
 
-    def run_biochemistry(self):
-        """
-        What is the signal MADE of — and does the model look at the
-        biochemistry the literature says should change in tumor tissue?
-        """
-        if self._lc_data is None or self._lc_wn is None:
-            QtWidgets.QMessageBox.information(
-                self, "Train first",
-                "Train a model first — the biochemistry panel uses the "
-                "preprocessed training data.")
-            return
-        X, yy, gg = self._lc_data
-        wn = np.asarray(self._lc_wn)
-        if X.shape[1] != len(wn):
-            QtWidgets.QMessageBox.warning(
-                self, "Preprocessing changed",
-                "The preprocessing changed since training — retrain "
-                "first so the wavenumber axis matches.")
-            return
-        seed = self.spin_seed.value()
-
-        def fn():
-            # model bands needed for the plausibility check — compute
-            # them here if the user hasn't run region importance yet
-            region_bands = self._region_bands
-            bands_note = ""
-            if not region_bands:
-                try:
-                    _wn_s, _signed, bands_s = modeling.region_importance_shap(
-                        X, yy, gg, wn)
-                    region_bands = [(float(c), float(sh), str(nm), int(s))
-                                    for c, sh, nm, s in bands_s]
-                    bands_note = ("Biochemistry: computed signed SHAP "
-                                  "bands (region importance had not been "
-                                  "run)")
-                except Exception:
-                    try:
-                        _wn_g, _imp, bands_g = modeling.region_importance(
-                            X, yy, gg, wn)
-                        region_bands = [(float(c), float(sh), "", 0)
-                                        for c, _w, sh in bands_g]
-                        bands_note = ("Biochemistry: computed Gini bands "
-                                      "(SHAP unavailable)")
-                    except Exception:
-                        region_bands = []
-            class_rows, paired_rows = bio.ratio_table(wn, X, yy, gg)
-            _H, labels, W = bio.nmf_components(X, wn, k=5, seed=seed)
-            deltas = bio.component_deltas(W, yy, gg)
-            ker_med, _mad, ker_flag, ker_tot = bio.keratin_flags(wn, X)
-            # FDR-corrected patient-paired band statistics (2 classes
-            # with patient groups only)
-            band_rows = (sstats.band_stats_paired(X, yy, gg, wn)
-                         if (gg and len(set(yy)) == 2) else [])
-            plaus_rows, (agree, known) = bio.plausibility(
-                region_bands or [])
-            return {"region_bands": region_bands, "bands_note": bands_note,
-                    "class_rows": class_rows, "paired_rows": paired_rows,
-                    "labels": labels, "deltas": deltas,
-                    "ker": (ker_med, ker_flag, ker_tot),
-                    "band_rows": band_rows,
-                    "plaus": (plaus_rows, agree, known)}
-
-        def done(res):
-            if res["bands_note"]:
-                self.log(res["bands_note"])
-            if not self._region_bands:
-                self._region_bands = res["region_bands"]
-            self._band_stats = res["band_rows"] or None
-            class_rows = res["class_rows"]
-            paired_rows = res["paired_rows"]
-            labels = res["labels"]
-            deltas = res["deltas"]
-            ker_med, ker_flag, ker_tot = res["ker"]
-            plaus_rows, agree, known = res["plaus"]
-
-            # left chart: paired marker deltas (tumor minus OWN normal) —
-            # vertical bars: short two-line labels never overlap
-            ax = plotting.clear(self.bio_canvas)
-            short = {"nucleic/protein": "nuc/protein", "collagen/protein":
-                     "coll/protein", "lipid/protein": "lipid/protein",
-                     "amide I/III": "amide I/III"}
-            expected = {"nucleic/protein": "↑", "collagen/protein": "↓",
-                        "lipid/protein": "·", "amide I/III": "↑"}
-            if paired_rows:
-                keys = [f"{short.get(k, k)}\n(exp {expected.get(k, '·')})"
-                        for k, _n, _d in paired_rows]
-                vals = [d for _k, _n, d in paired_rows]
-                bars = ax.bar(keys, vals,
-                              color=[COL_SIGN_POS if v >= 0 else COL_SIGN_NEG
-                                     for v in vals],
-                              edgecolor="white", linewidth=0.6, width=0.6)
-                ax.bar_label(bars, fmt="%+.2f", fontsize=9,
-                             fontweight="bold",
-                             color="#334155", padding=4)
-                n_pat = max(n for _k, n, _d in paired_rows)
-                ax.set_title(f"Marker deltas: tumor − own normal\n"
-                             f"({n_pat} patients)", fontsize=10)
-            else:
-                # no patient grouping -> class means side by side
-                classes = sorted(set(yy))
-                keys = [short.get(k, k) for k, _m, _means in class_rows]
-                x = np.arange(len(keys))
-                w_ = 0.8 / max(len(classes), 1)
-                for i, c in enumerate(classes):
-                    vals = [means.get(c, 0) or 0
-                            for _k, _m, means in class_rows]
-                    ax.bar(x + i * w_ - 0.4 + w_ / 2, vals, w_,
-                           color=plotting.class_color(i), label=c,
-                           edgecolor="white", linewidth=0.6)
-                ax.set_xticks(x, keys)
-                ax.legend(fontsize=8)
-                ax.set_title("Marker values per class (no pairing)",
-                             fontsize=10)
-            ax.axhline(0, color=COL_ZERO, lw=0.8)
-            # 2026-09-12 graph audit: the no-pairing branch plots
-            # class MEANS, not paired deltas — the label must not
-            # claim "paired"
-            ax.set_ylabel("Δ marker (paired)" if paired_rows
-                          else "marker level (class mean)")
-            ax.margins(y=0.18)
-            ax.tick_params(axis="x", labelsize=9)
-
-            # right chart: NMF biochemical component shifts (paired)
-            ax2 = plotting.clear(self.bio_comp_canvas)
-            comp_vals = [d for _c, _n, d in deltas]
-            x2 = np.arange(len(labels))
-            bars2 = ax2.bar(x2, comp_vals,
-                            color=[COL_SIGN_POS if v >= 0 else COL_SIGN_NEG
-                                   for v in comp_vals],
-                            edgecolor="white", linewidth=0.6, width=0.6)
-            ax2.bar_label(bars2, fmt="%+.3f", fontsize=9,
-                          fontweight="bold",
-                          color="#334155", padding=4)
-            ax2.set_xticks(x2, labels, rotation=25, ha="right",
-                           fontsize=8)
-            ax2.axhline(0, color="#64748b", lw=0.8)
-            ax2.set_title("Biochemical components (NMF)\n"
-                          "paired deltas, tumor − own normal", fontsize=10)
-            ax2.set_ylabel("Δ component weight")
-            ax2.margins(y=0.18)
-            self.bio_canvas.draw_idle()
-            self.bio_comp_canvas.draw_idle()
-
-            # plausibility table (literature reference panel when no model
-            # bands exist — the table is never left empty)
-            lit_txt = {1: "up in tumor", -1: "down in tumor", 0: "mixed"}
-            mod_txt = {1: "toward tumor", -1: "away", 0: "–"}
-            if plaus_rows:
-                table_rows = plaus_rows
-            else:
-                table_rows = [(c, mol, assign, direction, 0, "reference")
-                              for c, _hw, mol, assign, direction
-                              in bio.BANDS]
-            self.bio_table.setRowCount(len(table_rows))
-            for r, (center, mol, assign, direction, sign, verdict) in \
-                    enumerate(table_rows):
-                for c, txt in enumerate((
-                        f"{center:.0f}", mol, assign,
-                        lit_txt.get(direction, "–"),
-                        mod_txt.get(sign, "–"), verdict)):
-                    it = QtWidgets.QTableWidgetItem(txt)
-                    if c != 2:
-                        it.setTextAlignment(ALIGN_CENTER)
-                    if c == 5:                    # color the verdict
-                        col = {"agree": "#15803d", "opposite": "#b91c1c",
-                               "unknown-sign": "#b45309",
-                               "unassigned": "#64748b",
-                               "reference": "#475569"}.get(verdict,
-                                                           "#334155")
-                        it.setForeground(qc.QtGui.QColor(col))
-                        f = it.font()
-                        f.setBold(True)
-                        it.setFont(f)
-                    self.bio_table.setItem(r, c, it)
-
-            bits = []
-            if known:
-                bits.append(f"plausibility: {agree} of {known} model "
-                            "bands match the literature direction")
-            elif self._region_bands:
-                bits.append("plausibility: no model band fell inside a "
-                            "literature window")
-            else:
-                bits.append("model bands unavailable — literature "
-                            "reference panel shown")
-            if ker_tot and np.isfinite(ker_med):
-                bits.append(f"keratin: {ker_flag} of {ker_tot} spectra "
-                            "keratin-high (possible site effect)")
-            sig_bands = [r for r in (self._band_stats or []) if r[6]]
-            if sig_bands:
-                txt = ", ".join(
-                    f"{r[0]:.0f} {r[1]} "
-                    f"({'up' if r[4] > 0 else 'down'})"
-                    for r in sig_bands[:4])
-                bits.append(f"FDR-significant bands (p<0.05): {txt}")
-            self.bio_label.setText(
-                " · ".join(bits) + "\n"
-                "Red = higher in tumor, blue = lower · exp ↑/↓ = "
-                "literature direction")
-            self.train_status.setText("Biochemistry done.")
-            self.log("Biochemistry: " + " · ".join(bits))
-
-        self._run_async("Analyzing biochemistry", fn, done)
-
     def run_honest_check(self):
         """Nested evaluation: preprocessing re-chosen inside each fold."""
         if not self.spectra or self.X_raw is None:
@@ -7768,25 +7897,29 @@ class MainWindow(QtWidgets.QMainWindow):
             choices = "; ".join(
                 f"fold{c['fold']}: {c['preprocess']}+{c['model']} "
                 f"F1 {c['f1']:.2f}" for c in out["fold_choices"])
-            self.log(f"Honest (nested) evaluation: macro-F1 "
+            self.log(f"Single-model benchmark (nested): macro-F1 "
                      f"{out['mean_f1']:.3f} ± {out['std_f1']:.3f} "
-                     f"(optimistic single-choice number: {optimistic:.3f})")
+                     f"(trained winner: {optimistic:.3f})")
             self.log(f"  per-fold choices: {choices}")
             self._honest_result = out
             self.train_status.setText(
-                f"Honest macro-F1 {out['mean_f1']:.3f} ± "
-                f"{out['std_f1']:.3f} (vs optimistic {optimistic:.3f}) — "
-                "see log.")
-            # the banner now shows the honest numbers (2026-09-08: the
-            # honest estimate IS the displayed performance)
+                f"Single-model benchmark F1 {out['mean_f1']:.3f} vs "
+                f"winner {optimistic:.3f} — the banner keeps the "
+                "winner's numbers.")
+            # the banner keeps the TRAINED WINNER's numbers; the
+            # benchmark note is appended below them (2026-09-15)
             self._set_result_banner()
             self.update_welcome()
-            panel = self._diag_panel("honest", "Honest (nested) evaluation",
-                                     chart=False)
+            panel = self._diag_panel("honest", "Single-model benchmark "
+                                     "(nested)", chart=False)
             self._diag_caption(
-                panel, f"Honest macro-F1 {out['mean_f1']:.3f} ± "
-                       f"{out['std_f1']:.3f} (optimistic single-choice "
-                       f"number: {optimistic:.3f}).\n"
+                panel, "Best of PCA+SVM / RandomForest / PCA+LogReg on "
+                       "plain spectra, preprocessing re-chosen inside "
+                       "every fold — a FLOOR for context, NOT the "
+                       "trained winner's performance.\n"
+                       f"Benchmark macro-F1 {out['mean_f1']:.3f} ± "
+                       f"{out['std_f1']:.3f} (trained winner: "
+                       f"{optimistic:.3f}).\n"
                        f"Per-fold choices: {choices}"
                        + ("\n· TURBO (approximate — inner search at k=2)"
                           if self._turbo() else ""))
@@ -8151,112 +8284,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._diag_running("noise", "Noise robustness")
         self._run_async("Noise robustness check", fn, done)
 
-    def run_local_explain(self):
-        """
-        Signed band contributions behind THIS prediction: tree-surrogate
-        SHAP evaluated on the mean spectrum of every predicted class.
-        """
-        if (self._lc_data is None or self._lc_wn is None
-                or not self._pred_spectra):
-            QtWidgets.QMessageBox.information(
-                self, "Nothing to explain yet",
-                "Train and predict first — the explanation needs both "
-                "the training features and the predicted spectra.")
-            return
-        if len(self._pred_rows) != len(self._pred_spectra):
-            QtWidgets.QMessageBox.information(
-                self, "Nothing to explain yet",
-                "Predict first — the explanation works on the predicted "
-                "spectra.")
-            return
-        try:
-            import shap  # noqa: F401
-        except ImportError:
-            QtWidgets.QMessageBox.information(
-                self, "shap not installed",
-                "Local explanations need the optional `shap` package "
-                "(pip install shap).")
-            return
-        X, yy, gg = self._lc_data
-        wn = np.asarray(self._lc_wn)
-        pred_rows = list(self._pred_rows)
-        pred_spectra = list(self._pred_spectra)
-
-        def fn():
-            # shared surrogate cache (2026-09-12 speed program): the
-            # same RF-300 + TreeExplainer the regions/band-agreement
-            # diagnostics already fitted — ONE fit per training matrix
-            # instead of a fresh one per click (also n_jobs=1 by
-            # design, gotcha #25)
-            _est, expl = modeling.surrogate_explainer(
-                np.asarray(X), list(yy))
-            # mean spectrum per predicted class
-            groups_cls: dict[str, list[np.ndarray]] = {}
-            for (_fname, cls, _p), spec in zip(pred_rows, pred_spectra,
-                                               strict=True):
-                groups_cls.setdefault(cls, []).append(spec)
-            classes_enc = sorted(set(yy))
-            pos_idx_enc = len(classes_enc) - 1
-            rows = []
-            for cls in sorted(groups_cls):
-                mean_spec = np.mean(np.vstack(groups_cls[cls]), axis=0)
-                sv = expl.shap_values(mean_spec.reshape(1, -1),
-                                      check_additivity=False)
-                if isinstance(sv, list):           # per-class layout
-                    sv_pos = np.asarray(sv[pos_idx_enc])[0]
-                else:
-                    sv_a = np.asarray(sv)
-                    sv_pos = (sv_a[0, :, pos_idx_enc]
-                              if sv_a.ndim == 3 else sv_a[0])
-                contribs = []
-                for center, hw, mol, assign, direction in bio.BANDS:
-                    m = bio._window(wn, center, hw)
-                    if m.sum() < 2:
-                        continue
-                    contribs.append((float(np.mean(sv_pos[m])), center,
-                                     mol, assign, direction))
-                contribs.sort(key=lambda r: -abs(r[0]))
-                rows.append((cls, contribs[:5]))
-            return rows
-
-        def done(rows):
-            self._local_bands = rows
-            ax = plotting.clear(self.r_local_canvas)
-            colors = {1: COL_SIGN_POS, -1: COL_SIGN_NEG}
-            ybase = 0.0
-            yticks, yticklabs = [], []
-            for cls, contribs in rows:
-                for i, (v, center, mol, _assign, _dir) in enumerate(contribs):
-                    y = ybase + i
-                    ax.barh(y, v, height=0.7,
-                            color=colors[1 if v >= 0 else -1],
-                            edgecolor="white", linewidth=0.5)
-                    ax.text(v, y, f"  {center:.0f} {mol}",
-                            va="center", ha="left" if v >= 0 else "right",
-                            fontsize=8, color="#334155")
-                yticks.append(ybase + len(contribs) / 2 - 0.5)
-                yticklabs.append(f"predicted: {cls}")
-                ybase += len(contribs) + 1.2
-            ax.set_yticks(yticks, yticklabs, fontsize=9,
-                          fontweight="bold")
-            ax.axvline(0, color=COL_ZERO, lw=0.8)
-            ax.invert_yaxis()
-            ax.set_xlabel("signed SHAP contribution (surrogate)")
-            ax.set_title("Why this call — band contributions per "
-                         "predicted class", fontsize=10)
-            self.r_local_canvas.draw_idle()
-            tops = "; ".join(
-                f"{cls}: " + ", ".join(
-                    f"{c:.0f}{'+' if v >= 0 else '−'}"
-                    for v, c, _m, _a, _d in contribs[:3])
-                for cls, contribs in rows)
-            self.log(f"Local explanation ({len(pred_spectra)} "
-                     f"spectra): {tops}")
-            self.train_status.setText("Local explanation done — see "
-                                      "Result page.")
-
-        self._run_async("Explaining prediction", fn, done)
-
     # ============================================================== Train
     def start_training(self):
         if not self.spectra:
@@ -8417,6 +8444,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lc_data = (X, yy, gg)
         self._lc_data_key = self._data_key   # dataset-consistency tag
         self._region_bands = None      # stale after any retrain
+        # the single-model benchmark belongs to the OLD winner — a new
+        # search must not inherit it (the banner's benchmark note would
+        # describe the previous run; found 2026-09-15).  The banner
+        # itself keeps the NEW winner's validated numbers regardless.
+        self._honest_result = None
+        self.b_honest_btn = None   # was the dead _honest_btn
+        self._train_epoch += 1         # bundles saved earlier go stale
         # the wavenumber axis for the peak-band model must match the
         # (cropped) feature columns of X — also reused by the
         # region-importance plot (paired mode set it already)
@@ -8508,53 +8542,113 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _honest_display_numbers(self):
         """(sens, spec, f1, note) — the ONLY performance numbers the
-        screen shows (2026-09-08 user decision: one honest number).
-        Priority: 1) live nested-honest result (auto-runs first after
-        every training) 2) the honest F1 persisted in the saved bundle
-        (after a restore) 3) selection-CV numbers tagged PRELIMINARY
-        until the honest estimate lands."""
+        screen shows.  2026-09-15 user decision ("keep the real
+        number"): the banner carries the TRAINED MODEL'S OWN validated
+        numbers for every winner type — the nested single-model check
+        (best of PCA+SVM/RF/PCA+LogReg on plain spectra) can never
+        estimate the trained winner, so it appears only as a clearly
+        labeled benchmark floor in the note."""
+        w = self.winner
+        bench = ""
         h = self._honest_result
         if isinstance(h, dict) and np.isfinite(h.get("mean_f1",
                                                      float("nan"))):
-            return (h.get("sens", float("nan")),
-                    h.get("spec", float("nan")),
-                    float(h["mean_f1"]),
-                    "NESTED HONEST ESTIMATE — preprocessing re-chosen "
-                    "inside every CV fold. This is the number to "
-                    "report.")
+            bench = (f"\nSingle-model benchmark (best of PCA+SVM / "
+                     f"RandomForest / PCA+LogReg on plain spectra, "
+                     f"preprocessing re-chosen per fold): F1 "
+                     f"{h['mean_f1']:.3f} — a floor for context, NOT "
+                     "this model's performance.")
+        if w is not None:
+            if self._is_chain_winner():
+                note = ("3SSE CHAIN — nested validated, patient-grouped "
+                        "5-fold. The architecture was searched on this "
+                        "data, so the number is slightly optimistic; the "
+                        "locked test-set evaluation is the one-shot "
+                        "confirmation.")
+            else:
+                note = ("WINNER (cross-validated) — best of the models "
+                        "you selected, scored on held-out patients. "
+                        "Model choice happened on this data, so the "
+                        "number is slightly optimistic; the locked "
+                        "test-set evaluation is the one-shot "
+                        "confirmation.")
+            return (w.macro["sens"][0], w.macro["spec"][0], w.macro_f1(),
+                    note + bench)
         saved = (self.bundle or {}).get("nested_honest_f1")
+        # the saved bundle may speak only while no NEWER training
+        # exists — a bundle saved/restored before the last retrain
+        # carries the OLD winner's benchmark F1 (2026-09-15)
+        if self._bundle_epoch < self._train_epoch:
+            saved = None
         if isinstance(saved, tuple):
             saved = saved[0] if saved else None
         if isinstance(saved, (int, float)) and np.isfinite(saved):
             return (float("nan"), float("nan"), float(saved),
-                    "Nested honest F1 from the SAVED model — sens/spec "
-                    "were not persisted; re-run diagnostics to refresh.")
-        w = self.winner
-        if w is None:
-            return (float("nan"), float("nan"), float("nan"), "")
-        return (w.macro["sens"][0], w.macro["spec"][0], w.macro_f1(),
-                "PRELIMINARY (selection CV) — the nested honest estimate "
-                "will replace these numbers once it runs (press 'Run all "
-                "diagnostics' or retrain).")
+                    "Single-model benchmark F1 stored with the SAVED "
+                    "model — NOT the model's own estimate; re-run "
+                    "diagnostics to refresh.")
+        return (float("nan"), float("nan"), float("nan"), "")
 
     def _ppv_source(self):
         """(sens, spec, label) for every PPV/NPV table — ONE source so
-        the screen, txt and HTML reports can never disagree: nested
-        honest values when available, else selection-CV values tagged
-        'preliminary'. (None, None, '') when nothing is trained.)"""
+        the screen, txt and HTML reports can never disagree: the
+        TRAINED WINNER's validated sens/spec (2026-09-15: the
+        single-model benchmark never speaks here — PPV/NPV describe
+        the deployed winner).  (None, None, '') when nothing is
+        trained."""
         w = self.winner
         if w is None:
             return None, None, ""
-        hs, hp, _hf1, hnote = self._honest_display_numbers()
-        # only the REAL nested-honest numbers count (note prefix);
-        # _honest_display_numbers' selection fallback also returns
-        # finite values, so finiteness alone would silently relabel
-        # preliminary numbers as honest
-        if np.isfinite(hs) and np.isfinite(hp)                 and hnote.startswith("NESTED"):
+        hs, hp, _hf1, _hnote = self._honest_display_numbers()
+        if np.isfinite(hs) and np.isfinite(hp):
             return hs, hp, ""
         return (w.macro.get("sens", (None,))[0],
                 w.macro.get("spec", (None,))[0],
                 "preliminary (selection-CV) sens/spec")
+
+    def _literature_comparison(self):
+        """(f1_grouped, f1_spectrum_level) or None — the SAME trained
+        winner scored under the literature-standard spectrum-level
+        split (leaky, inflated) so reports can show both numbers
+        side by side.  Cached per winner+data; heavy for chains
+        (~1-2 min on first call)."""
+        w = self.winner
+        if w is None or self._lc_data is None or self._lc_data[0] is None:
+            return None
+        key = (w.name, self._lc_data_key, id(w))
+        cache = getattr(self, "_lit_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        est = getattr(w, "pipeline", None)
+        if est is None:                     # plain models: registry est
+            for spec in modeling.model_specs():
+                if spec["name"] == w.name:
+                    est = spec.get("estimator")
+                    break
+        if est is None:
+            return None
+        X, yy, _gg = self._lc_data
+        try:
+            from sklearn.model_selection import (StratifiedKFold,
+                                                 cross_val_predict)
+            from sklearn.metrics import f1_score
+            self.log("Computing the literature-protocol comparison "
+                     "(spectrum-level re-validation)…")
+            cv = StratifiedKFold(n_splits=5, shuffle=True,
+                                 random_state=42)
+            pred = cross_val_predict(modeling.clone(est), np.asarray(X),
+                                     np.asarray(yy), cv=cv, n_jobs=1)
+            res = (float(w.macro_f1()),
+                   float(f1_score(np.asarray(yy), pred,
+                                  average="macro")))
+            self._lit_cache = (key, res)
+            self.log(f"Literature comparison: grouped F1 {res[0]:.3f} "
+                     f"vs spectrum-level (inflated) F1 {res[1]:.3f}")
+            return res
+        except Exception:
+            self.log("Literature comparison failed:\n"
+                     + traceback.format_exc())
+            return None
 
     def _set_result_banner(self):
         """(Re)build the Train result banner from the honest numbers.
@@ -8573,22 +8667,22 @@ class MainWindow(QtWidgets.QMainWindow):
             lbl.setText(_txt(v))
             lbl.setStyleSheet(f"color:{uh.metric_fg(v)};"
                               if np.isfinite(v) else "")
-        extra = ("Decision threshold tuned to maximize F1: "
-                 f"{w.threshold:.3f}." if w.threshold is not None
+        extra = (" Decision threshold tuned to maximize F1: "
+                 f"{self._threshold_now():.3f}"
+                 + (" (calibrated)." if self._fresh_calibrator() else ".")
+                 if w.threshold is not None
                  else "")
         mid = (f"Detects {sens:.0%} of true positive cases · correctly "
                f"rules out {spec:.0%} of negatives"
                if np.isfinite(sens) and np.isfinite(spec) else "")
         self.banner_plain.setText(
             f"{note}" + (f"\n{mid}" if mid else "")
-            + f"\n{self.spin_folds.value()}-fold "
-            + ("patient-grouped CV" if getattr(w, "groups", None)
-               or self.groups else "CV (spectrum-level)")
+            + f"\n{self._protocol_text(w)}"
             + " · save the model to start predicting."
             + extra)
-        # B6 patient-level reading belongs to the selection-CV protocol
-        # — only shown while the banner is still preliminary
-        if note.startswith("PRELIMINARY") \
+        # B6 patient-level reading belongs to the winner's CV protocol
+        # — shown whenever the winner's own numbers are displayed
+        if note.startswith(("WINNER", "3SSE")) \
                 and w.groups is not None and w.oof_proba is not None \
                 and w.y_true_encoded is not None:
             try:
@@ -8597,13 +8691,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 if pm is not None:
                     self.banner_plain.setText(
                         self.banner_plain.text()
-                        + f"  ·  Patient-level (mean P, n={pm['n_patients']}):"
-                        f" F1 {pm['f1']:.3f}"
+                        + f"  ·  Patient level (mean-P majority vote, "
+                          f"n={pm['n_patients']} patients): "
+                          f"{pm.get('n_correct', 0)}/{pm['n_patients']} "
+                          f"correct · F1 {pm['f1']:.3f}"
                         + (f", AUC {pm['auc']:.3f}"
-                           if "auc" in pm else ""))
+                           if "auc" in pm else "")
+                        + " — the deployment operating level")
             except Exception:
                 self.log("Patient-level metrics failed:\n"
                          + traceback.format_exc())
+        # selective-prediction lines (2026-09-17): rule-out/rule-in tiers
+        # + decided-case F1 at stated coverage — the honest 0.8x framing
+        try:
+            dlines = self._decided_lines()
+            if dlines:
+                self.banner_plain.setText(
+                    self.banner_plain.text()
+                    + "\n" + "  ·  ".join(dlines))
+        except Exception:
+            pass
 
     def on_train_done(self, results, winner):
         self.results, self.winner = results, winner
@@ -8621,13 +8728,13 @@ class MainWindow(QtWidgets.QMainWindow):
         sens = winner.macro["sens"][0]
         spec = winner.macro["spec"][0]
         f1 = winner.macro_f1()
-        # ONE number on screen: the honest estimate (helper falls back
-        # to a PRELIMINARY tag until the auto honest check lands)
+        # ONE number on screen (2026-09-15): the trained winner's own
+        # validated numbers; the single-model benchmark adds context
         self._set_result_banner()
         self.train_status.setText(
-            f"Done — best: {winner.name} (selection-CV macro-F1 "
-            f"{f1:.3f}); the nested honest estimate will replace these "
-            "numbers once it runs…")
+            f"Done — best: {winner.name} (validated macro-F1 "
+            f"{f1:.3f}). The banner shows these numbers; the "
+            "single-model benchmark adds context when it lands.")
         self.log(f"Training complete. Winner: {winner.name} "
                  f"(macro sens {sens:.3f} / spec {spec:.3f} / F1 {f1:.3f})"
                  + (f", threshold={winner.threshold:.3f}"
@@ -8657,6 +8764,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fill_perclass_table()
         self._draw_winner_plots()
         self.b_save.setEnabled(True)
+        self.b_model_lab.setEnabled(bool(self.spectra))
         self.statusBar().showMessage(
             f"Best model: {winner.name} — save it to start predicting")
         self.update_welcome()
@@ -8735,6 +8843,10 @@ class MainWindow(QtWidgets.QMainWindow):
             for cb in self.model_checks.values():
                 cb.setChecked(want)
             return
+        if preset == "proven":
+            for name, cb in self.model_checks.items():
+                cb.setChecked(name not in PROVEN_EXCLUDE)
+            return
         import sequential
         if preset == "classical":
             def pick(n):
@@ -8805,9 +8917,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "hardware-dependent, calibrated on the reference machine)")
         ckpt = os.path.join(APP_DIR, "study_run_3sse", "archs.jsonl")
         if os.path.isfile(ckpt):
-            self.seq_phase.setText(
-                "Checkpoint from an interrupted search found — Run "
-                "resumes it instead of starting over.")
+            # a RUNNING search streams live phase text into this label —
+            # toggling a model checkbox (which fires _update_seq_card)
+            # must not stomp it (2026-09-17)
+            if (self._seq_worker is None
+                    or not self._seq_worker.isRunning()):
+                self.seq_phase.setText(
+                    "Checkpoint from an interrupted search found — Run "
+                    "resumes it instead of starting over.")
 
     def run_3sse_now(self):
         """Run button: start the search through the normal Start-training
@@ -9185,6 +9302,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_model_lab.setEnabled(True)
         self.b_3sse_run.show()
         self.b_3sse_cancel.hide()
+        # the winner was NOT replaced by a cancelled search — the
+        # diagnostics stay valid for it
+        for b in getattr(self, "_diag_buttons", []):
+            b.setEnabled(True)
         self.progress.setValue(0)
         self.seq_phase.setText(
             "Cancelled — checkpoint kept. Press Run to resume where "
@@ -9196,6 +9317,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_model_lab.setEnabled(True)
         self.b_3sse_run.show()
         self.b_3sse_cancel.hide()
+        for b in getattr(self, "_diag_buttons", []):
+            b.setEnabled(True)
         self.log(f"3SSE search failed:\n{tb}")
         self.show_error("3SSE architecture search failed", tb=tb)
         QtWidgets.QMessageBox.warning(
@@ -9394,8 +9517,16 @@ class MainWindow(QtWidgets.QMainWindow):
                               float(self._honest_result.get("std_f1", 0.0)))
                 except (KeyError, TypeError, ValueError):
                     nested = None
+            # the bundle's prep_params drive PREDICT-time preprocessing:
+            # it must be the snapshot the winner was TRAINED with, never
+            # the current GUI spinboxes (post-train preprocess-page
+            # tweaks — or a startup-restored winner with no snapshot at
+            # all — silently changed every future prediction; 2026-09-17)
+            _p_train = (getattr(self, "_params_at_train", None)
+                        or (self.bundle or {}).get("prep_params")
+                        or self.read_params().validate())
             modeling.save_bundle(path, self.winner, self.grid,
-                                 self.read_params().validate(),
+                                 _p_train,
                                  dataset_name=self.folder_edit.text(),
                                  paired=self._paired_mode,
                                  pqn=self._pqn_mode,
@@ -9413,7 +9544,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         and self._lc_data[2] is not None)
                 modeling.export_model_card(
                     card, self.winner,
-                    self.read_params().validate(),
+                    _p_train,
                     dataset_name=self.folder_edit.text(),
                     k_folds=self.spin_folds.value(),
                     repeats=_reps, grouped=_grp,
@@ -9437,6 +9568,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ============================================================ Predict
     def _set_bundle(self, bundle: dict, path: str):
         self.bundle = bundle
+        self._bundle_epoch = self._train_epoch   # honest-display guard
         self.model_path_edit.setText(path)
         m = bundle["macro"]
         self._region_bands = bundle.get("region_bands") or None
@@ -9446,10 +9578,10 @@ class MainWindow(QtWidgets.QMainWindow):
         nested = bundle.get("nested_honest_f1")
         if isinstance(nested, tuple):
             nested = nested[0] if nested else None
-        nested_txt = (f" | nested honest F1 {nested:.3f}"
+        nested_txt = (f" | single-model benchmark F1 {nested:.3f}"
                       if isinstance(nested, (int, float))
                       and np.isfinite(nested) else
-                      " | nested honest estimate pending")
+                      " | benchmark pending")
         self.model_info.setText(
             f"<b>{bundle['model_name']}</b> — classes: "
             f"{', '.join(bundle['classes'])} | macro sensitivity "
@@ -9839,7 +9971,7 @@ class MainWindow(QtWidgets.QMainWindow):
                    f"(F1 {self.winner.macro_f1():.3f}")
             if self._honest_result is not None:
                 try:
-                    txt += (f", nested honest F1 "
+                    txt += (f", single-model benchmark "
                             f"{self._honest_result['mean_f1']:.3f}")
                 except (KeyError, TypeError, ValueError):
                     pass
@@ -9888,9 +10020,9 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"{r[1]} {r[3]:+.2f}" +
                         (" (FDR p<.05)" if r[5] < 0.05 else "")
                         for r in top if r[0])
-                    self.log(f"Biochemical shift (top bands, {sorted(set(labels[labels != '']))[-1]} minus "
-                             f"{sorted(set(labels[labels != '']))[0]}: "
-                             f"{sorted(set(labels[labels != '']))[0]}): {txt}")
+                    _cls = sorted(set(labels[labels != '']))
+                    self.log(f"Biochemical shift (top bands, "
+                             f"{_cls[-1]} minus {_cls[0]}): {txt}")
             except Exception:
                 pass                     # QC never blocks the workflow
 
@@ -10099,7 +10231,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.settings["folder"] = self._source_folder
         self.settings.pop("files", None)          # legacy setting
         self.settings.update({
-            "params": asdict(self.read_params()),
+            "params": _sanitize_params(asdict(self.read_params())),
             "params_version": PARAMS_VERSION,
             "folds": self.spin_folds.value(),
             "seed": self.spin_seed.value(),

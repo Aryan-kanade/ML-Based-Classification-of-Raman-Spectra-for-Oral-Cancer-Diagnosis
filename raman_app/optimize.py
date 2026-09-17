@@ -207,9 +207,10 @@ def save_best_params(params: pp.PreprocessParams, score: float,
 # ---- B2 (2026-09-05 program): paired-mode sweep --------------------------
 # The deviation features the strong mode uses have NEVER been swept —
 # the old GRID only ever scored absolute spectra. One axis at a time
-# around the current defaults (crop 500/2000, deriv 0, vector, ALS 1e5,
-# despike off), plus the measured suspects: deriv 1 (+0.05 F1 in
-# standard mode), snv, arPLS, λ 1e6, despike ON, and the PQN variant.
+# around the CURRENT dataclass defaults (since 2026-09-12: the
+# deep-search winner — no-crop, deriv 2, none; historically crop
+# 500/2000, deriv 0, vector, ALS 1e5, despike off), plus the measured
+# suspects: deriv 1, snv, arPLS, λ 1e6, despike ON, and the PQN variant.
 GRID_PAIRED: list[dict] = [
     dict(),                                            # current defaults
     dict(sg_deriv=1),

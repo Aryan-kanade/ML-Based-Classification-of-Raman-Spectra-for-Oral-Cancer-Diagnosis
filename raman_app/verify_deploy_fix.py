@@ -30,10 +30,16 @@ import modeling                    # noqa: E402
 import paired as paired_mod        # noqa: E402
 
 ROOT = sys.argv[1] if len(sys.argv) > 1 else r"D:\BARC\Data"
+_HERE = os.path.dirname(os.path.abspath(__file__))
 BUNDLE = (sys.argv[2] if len(sys.argv) > 2
-          else os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "model_3SSE__PCA___XGBoost___Ensemble__"
-                            "top-3_.joblib"))
+          else next((os.path.join(_HERE, d, "winner.joblib")
+                     for d in ("study_run_3sse", "study_run_3sse_d2")
+                     if os.path.isfile(os.path.join(_HERE, d,
+                                                    "winner.joblib"))),
+                    os.path.join(_HERE, "study_run_3sse", "winner.joblib")))
+if not os.path.isfile(BUNDLE):
+    sys.exit(f"bundle not found: {BUNDLE}\nUsage: python "
+             f"verify_deploy_fix.py [data_root] [bundle.joblib]")
 
 bundle = modeling.load_bundle(BUNDLE)
 print(f"bundle: {bundle.get('model_name')}  paired={bundle.get('paired')}")

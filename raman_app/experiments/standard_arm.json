@@ -1,0 +1,17 @@
+{
+  "arch": [
+    "PLS + XGBoost",
+    "Random Forest",
+    "Extra Trees"
+  ],
+  "n_rows": 299,
+  "n_patients": 70,
+  "f1": 0.5902173913043478,
+  "sens": 0.5945047489823609,
+  "spec": 0.5945047489823609,
+  "auc": 0.6273405698778834,
+  "pat_f1": 0.5957219251336898,
+  "paired_reference_f1": 0.757,
+  "delta_vs_paired": -0.1667826086956522,
+  "verdict": "DROP (paired wins)"
+}

@@ -217,9 +217,40 @@ def main() -> int:
 
     check("training with a single class: clean error path", s_one_class_train)
 
+    def s_stale_honest_cleared():
+        # a NEW training must not inherit the PREVIOUS run's honest
+        # estimate (the banner showed the old number over the new
+        # winner; 2026-09-15) — and the saved-bundle fallback stays
+        # silent once a training landed in this session
+        win = make_gui()
+        win.load_folder(_flat_folder(tempfile.mkdtemp()), quiet=True)
+        for name, cb in win.model_checks.items():
+            cb.setChecked(name == "PCA + LDA")
+        win.chk_auto_diags.setChecked(False)      # no battery afterwards
+        win._honest_result = {"mean_f1": 0.99, "sens": 0.99,
+                              "spec": 0.99}       # stale from an old run
+        win.start_training()
+        assert win._honest_result is None         # cleared synchronously
+        if win.worker is not None:                # let it finish quietly
+            win.worker.wait(120000)
+            from qt_compat import QtWidgets as QW
+            for _ in range(10):
+                QW.QApplication.processEvents()
+        assert win.results and win.winner is not None
+        _s, _p, _f, note = win._honest_display_numbers()
+        assert note.startswith("WINNER")     # the winner's own numbers
+        win.bundle = {"nested_honest_f1": 0.42}   # old saved model
+        _s, _p, f1, note = win._honest_display_numbers()
+        assert note.startswith("WINNER") and "SAVED model" not in note
+        assert f1 == win.winner.macro_f1()
+        win.close()
+
+    check("stale honest estimate cleared when a new training starts",
+          s_stale_honest_cleared)
+
     def s_train_cards():
         # Train right column: NO tabs — every result card (diagnostics,
-        # comparison, per-class, biochemistry) stacked in one page scroll;
+        # comparison, per-class) stacked in one page scroll;
         # cm+roc side by side; panels collapse; _reveal scrolls the page
         from qt_compat import QtWidgets as QW
         win = make_gui()
@@ -242,7 +273,6 @@ def main() -> int:
         assert roc.x() > cm.x() + 0.8 * cm.width()     # side by side
         assert win.compare_table.rowCount() >= 1        # card visible w/o
         assert win.compare_table.isVisibleTo(win)       # clicking a tab
-        assert win.bio_table.isVisibleTo(win)
         head = [b for b in cm.findChildren(QW.QToolButton)
                 if b.parent() is cm][0]
         head.setChecked(False)                         # collapse the chart
@@ -709,7 +739,7 @@ def main() -> int:
         win.run_noise_check()
         wait_analysis(win)
         assert win._noise_result and len(win._noise_result) == 4
-        # predict something, then explain it locally
+        # predict something so the Result page has content to render
         path = os.path.join(tmp, "m.joblib")
         modeling.save_bundle(path, w, win.grid, params)
         win._set_bundle(modeling.load_bundle(path), path)
@@ -720,13 +750,6 @@ def main() -> int:
             for _ in range(10):
                 QtWidgets.QApplication.processEvents()
         assert len(win._pred_rows) == 32
-        try:
-            import shap  # noqa: F401
-            win.run_local_explain()
-            wait_analysis(win)
-            assert win._local_bands, "local explanation produced rows"
-        except ImportError:
-            pass                        # optional dependency
         # Result page renders everything new
         win.render_result_page()
         assert win.r_deep_label.text() != ""
@@ -737,7 +760,7 @@ def main() -> int:
         assert os.path.isfile(log_path)
         win.close()
 
-    check("deep diagnostics: LOPO, seeds, noise, local SHAP, file log",
+    check("deep diagnostics: LOPO, seeds, noise, file log",
           s_deep_diagnostics)
 
     def s_reset_session():
@@ -747,10 +770,9 @@ def main() -> int:
         win.labels = ["Tumor", "Normal", "Tumor"]
         win._source_folder = "X"
         win.settings["folder"] = "X"
-        win.spin_crop_min.setValue(500)
+        win.spin_crop_min.setValue(123)   # non-default value
         win._pred_rows = [("f.csv", "Tumor", 0.9)]
         win._patient_rows = [("P1",)]
-        win._local_bands = [1]
 
         class _W:                              # minimal winner stub
             name = "stub"
@@ -768,10 +790,11 @@ def main() -> int:
         win.reset_session()                    # recorder answers Yes
         assert not win.spectra and win._pred_rows == []
         assert win.winner is not None and win.bundle is not None
-        assert win._patient_rows == [] and win._local_bands is None
+        assert win._patient_rows == []
         assert win._source_folder is None and "folder" not in win.settings
         assert win.folder_edit.text() == "" and win.table.rowCount() == 0
-        assert win.spin_crop_min.value() == 500   # params back to defaults
+        assert win.spin_crop_min.value() == 0     # params back to the
+        # deep-search winner defaults (no crop — PARAMS_VERSION 4)
         assert not win.b_train.isEnabled()
         win.render_result_page()               # renders from kept training
         win.close()

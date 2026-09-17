@@ -1,0 +1,21 @@
+{
+  "n_ours": 299,
+  "n_ext": 2830,
+  "ours_to_external": {
+    "direction": "ours->RSClass",
+    "n": 2830,
+    "f1": 0.42909017550938067,
+    "sens": 1.0,
+    "spec": 0.0,
+    "auc": 0.5418055201664437
+  },
+  "external_to_ours": {
+    "direction": "RSClass->ours",
+    "n": 299,
+    "f1": 0.35560344827586204,
+    "sens": 1.0,
+    "spec": 0.0,
+    "auc": 0.5508367254635913
+  },
+  "verdict": "ours->RSClass F1 0.429 (sens 1.000 / spec 0.000 / AUC 0.542); RSClass->ours F1 0.356 (AUC 0.551)"
+}

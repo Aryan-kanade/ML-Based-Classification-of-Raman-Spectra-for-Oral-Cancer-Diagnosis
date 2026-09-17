@@ -91,7 +91,10 @@ def report_models() -> "OrderedDict[str, Pipeline]":
                       min_child_weight=2, subsample=0.993,
                       eval_metric="mlogloss",
                       random_state=42, n_jobs=-1)
-    svm = dict(kernel="rbf", probability=True, random_state=42)
+    # SVC(probability=True) is deprecated in sklearn 1.9 (removed 1.11) —
+    # calibrate explicitly instead
+    from sklearn.calibration import CalibratedClassifierCV
+    svm = dict(kernel="rbf", random_state=42)
     out = OrderedDict()
 
     def make(dim, clf):
@@ -100,9 +103,11 @@ def report_models() -> "OrderedDict[str, Pipeline]":
             ("dim", dim), ("sc", StandardScaler()), ("clf", clf)])
 
     out["PCA+SVM"] = make(PCA(n_components=5, random_state=42),
-                          SVC(**svm))
+                          CalibratedClassifierCV(SVC(**svm), cv=3,
+                                                 ensemble=False))
     out["PLS-DA+SVM"] = make(modeling.PLSScores(n_components=5),
-                             SVC(**svm))
+                             CalibratedClassifierCV(SVC(**svm), cv=3,
+                                                    ensemble=False))
     out["PLS+QDA"] = make(modeling.PLSScores(n_components=5),
                           QuadraticDiscriminantAnalysis())
     out["PCA+XGB"] = make(PCA(n_components=5, random_state=42),

@@ -1,0 +1,17 @@
+{
+  "members": [
+    "PLS + XGBoost -> Extra Trees -> Random Forest",
+    "PCA + Logistic Regression -> Extra Trees -> Random Forest",
+    "Peak bands + RF -> Random Forest -> Extra Trees"
+  ],
+  "single": [
+    0.7547008547008547,
+    0.7540330711837064,
+    0.7411349345428306
+  ],
+  "f1_by_member": [],
+  "meta_f1": 0.7460819009100101,
+  "meta_sens": 0.7430856299212598,
+  "meta_spec": 0.7430856299212598,
+  "verdict": "meta-ensemble F1 0.746 vs best member 0.755 (-0.009)"
+}

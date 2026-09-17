@@ -120,6 +120,49 @@ def triage(p: float, thr_ruleout: float | None,
     return TRIAGE_INDETERMINATE
 
 
+def decided_case(y_true, p_pos: np.ndarray, lo: float, hi: float) -> dict:
+    """
+    Selective-prediction (decided-case) performance: cases with
+    p_pos < lo or p_pos >= hi are DECIDED (the NEGATIVE / POSITIVE tiers
+    of `triage`), the band [lo, hi) is DEFERRED (re-sample or biopsy
+    anyway).  Threshold semantics mirror `triage`: p >= hi is a positive
+    call, p < lo a negative call, the positive class is y == 1.
+
+    F1/sens/spec on the decided subset are only honest next to the
+    coverage (decided fraction) — a model that defers every hard case
+    looks excellent on the remainder (Brain.md §60: screen band decided
+    F1 0.867 at 23% coverage, confirm band 0.813 at 57%).  Every caller
+    must display coverage with the metrics.
+
+    Returns dict(n_total, n_decided, coverage, f1, sens, spec); metrics
+    are NaN when nothing is decided.  NaN-probability rows are dropped.
+    """
+    y = np.asarray(y_true)
+    p = np.asarray(p_pos, dtype=float)
+    ok = ~np.isnan(p)
+    y, p = y[ok], p[ok]
+    n = int(y.size)
+    dec = (p < lo) | (p >= hi)
+    k = int(dec.sum())
+    out: dict = {"n_total": n, "n_decided": k,
+                 "coverage": (k / n) if n else float("nan")}
+    if k == 0:
+        out.update(f1=float("nan"), sens=float("nan"), spec=float("nan"))
+        return out
+    yd = y[dec]
+    pos = yd == 1
+    call = p[dec] >= hi
+    tp = int((call & pos).sum())
+    fn = int((~call & pos).sum())
+    fp = int((call & ~pos).sum())
+    tn = int((~call & ~pos).sum())
+    out["sens"] = tp / (tp + fn) if tp + fn else float("nan")
+    out["spec"] = tn / (tn + fp) if tn + fp else float("nan")
+    den = 2 * tp + fp + fn
+    out["f1"] = (2 * tp / den) if den else float("nan")
+    return out
+
+
 def ppv_npv(sens: float, spec: float, prev: float):
     """
     Predictive values at a given disease prevalence (Bayes).

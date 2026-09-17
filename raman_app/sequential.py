@@ -77,7 +77,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # project moves to another computer (see clinical_data.find_data_root)
 DEFAULT_DATA = cdata.find_data_root() or os.path.join(APP_DIR, "..", "Data")
 # models skipped by the GUI's "fast screening" toggle (slowest first)
-SLOW_MODELS = ("1D-CNN", "CatBoost", "XGBoost")
+SLOW_MODELS = ("1D-CNN (attention)", "1D-CNN", "CatBoost", "XGBoost")
 # study reference baselines (2026-08-30 run, seed 42, 5-fold grouped ×3)
 # — ONE home for the numbers so the CLI report, the GUI winner tab and
 # the HTML export can never drift apart; shown as "study reference",
@@ -563,15 +563,38 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
             eta = (time.time() - t0) / max(done[0], 1) * (total - done[0])
             progress_cb(done[0], total, best, best_f1, eta)
 
+    # checkpoint identity (2026-09-15): records are bound to the
+    # dataset they were computed on — the GUI always resumes the same
+    # fixed archs.jsonl, and a mixed file (e.g. paired 287 rows + PQN
+    # 307 rows) used to detonate as a hstack ValueError deep in the
+    # triples workers.  Records from any other dataset/mode/feature
+    # count (or pre-fingerprint files) are ignored here, so their
+    # architectures are recomputed fresh and their metrics can never
+    # pollute the leaderboard or the early-abandon cutoff.
+    data_id = {"n_rows": int(len(y)),
+               "n_cols": int(np.asarray(X).shape[1])}
     resume: dict[str, dict] = {}
     if resume_path and os.path.exists(resume_path):
+        total = 0
+        kept: list[str] = []
         with open(resume_path, encoding="utf-8") as fh:
             for line in fh:
+                total += 1
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if rec.get("data") != data_id:
+                    continue           # stale: different data/mode
+                kept.append(line)
                 resume[" → ".join(rec["arch"])] = rec
+        if len(kept) < total:
+            # purge stale/corrupt lines on open: the GUI resumes a
+            # FIXED path, so foreign-dataset records would otherwise
+            # accumulate forever (worst case: recompute, never data loss
+            # — it is a cache)
+            with open(resume_path, "w", encoding="utf-8") as fh:
+                fh.writelines(kept)
     if resume_path:        # parent may not exist yet (GUI resume path)
         os.makedirs(os.path.dirname(resume_path) or ".", exist_ok=True)
     ckpt = open(resume_path, "a", encoding="utf-8") \
@@ -580,7 +603,7 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
     def record(arch, metrics, pruned, level: int = 3, oof=None):
         if not ckpt:
             return
-        rec = {"arch": list(arch), "level": level,
+        rec = {"arch": list(arch), "level": level, "data": data_id,
                "pruned": pruned is not None,
                **({"bound": round(float(pruned), 4)}
                   if pruned is not None
@@ -598,6 +621,7 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
         ranking/cutoff/winner filter."""
         if ckpt:
             ckpt.write(json.dumps({"arch": list(arch), "level": level,
+                                   "data": data_id,
                                    "error": msg[:300]}) + "\n")
             ckpt.flush()
         print(f"3SSE: {_fmt_arch(tuple(arch))} failed — {msg}")
@@ -622,10 +646,13 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
             done[0] += 1
             if rec.get("error"):
                 continue               # failed before: don't retry
+            if "oof" in rec:
+                arr = np.asarray(rec["oof"], dtype=np.float32)
+                if arr.ndim != 2 or arr.shape[0] != len(y):
+                    continue   # corrupt OOF: recompute the single fresh
+                oof1[name] = arr
             singles.append({"arch": (name,), "level": 1,
                             "metrics": _metrics_from_rec(rec)})
-            if "oof" in rec:
-                oof1[name] = np.asarray(rec["oof"], dtype=np.float32)
     pending = [n for n in names if n not in done_names]
     batch1 = max(1, jobs) * 2
     for i in range(0, len(pending), batch1):
@@ -683,10 +710,13 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
             done[0] += 1
             if rec.get("error"):
                 continue               # failed before: don't retry
+            if "oof" in rec:
+                arr = np.asarray(rec["oof"], dtype=np.float32)
+                if arr.ndim != 2 or arr.shape[0] != len(y):
+                    continue   # corrupt OOF: recompute the pair fresh
+                p2[key] = arr
             pairs.append({"arch": key, "level": 2,
                           "metrics": _metrics_from_rec(rec)})
-            if "oof" in rec:
-                p2[key] = np.asarray(rec["oof"], dtype=np.float32)
     pair_permutations = [ab for ab in itertools.permutations(names, 2)
                          if " → ".join(ab) not in done_pairs]
     for A, B in pair_permutations:
@@ -771,8 +801,16 @@ def _search_impl(X, y, groups=None, wavenumbers=None, k: int = 3,
                            and " → ".join((A, B, C)) not in resume),
                           key=lambda c: -single_f1.get(c, 0.0))
             if cand:
+                P1, P2 = oof1.get(A), p2.get((A, B))
+                if (P1 is None or P2 is None
+                        or P1.shape[0] != len(y)
+                        or P2.shape[0] != len(y)):
+                    raise RuntimeError(
+                        f"internal: missing/mismatched OOF features "
+                        f"for pair {A} -> {B} — the checkpoint file is "
+                        f"stale; delete archs.jsonl and rerun")
                 tasks.append(((A, B), X, y, groups, classes, k_s, seed,
-                              oof1[A], p2[(A, B)], cand, factories,
+                              P1, P2, cand, factories,
                               wavenumbers, cutoff))
         for results in Parallel(n_jobs=jobs, max_nbytes=100)(
                 delayed(_worker_triples)(t) for t in tasks):

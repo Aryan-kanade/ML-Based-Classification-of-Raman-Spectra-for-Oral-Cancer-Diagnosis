@@ -50,6 +50,11 @@ def main() -> int:
     import tempfile as _tf
     import gui as _gui
     _gui.APP_DIR = _tf.mkdtemp(prefix="raman_guitest_")
+    # do NOT let closeEvent overwrite the REAL user settings.json with
+    # the synthetic session (found 2026-09-17: the real file ended up
+    # pointing at a deleted temp folder after a gui_test run)
+    import ui_helpers as _uh
+    _uh.save_settings = lambda s: None
     # keep a reference: an unreferenced QApplication gets garbage-collected
     # and every later Qt call crashes natively
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])  # noqa: F841
@@ -141,15 +146,89 @@ def main() -> int:
     assert win.dist_canvas.figure.axes
     print(f"[5] Result page OK — verdict: {win.result_verdict.text()!r}")
 
+    # --- [5b] "Then vs now" card + selective-prediction lines -------------
+    tnow = win.r_tnow_table
+    assert tnow.rowCount() == len(gui.THEN_NOW_RECORD) + 1, tnow.rowCount()
+    assert tnow.columnCount() == 4
+    row_labels = [tnow.item(r, 0).text() for r in range(tnow.rowCount())]
+    assert any("pre-2026-09-09" in s for s in row_labels), row_labels
+    assert any("honest protocol" in s for s in row_labels), row_labels
+    assert any("This winner" in s for s in row_labels), row_labels
+    live_f1_txt = tnow.item(tnow.rowCount() - 1, 1).text()
+    assert live_f1_txt != "–", "live winner F1 must render, not a dash"
+    # multiclass winner (C1/C5/C8) -> no decided-case lines
+    assert win._decided_lines() == []
+    # binary winner -> rule-out/rule-in + decided-case coverage line.
+    # ~25% label noise keeps the ROC from saturating (perfectly
+    # separable synthetic classes give p in {0,1}, where rule-out ==
+    # rule-in and the two-tier rule correctly collapses to nothing).
+    keep2 = [i for i in keep if win.labels[i] in ("C1", "C8")]
+    import numpy as _np
+    y2 = [win.labels[i] for i in keep2]
+    _rng = _np.random.default_rng(7)
+    _flip = _rng.random(len(y2)) < 0.25
+    y2 = [("C1" if v == "C8" else "C8") if f else v
+          for f, v in zip(_flip, y2, strict=True)]
+    _r2, wbin = modeling.evaluate_models(
+        X[keep2], y2, model_names=["Random Forest"], k_folds=3,
+        wavenumbers=win.grid)
+    assert len(wbin.classes) == 2
+    assert wbin.oof_proba is not None
+    win.winner = wbin
+    win._set_result_banner()
+    dlines = win._decided_lines()
+    assert dlines and any("of cases" in d for d in dlines), dlines
+    assert any("Rule-out" in d or "Rule-in" in d for d in dlines), dlines
+    banner_txt = win.banner_plain.text()
+    assert "of cases" in banner_txt, "decided-case line must reach banner"
+    win.winner = winner                    # restore for the sections below
+    win._set_result_banner()
+    print(f"[5b] then-vs-now card + selective-prediction lines OK "
+          f"({len(dlines)} binary lines)")
+
     # --- [6] report writer -------------------------------------------------
     win.save_result_report()
     # APP_DIR was redirected to a temp dir at startup — the report lands
     # THERE, never in the source tree (the old assertion read the stale
     # in-tree copy and passed even when the fresh write failed)
     rep = os.path.join(_gui.APP_DIR, "result_report.txt")
-    assert os.path.isfile(rep) and "Predictions" in open(
-        rep, encoding="utf-8").read()
-    print("[6] result report written (temp APP_DIR, out of tree)")
+    assert os.path.isfile(rep), "result report not written"
+    rep_txt = open(rep, encoding="utf-8").read()
+    assert "Predictions" in rep_txt
+    assert "Then vs now" in rep_txt, "then-vs-now block missing from report"
+    assert "pre-2026-09-09" in rep_txt and "0.702" in rep_txt
+    print("[6] result report written (temp APP_DIR, out of tree; "
+          "then-vs-now block present)")
+
+    # --- [6b] startup restore picks the BEST 3SSE winner ------------------
+    # §62: restore_last_3sse must scan all study_run_3sse*/ folders and
+    # land on the highest-F1 one — a fresh weak search (0.63 TabPFN
+    # chain) must not drag the startup display below the proven winner.
+    import json as _json
+    for sub, arch, f1, cm in (("study_run_3sse_low", ["Fake Low Model"],
+                               0.60, None),
+                              ("study_run_3sse_high", ["Fake High Model"],
+                               0.75, [[77, 50], [16, 144]])):
+        d = os.path.join(_gui.APP_DIR, sub)
+        os.makedirs(d, exist_ok=True)
+        # NO "classes" key: a 2-class cm must resolve through the
+        # Normal/Tumor fallback even though the SESSION is 3-class
+        # (C1/C5/C8) — the reshape used to crash here (2026-09-17)
+        metrics = {"f1": f1, "sens": f1, "spec": f1, "prec": f1}
+        if cm is not None:
+            metrics["cm"] = cm
+        with open(os.path.join(d, "winner.json"), "w",
+                  encoding="utf-8") as fh:
+            _json.dump({"arch": arch, "threshold": None,
+                        "metrics": metrics}, fh)
+    win.restore_last_3sse()
+    assert "Fake High" in win.banner_title.text(), win.banner_title.text()
+    # HIGH-2 fix pin: a completed train/restore must leave Model Lab
+    # enabled (it used to stay dead after every successful training)
+    assert win.b_model_lab.isEnabled(), \
+        "Model Lab must re-enable after train/restore success"
+    print("[6b] restore_last_3sse picked the best winner (0.75 over 0.60)"
+          " · Model Lab re-enabled")
 
     # --- [7] sidebar completion ticks + nav bounds -------------------------
     win.refresh_nav()

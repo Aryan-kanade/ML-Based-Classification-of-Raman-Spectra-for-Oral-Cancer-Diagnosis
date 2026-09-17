@@ -188,12 +188,12 @@ are stored in the checkpoint).
 | `vit_model.py` | spectral Vision Transformer model + checkpoint I/O |
 | `vit_train.py` | train the ViT on a spectra folder (curves + confusion matrix) |
 | `vit_test.py` | re-evaluate a trained ViT checkpoint on its test set |
-| `test_all.py` / `gui_test.py` / `deep_test.py` | 97 unit tests · GUI walk · 19 adversarial scenarios |
+| `test_all.py` / `gui_test.py` / `deep_test.py` | 131 unit tests · GUI walk · 23 adversarial scenarios |
 
 ## Testing
 
 ```bat
-python test_all.py    :: 97 unit/regression tests (synthetic data, ~2 min)
+python test_all.py    :: 131 unit/regression tests (synthetic data, ~2 min)
 python gui_test.py    :: headless end-to-end GUI flow (offscreen, ~20 s)
 python deep_test.py   :: adversarial sweep: error paths, workers, CLI (~60 s)
 ```
@@ -217,8 +217,8 @@ LightGBM pip wheels contain no GPU build (source build with
 `-DUSE_GPU=1` required) — honestly reported as CPU. Bundle weights
 are stored on CPU, so saved-model predictions are **identical**
 whether the training ran on GPU or CPU (verified MAX |Δp| = 0).
-Full details + benchmarks: `GPU_ACCELERATION.md`,
-`GPU_ACCELERATION_AUDIT.md`, `GPU_STRESS_TEST_AUDIT.md` (repo root).
+Full details: `Brain.md` (repo root, sections "GPU acceleration
+semantics" and "GPU stress/soak test").
 
 ## Performance reporting policy
 
@@ -234,14 +234,14 @@ labeled and never mixed.
 ## Validation summary
 
 Five audit rounds + a formula audit + a GPU implementation audit + a
-long-running GPU soak test (all reports at the repo root: `MASTER_
-AUDIT_REPORT.md`, `FINAL_RELEASE_AUDIT.md`, `METRIC_IMPROVEMENT_
-IMPLEMENTATION.md`, `GPU_*.md`). Final state: **97/97 unit · 19/19
-deep · GUI suite · ruff clean · 25/25 registry (Extra Trees F1
-0.760) · zero patient-level leakage (fingerprint probes at chance)
-· persistence bit-exact across processes · all scientific baselines
-bit-identical after every change · GPU soak 15/15 PASS (20× train,
-100× predictions, memory plateau, 0 CUDA errors).**
+long-running GPU soak test (the round-by-round record lives in
+`Brain.md` at the repo root — the per-round report files were removed
+in the 2026-09-06 workspace cleanup). Final state: **131/131 unit ·
+23/23 deep · GUI suite · ruff clean · 25/25 registry (proven 3SSE
+chain F1 0.757 / AUC 0.791) · zero patient-level leakage (fingerprint
+probes at chance) · persistence bit-exact across processes · all
+scientific baselines bit-identical after every change · GPU soak 15/15
+PASS (20× train, 100× predictions, memory plateau, 0 CUDA errors).**
 
 ## Scientific limitations
 

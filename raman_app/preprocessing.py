@@ -37,29 +37,34 @@ except ImportError:
 # --------------------------------------------------------------------------
 @dataclass
 class PreprocessParams:
-    crop_min: float = 500.0        # keep wavenumbers >= this (0 = no crop;
-                                   # default = tuned working range)
-    crop_max: float = 2000.0       # keep wavenumbers <= this (0 = no crop)
+    crop_min: float = 0.0          # keep wavenumbers >= this (0 = no crop;
+                                   # default = deep-search winner: deriv 2
+                                   # nullifies the padded edges anyway)
+    crop_max: float = 0.0          # keep wavenumbers <= this (0 = no crop)
     despike: bool = False          # Whitaker-Hayes removal (measured:
                                    # excluding heavily spiked spectra
                                    # beat despiking on this dataset)
     despike_z: float = 7.0         # modified Z-score threshold
     despike_window: int = 5        # replacement moving-average width (odd)
     wavelet: bool = True            # enable wavelet denoising
-    wavelet_name: str = "sym8"
-    wavelet_level: int = 4
+    wavelet_name: str = "db6"
+    wavelet_level: int = 2
     wavelet_threshold: str = "universal"  # 'universal'|'bayes'|'sure'
     wavelet_mode: str = "soft"            # 'soft'|'hard'|'garrote'
     wavelet_cycle: int = 0                 # cycle-spin shifts (0 = off)
     sg_window: int = 11             # odd
-    sg_poly: int = 3
-    sg_deriv: int = 0               # 0/1/2
+    sg_poly: int = 4
+    sg_deriv: int = 2               # 0/1/2 — the 2nd derivative is the
+                                    # biggest single lever measured: it
+                                    # kills baseline AND padded edges
     detrend: bool = False           # subtract a linear trend first
     baseline_method: str = "als"    # 'als'|'arpls'|'iarpls'|'pspline'|'snip'
     als_lambda: float = 1e5         # smoothness
     als_p: float = 0.01             # asymmetry
     als_niter: int = 10
-    norm: str = "vector"            # 'vector'|'snv'|'area'|'minmax'|'none'
+    norm: str = "none"              # 'vector'|'snv'|'area'|'minmax'|'none'
+                                    # (measured: none wins — deriv spectra
+                                    # are signed; amplitude IS signal)
     wn_calibrate: bool = False      # align spectra on the Phe-1003 peak
 
     @classmethod
@@ -72,6 +77,19 @@ class PreprocessParams:
         """
         return cls(crop_min=400.0, crop_max=2300.0, despike=True,
                    baseline_method="snip", norm="snv")
+
+    @classmethod
+    def standard_tuned(cls) -> "PreprocessParams":
+        """
+        Standard-mode preset (deep-search winner for classifying
+        absolute spectra, no patient reference available): tight
+        fingerprint crop 700–1800, sym8 L4 wavelet, SG 11/3, deriv 2,
+        no normalization, Phe-1003 axis calibration.  Paired-mode users
+        keep the dataclass defaults (no-crop / db6 L2 / SG 11/4).
+        """
+        return cls(crop_min=700.0, crop_max=1800.0,
+                   wavelet_name="sym8", wavelet_level=4, sg_poly=3,
+                   sg_deriv=2, norm="none", wn_calibrate=True)
 
     def validate(self) -> "PreprocessParams":
         p = PreprocessParams(**asdict(self))

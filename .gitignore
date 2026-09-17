@@ -1,5 +1,6 @@
 # Patient data — never commit (privacy)
 Data/
+Data_RSClass/
 
 # Copyrighted literature / external clones / generated renders
 Documatation/

@@ -1,0 +1,84 @@
+{
+  "n_patients": 64,
+  "deployed_threshold": 0.5,
+  "aggregations": {
+    "mean": {
+      "deployed_threshold": {
+        "f1": 0.4325123152709359,
+        "acc": 0.4375,
+        "sens": 0.5483870967741935,
+        "spec": 0.3333333333333333,
+        "n_correct": 28,
+        "n_patients": 64
+      },
+      "loo_tuned": {
+        "f1": 0.38688282977155486,
+        "acc": 0.390625,
+        "sens": 0.3225806451612903,
+        "spec": 0.45454545454545453,
+        "n_correct": 25,
+        "n_patients": 64
+      },
+      "verdict": "agg=mean: LOO-tuned patient F1 0.387 vs 0.433 at deployed thr (-0.046)"
+    },
+    "median": {
+      "deployed_threshold": {
+        "f1": 0.5866701110824076,
+        "acc": 0.609375,
+        "sens": 0.8709677419354839,
+        "spec": 0.36363636363636365,
+        "n_correct": 39,
+        "n_patients": 64
+      },
+      "loo_tuned": {
+        "f1": 0.6384180790960452,
+        "acc": 0.640625,
+        "sens": 0.7419354838709677,
+        "spec": 0.5454545454545454,
+        "n_correct": 41,
+        "n_patients": 64
+      },
+      "verdict": "agg=median: LOO-tuned patient F1 0.638 vs 0.587 at deployed thr (+0.052)"
+    },
+    "trimmed": {
+      "deployed_threshold": {
+        "f1": 0.4325123152709359,
+        "acc": 0.4375,
+        "sens": 0.5483870967741935,
+        "spec": 0.3333333333333333,
+        "n_correct": 28,
+        "n_patients": 64
+      },
+      "loo_tuned": {
+        "f1": 0.4009852216748768,
+        "acc": 0.40625,
+        "sens": 0.3225806451612903,
+        "spec": 0.48484848484848486,
+        "n_correct": 26,
+        "n_patients": 64
+      },
+      "verdict": "agg=trimmed: LOO-tuned patient F1 0.401 vs 0.433 at deployed thr (-0.032)"
+    },
+    "logit": {
+      "deployed_threshold": {
+        "f1": 0.41832473593711617,
+        "acc": 0.421875,
+        "sens": 0.5161290322580645,
+        "spec": 0.3333333333333333,
+        "n_correct": 27,
+        "n_patients": 64
+      },
+      "loo_tuned": {
+        "f1": 0.28268991282689915,
+        "acc": 0.296875,
+        "sens": 0.45161290322580644,
+        "spec": 0.15151515151515152,
+        "n_correct": 19,
+        "n_patients": 64
+      },
+      "verdict": "agg=logit: LOO-tuned patient F1 0.283 vs 0.418 at deployed thr (-0.136)"
+    }
+  },
+  "best_agg": "median",
+  "verdict": "agg=median: LOO-tuned patient F1 0.638 vs 0.587 at deployed thr (+0.052)"
+}

@@ -15,6 +15,7 @@ Strategy used to MAXIMIZE sensitivity / specificity / F1:
 from __future__ import annotations
 
 import traceback
+import math
 import os
 from collections import Counter
 from dataclasses import dataclass, field
@@ -416,9 +417,20 @@ if HAS_TORCH:
 
     class _CNN1DNet(nn.Module):
         """Conv1d(1→32, k7) → pool → Conv1d(32→64, k5) → global avg pool
-        → dropout → linear head.  ~25k parameters; CPU-fast."""
+        → dropout → linear head.  ~25k parameters; CPU-fast.
 
-        def __init__(self, n_classes: int, length: int, dropout: float):
+        attention=True prepends a learnable per-wavenumber gate on the
+        RAW spectrum (Conv1d 1→8→1, sigmoid) — the net learns which
+        bands matter before any feature extraction (MTN-OralRaman's
+        SpatialAttention, simplified for small n).  The gate is a
+        separate attribute, NOT part of `features`, so Grad-CAM's
+        features[4] indexing keeps pointing at the last Conv1d.  The
+        gate's final conv is zero-initialised: it starts as a constant
+        0.5 scale (absorbed by the following BatchNorm) and learns
+        deviations from there."""
+
+        def __init__(self, n_classes: int, length: int, dropout: float,
+                     attention: bool = False):
             super().__init__()
             self.features = nn.Sequential(
                 nn.Conv1d(1, 32, kernel_size=7, padding=3),
@@ -427,10 +439,21 @@ if HAS_TORCH:
                 nn.BatchNorm1d(64), nn.ReLU(),
                 nn.AdaptiveAvgPool1d(1),
             )
+            self.attn = (nn.Sequential(
+                nn.Conv1d(1, 8, kernel_size=9, padding=4),
+                nn.ReLU(),
+                nn.Conv1d(8, 1, kernel_size=9, padding=4),
+                nn.Sigmoid(),
+            ) if attention else None)
+            if self.attn is not None:          # start as a flat gate
+                nn.init.zeros_(self.attn[-2].weight)
+                nn.init.zeros_(self.attn[-2].bias)
             self.head = nn.Sequential(nn.Dropout(dropout),
                                       nn.Linear(64, n_classes))
 
         def forward(self, x):            # x: (batch, 1, length)
+            if self.attn is not None:
+                x = x * self.attn(x)
             h = self.features(x).squeeze(-1)
             return self.head(h)
 
@@ -448,7 +471,8 @@ if HAS_TORCH:
         def __init__(self, epochs: int = 25, batch_size: int = 32,
                      lr: float = 1e-3, dropout: float = 0.2,
                      seed: int = RANDOM_STATE, augment: bool = True,
-                     synth: float = 0.0):
+                     synth: float = 0.0, attention: bool = False,
+                     scheduler: str = "none"):
             self.epochs = epochs
             self.batch_size = batch_size
             self.lr = lr
@@ -458,6 +482,11 @@ if HAS_TORCH:
             # B2: fraction of the TRAINING rows to additionally
             # synthesize as within-class spectral blends (0 = off)
             self.synth = synth
+            # §53 (MTN-OralRaman adoption): learnable per-wavenumber
+            # gate on the raw spectrum + warmup+cosine LR schedule
+            # ("none" = the legacy fixed-Adam behaviour)
+            self.attention = attention
+            self.scheduler = scheduler
 
         def _to_tensor(self, X):
             X = np.asarray(X, dtype=np.float32)
@@ -525,8 +554,21 @@ if HAS_TORCH:
                 dtype=torch.float32, device=dev)
             loss_fn = nn.CrossEntropyLoss(weight=weights)
             self.net_ = _CNN1DNet(len(self.classes_), Xt.shape[-1],
-                                  self.dropout).to(dev)
+                                  self.dropout,
+                                  attention=self.attention).to(dev)
             opt = torch.optim.Adam(self.net_.parameters(), lr=self.lr)
+            sched = None
+            if self.scheduler == "cosine":
+                # vit_train's warmup+cosine LambdaLR, per epoch
+                warmup = min(5, max(1, self.epochs // 10))
+
+                def _lr_lambda(epoch):
+                    if epoch < warmup:
+                        return (epoch + 1) / warmup
+                    t = (epoch - warmup) / max(1, self.epochs - warmup)
+                    return 0.5 * (1.0 + math.cos(math.pi * t))
+
+                sched = torch.optim.lr_scheduler.LambdaLR(opt, _lr_lambda)
             gen = torch.Generator().manual_seed(self.seed)
             best_state, best_loss, best_epoch = None, np.inf, -1
             for epoch in range(self.epochs):
@@ -570,6 +612,8 @@ if HAS_TORCH:
                     va_loss = float(loss_fn(self.net_(Xt[idx_va]),
                                             torch.from_numpy(
                                                 ye[idx_va]).to(dev)))
+                if sched is not None:
+                    sched.step()
                 if va_loss < best_loss - 1e-4:
                     best_loss, best_epoch = va_loss, epoch
                     best_state = {k: v.clone()
@@ -1175,6 +1219,14 @@ def model_specs() -> list[dict]:
             # empty grid: one seeded fit per fold (grid over epochs
             # would multiply an already-iterative training)
             "estimator": CNN1DClassifier(),
+            "grid": {},
+        })
+        # §53 (2026-09-12, MTN-OralRaman adoption): learnable
+        # per-wavenumber gate on the raw spectrum + warmup-cosine LR
+        specs.append({
+            "name": "1D-CNN (attention)",
+            "estimator": CNN1DClassifier(attention=True,
+                                         scheduler="cosine"),
             "grid": {},
         })
         # B1+B2 (2026-09-05): deep (seed) ensemble — the small-n gold

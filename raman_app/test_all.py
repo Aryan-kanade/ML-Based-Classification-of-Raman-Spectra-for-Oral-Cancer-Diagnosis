@@ -17,8 +17,17 @@ import os
 import re
 import sys
 import tempfile
+import warnings
 
-import numpy as np
+# joblib 1.5.3's pickle loader still assigns ndarray.shape (removed
+# pattern in numpy 2.5) — ~120k DeprecationWarnings per suite, all from
+# site-packages, zero from our code.  Silenced until joblib ships the
+# fix; tracked in Brain.md §59.
+warnings.filterwarnings(
+    "ignore", message="Setting the shape on a NumPy array",
+    category=DeprecationWarning, module=r"joblib\.numpy_pickle")
+
+import numpy as np  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -207,8 +216,8 @@ def test_bundle_roundtrip_with_crop():
         # (2026-09-08: a zeros() dummy is now correctly REJECTED by the
         # BUG-1 zero-signal guard — use a constant-with-signal vector;
         # the assertion targets crop/axis mechanics, which are unchanged)
-        out = modeling.predict_with_bundle(b, wn_bundle[::-1],
-                                           np.ones_like(wn_bundle))
+        bump = 1.0 + np.exp(-((wn_bundle - 1000.0) / 40.0) ** 2)
+        out = modeling.predict_with_bundle(b, wn_bundle[::-1], bump)
         assert out["prediction"] in ("A", "B")
         assert abs(sum(out["probabilities"].values()) - 1) < 1e-6
 
@@ -440,7 +449,7 @@ def test_adaptive_wavelet_and_new_steps():
     d = pp.PreprocessParams().validate()
     assert (d.wavelet_threshold, d.wavelet_mode, d.wavelet_cycle,
             d.baseline_method, d.norm) == \
-        ("universal", "soft", 0, "als", "vector")
+        ("universal", "soft", 0, "als", "none")
 
 
 def test_stage2_registry_augmentation_uncertainty_pr():
@@ -448,7 +457,7 @@ def test_stage2_registry_augmentation_uncertainty_pr():
     dropout + deep ensemble; physics synthesis; PR points."""
     import gui  # SUITE_VERSION bump when the registry changes
     assert gui.SUITE_VERSION >= 7
-    assert len(modeling.ALL_MODEL_NAMES) == 24
+    assert len(modeling.ALL_MODEL_NAMES) == 25
     for n in ("Sparse PLS-DA", "PLS + XGBoost", "PCA + XGBoost",
               "t-test filter + XGBoost", "Spectral + band features"):
         assert n in modeling.ALL_MODEL_NAMES
@@ -834,15 +843,14 @@ def test_prep_param_rows_and_compact():
     from preprocessing import PreprocessParams
     rows = gui.prep_param_rows(PreprocessParams())
     vals = dict(rows)
-    assert vals["crop_min"] == "500" and vals["crop_max"] == "2000"
+    assert vals["crop_min"] == "0" and vals["crop_max"] == "0"
     assert vals["despike"] == "off" and vals["wavelet"] == "on"
-    assert vals["norm"] == "vector"
+    assert vals["norm"] == "none"
     assert vals["als_lambda"] == "100000"   # :g — never 1e+05
     compact = gui.prep_compact(PreprocessParams())
-    # dash style is presentation (ascii or en-dash): accept both
-    assert ("crop 500-2000" in compact or "crop 500–2000" in compact)
-    assert "norm vector" in compact
-    assert "despike off" in compact and "wavelet sym8 L4" in compact
+    assert "no crop" in compact
+    assert "norm none" in compact
+    assert "despike off" in compact and "wavelet db6 L2" in compact
     compact_saliva = gui.prep_compact(PreprocessParams.saliva())
     assert ("crop 400-2300" in compact_saliva
             or "crop 400–2300" in compact_saliva)
@@ -879,7 +887,7 @@ def test_seq_results_html():
     assert html.startswith("<!DOCTYPE html>")
     assert html.rstrip().endswith("</body></html>")
     assert "Preprocessing (as trained)" in html
-    assert "crop_min" in html and "vector" in html
+    assert "crop_min" in html and "none" in html
     assert "PLS + SVM → Logistic Regression" in html
     assert "0.800" in html and "NOT significant" in html
     assert "Single Models ranking" in html
@@ -926,16 +934,17 @@ def test_text_audit_fixes():
         assert any("Seed stability (5 seeds): macro-F1 0.820 ± 0.014"
                    in ln.replace("\u2212", "-") for ln in lines)
 
-        # 4) PPV source: honest first, else selection tagged preliminary
+        # 4) PPV source: the TRAINED WINNER's sens/spec (2026-09-15) —
+        # the single-model benchmark never speaks for PPV/NPV
         win.winner = SimpleNamespace(
             macro={"sens": (0.6, 0.0), "spec": (0.5, 0.0)},
             macro_f1=lambda: 0.55)
         win._honest_result = None
         s, p, note = win._ppv_source()
-        assert (s, p) == (0.6, 0.5) and "preliminary" in note
+        assert (s, p, note) == (0.6, 0.5, "")
         win._honest_result = {"mean_f1": 0.8, "sens": 0.9, "spec": 0.7}
         s, p, note = win._ppv_source()
-        assert (s, p, note) == (0.9, 0.7, "")
+        assert (s, p, note) == (0.6, 0.5, "")
     finally:
         win.close()
 
@@ -989,8 +998,9 @@ def test_seq_dialog_winner_tab_ui():
     chips = [p for p in page.findChildren(QtWidgets.QLabel)
              if p.objectName() == "Pill"
              and p.property("tone") == "slate"
-             and p.text().startswith(("crop ", "despike", "wavelet",
-                                      "SG ", "baseline ", "norm "))]
+             and p.text().startswith(("crop ", "no crop", "despike",
+                                      "wavelet", "SG ", "baseline ",
+                                      "norm "))]
     assert len(chips) == 6
     # collapsible full parameter table: hidden until toggled
     assert params.rowCount() == 21 and params.isHidden()
@@ -1113,6 +1123,63 @@ def test_ppv_npv_prevalence():
     assert ppv05 < 0.5 and ppv60 > 2 * ppv05 and npv05 > 0.99
     # degenerate prevalence does not divide by zero
     assert np.isfinite(clin.ppv_npv(0.9, 0.9, 0.0)[0])
+
+
+def test_decided_case_selective_prediction():
+    """Decided-case (selective prediction) metrics: p<lo or p>=hi is
+    decided (triage semantics — p==hi is a positive call), the middle
+    band is deferred; coverage must always accompany the metrics."""
+    import clinical as clin
+    y = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    p = np.array([0.05, 0.20, 0.45, 0.55, 0.75, 0.90, 0.35, 0.60])
+    r = clin.decided_case(y, p, 0.30, 0.70)
+    # decided: 0.05, 0.20 (both negative, cleared) + 0.75, 0.90 (both
+    # positive, caught); 0.35/0.55/0.60 deferred
+    assert r["n_total"] == 8 and r["n_decided"] == 4
+    assert abs(r["coverage"] - 0.5) < 1e-9
+    assert r["f1"] == 1.0 and r["sens"] == 1.0 and r["spec"] == 1.0
+    # errors inside the decided set: 0.80 TP, 0.10 FN, 0.10 TN
+    r2 = clin.decided_case(np.array([1, 1, 0]),
+                           np.array([0.80, 0.10, 0.10]), 0.30, 0.70)
+    assert abs(r2["sens"] - 0.5) < 1e-9 and r2["spec"] == 1.0
+    assert abs(r2["f1"] - 2 / 3) < 1e-9
+    # band boundaries: p == hi decided positive, p == lo deferred
+    r3 = clin.decided_case(np.array([1, 0]),
+                           np.array([0.70, 0.30]), 0.30, 0.70)
+    assert r3["n_decided"] == 1 and r3["sens"] == 1.0
+    # nothing decided -> NaN metrics (never fake zeros)
+    r4 = clin.decided_case(y, p, 0.0, 1.01)
+    assert r4["n_decided"] == 0 and np.isnan(r4["f1"])
+    # NaN probabilities are dropped, not decided
+    r5 = clin.decided_case(np.array([1, 0]),
+                           np.array([float("nan"), 0.9]), 0.3, 0.7)
+    assert r5["n_total"] == 1 and r5["n_decided"] == 1
+
+
+def test_then_now_record_matches_presept9():
+    """The on-screen 'Then vs now' record must equal the measured
+    honest re-run (experiments/presept9.json), not drift as text."""
+    import json
+    import gui as _gui
+    rec = _gui.THEN_NOW_RECORD
+    assert len(rec) == 2
+    old_label, old_f1, old_auc, old_note = rec[0]
+    honest_label, honest_f1, honest_auc, honest_note = rec[1]
+    assert "pre-2026-09-09" in old_label and old_f1 == 0.702 \
+        and old_auc == 0.788
+    assert "honest" in honest_label and honest_f1 == 0.639 \
+        and honest_auc == 0.682
+    assert "0.572" in honest_note  # the old 3SSE chain's honest F1
+    p9 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "experiments", "presept9.json")
+    if os.path.isfile(p9):
+        with open(p9, encoding="utf-8") as fh:
+            data = json.load(fh)
+        # display record carries 3 decimals; compare at that precision
+        assert round(data["old_record"]["paired_et_f1"], 3) == old_f1
+        assert round(data["old_record"]["paired_et_auc"], 3) == old_auc
+        assert round(data["paired_extra_trees"]["f1"], 3) == honest_f1
+        assert round(data["paired_extra_trees"]["auc"], 3) == honest_auc
 
 
 def test_calibration_and_dca():
@@ -2068,7 +2135,8 @@ def test_predict_rejects_nonfinite_and_degenerate():
                 raise AssertionError(f"{name} spectrum was not rejected")
         # degenerate-but-real inputs STAY accepted (they carry signal):
         r_const = modeling.predict_with_bundle(
-            b, wn, np.full(X.shape[1], 5.0))
+            b, wn,
+            5.0 + np.exp(-((np.asarray(wn) - 1000.0) / 40.0) ** 2))
         assert r_const["prediction"] in ("A", "B")
         # release gate: empty / length-mismatched arrays must be a clean
         # ValueError (previously IndexError at the sort step)
@@ -2990,6 +3058,110 @@ def test_search_survives_broken_model():
         "Boom" not in p["arch"] for p in board["pairs"])
 
 
+def test_standard_tuned_preset_and_defaults():
+    """§54: the deep-search winner is now the dataclass default (paired
+    mode), and standard_tuned() carries the standard-mode optimum."""
+    d = pp.PreprocessParams().validate()
+    assert (d.crop_min, d.crop_max) == (0.0, 0.0)
+    assert (d.wavelet_name, d.wavelet_level) == ("db6", 2)
+    assert (d.sg_window, d.sg_poly, d.sg_deriv) == (11, 4, 2)
+    assert d.norm == "none" and not d.despike
+    st = pp.PreprocessParams.standard_tuned().validate()
+    assert (st.crop_min, st.crop_max) == (700.0, 1800.0)
+    assert (st.wavelet_name, st.wavelet_level) == ("sym8", 4)
+    assert (st.sg_window, st.sg_poly, st.sg_deriv) == (11, 3, 2)
+    assert st.norm == "none" and st.wn_calibrate
+
+
+def test_proven_preset_and_stability_defaults():
+    """§57 (2026-09-15): '⭐ Proven' checks exactly the d2-proven
+    families (registry minus the measured-weak 7); Repeat-CV ×3 and
+    Average-replicates default ON (stability defaults).  §62
+    (2026-09-17): Proven is ALSO the startup default — an all-25
+    search wasted budget on the CNNs/TabPFN and picked a 0.63 chain."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import gui
+    app, win = _isolated_main_window()
+    try:
+        expected = set(modeling.ALL_MODEL_NAMES) - gui.PROVEN_EXCLUDE
+        startup = {n for n, cb in win.model_checks.items()
+                   if cb.isChecked()}
+        assert startup == expected, "Proven must be the startup default"
+        assert "TabPFN (foundation model)" not in startup
+        win._apply_model_preset("proven")
+        checked = {n for n, cb in win.model_checks.items()
+                   if cb.isChecked()}
+        assert checked == expected
+        assert "1D-CNN (attention)" not in checked       # measured ~0.50
+        assert "Random Forest" in checked                # d2 layer-2
+        assert "Extra Trees" in checked                  # d2 layer-3
+        assert "PLS + XGBoost" in checked                # d2 layer-1
+        assert win.chk_repeat.isChecked()
+        assert win.chk_avg_replicates.isChecked()
+        assert not win.chk_avg_replicates.isEnabled()    # needs groups
+    finally:
+        win.close()
+
+
+def test_patient_level_metrics_n_correct():
+    """§57: patient_level_metrics also reports n_correct (mean-P
+    majority vote vs dominant true class) for the deployment line."""
+    import study_stats as sstats
+    n_pat, per = 8, 5
+    g = [f"P{i}" for i in range(n_pat) for _ in range(per)]
+    y = ["A" if i < n_pat // 2 else "B"
+         for i in range(n_pat) for _ in range(per)]
+    oof = np.zeros((n_pat * per, 2))
+    for i in range(n_pat):
+        rows = slice(i * per, (i + 1) * per)
+        # every patient exactly right except P7 (wrong majority)
+        oof[rows, int(i >= n_pat // 2)] = 0.9
+        oof[rows, int(i < n_pat // 2)] = 0.1
+    oof[(n_pat - 1) * per:, :] = oof[(n_pat - 1) * per:, ::-1]
+    out = sstats.patient_level_metrics(y, g, oof)
+    assert out is not None
+    assert out["n_patients"] == n_pat
+    assert out["n_correct"] == n_pat - 1
+    assert out["f1"] > 0.85      # 7/8 patients, one wrong majority
+
+
+def test_search_checkpoint_fingerprint():
+    """§54 (2026-09-15 crash): archs.jsonl is resumed from a FIXED GUI
+    path, so records from a different dataset/mode (mixed 287/307-row
+    OOFs) must be ignored + purged — never replayed into a hstack
+    ValueError.  Matching-identity records still resume cleanly."""
+    import json
+    import tempfile
+
+    import sequential as seq
+    rng = np.random.default_rng(0)
+    n_pat, per = 12, 6
+    g = np.array([f"P{i:02d}" for i in range(n_pat)]).repeat(per)
+    X = rng.normal(size=(n_pat * per, 8)).astype(np.float32)
+    y = ((np.arange(n_pat) < n_pat // 2).repeat(per)).tolist()
+    models = ["PCA + LDA", "Random Forest"]
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt = os.path.join(tmp, "archs.jsonl")
+        poison = {"arch": ["PCA + LDA"], "level": 1, "pruned": False,
+                  "f1": 0.99, "oof": np.zeros((99, 2)).tolist()}
+        with open(ckpt, "w", encoding="utf-8") as fh:   # stale, no
+            fh.write(json.dumps(poison) + chr(10))      # fingerprint
+        board = seq.search(X, list(y), groups=list(g), k=2, top=2,
+                           model_names=models, jobs=1,
+                           resume_path=ckpt, prune_pairs=2)
+        assert len(board["singles"]) == 2   # stale row did NOT suppress
+        recs = [json.loads(l) for l in open(ckpt, encoding="utf-8")]
+        assert recs and all(
+            r.get("data") == {"n_rows": len(y), "n_cols": X.shape[1]}
+            for r in recs)                 # poisoned line purged
+        n = len(recs)
+        board2 = seq.search(X, list(y), groups=list(g), k=2, top=2,
+                            model_names=models, jobs=1,
+                            resume_path=ckpt, prune_pairs=2)
+        recs2 = [json.loads(l) for l in open(ckpt, encoding="utf-8")]
+        assert len(board2["singles"]) == 2 and len(recs2) == n  # replay
+
+
 def _optional_report():
     """Honesty line: which optional deps were absent, i.e. how much of
     the suite silently covered less than it looks (guarded test bodies
@@ -3068,13 +3240,20 @@ def _isolated_main_window():
     import gui
     app = _qt_app_styled()
     _stub_native_dialogs_once()
-    _saved = (uh.load_settings, _cd.find_data_root)
+    # save_settings is patched for the WINDOW'S LIFETIME (not restored
+    # here): closeEvent fires after this helper returns, and an
+    # unpatched write would overwrite the developer's real
+    # settings.json with this window's synthetic state (2026-09-17)
+    _saved = (uh.load_settings, uh.save_settings, _cd.find_data_root)
+    if not hasattr(uh, "_real_save_settings"):
+        uh._real_save_settings = uh.save_settings
     uh.load_settings = lambda: {}
+    uh.save_settings = lambda s: None
     _cd.find_data_root = lambda: None
     try:
         win = gui.MainWindow()
     finally:
-        uh.load_settings, _cd.find_data_root = _saved
+        uh.load_settings, _cd.find_data_root = _saved[0], _saved[2]
     return app, win
 
 
@@ -3263,8 +3442,13 @@ def test_settings_persistence_roundtrip():
     import ui_helpers as uh
     with tempfile.TemporaryDirectory() as td:
         path = os.path.join(td, "settings.json")
-        saved = uh.SETTINGS_PATH
+        saved_path = uh.SETTINGS_PATH
+        saved_save = uh.save_settings
+        # _isolated_main_window leaves a no-op stub installed; use the
+        # REAL writer it stashed for exactly this case
+        real = getattr(uh, "_real_save_settings", saved_save)
         uh.SETTINGS_PATH = path
+        uh.save_settings = real
         try:
             uh.save_settings({"last_model": "m.joblib", "n": 3})
             assert os.path.isfile(path)
@@ -3281,7 +3465,27 @@ def test_settings_persistence_roundtrip():
                 fh.write("[1, 2]")
             assert uh.load_settings() == {}
         finally:
-            uh.SETTINGS_PATH = saved
+            uh.SETTINGS_PATH = saved_path
+            uh.save_settings = saved_save
+
+
+def test_legacy_bad_params_sanitized():
+    """The 2026-09-01 legacy session (crop 500/1800 + deriv 0 + vector +
+    sym8 L4 + despike ON, ~0.12 F1 below the §52 winner) can never be
+    SAVED again — even by a GUI process that started before the v5
+    gate (gui._sanitize_params substitutes the winner defaults)."""
+    import gui
+    import preprocessing as pp
+    from dataclasses import asdict
+    bad = {"crop_min": 500.0, "crop_max": 1800.0, "sg_deriv": 0,
+           "norm": "vector", "wavelet_name": "sym8", "wavelet_level": 4,
+           "despike": True}
+    out = gui._sanitize_params(dict(bad))
+    good = asdict(pp.PreprocessParams().validate())
+    assert out == good
+    # anything NOT the exact combo passes through untouched
+    ok = dict(bad, crop_max=2000.0)
+    assert gui._sanitize_params(ok) == ok
 
 
 def test_untested_modeling_helpers():
@@ -3616,7 +3820,11 @@ def test_honest_numbers_are_the_displayed_numbers():
         assert key in out and 0.0 <= out[key] <= 1.0, (key, out[key])
     assert out["cm"].shape == (2, 2) and int(out["cm"].sum()) == len(y)
     assert 0.5 < out["auc"] <= 1.0        # separable synthetic data
-    # ---- 2/3/4. the GUI shows ONE (honest) number everywhere ----
+    # ---- 2/3/4. the GUI shows ONE (real) number everywhere ----
+    # 2026-09-15 design: the banner carries the TRAINED WINNER's own
+    # validated numbers for every winner type; the nested single-model
+    # check can never estimate the winner and appears only as a
+    # clearly-labeled benchmark inside the note.
     app, win = _isolated_main_window()
     import gui
     _saved = gui.APP_DIR
@@ -3629,26 +3837,26 @@ def test_honest_numbers_are_the_displayed_numbers():
             win.winner = w
             win.results = [w]
             win._set_result_banner()
-            assert "PRELIMINARY" in win.banner_plain.text()
+            assert "WINNER (cross-validated)" in win.banner_plain.text()
             assert win.stat_values["f1"].text() == "0.900"
-            # honest result lands -> banner swaps in place
+            # benchmark lands -> winner numbers STAY, benchmark is a note
             win._honest_result = {"mean_f1": 0.55, "std_f1": 0.05,
                                   "sens": 0.56, "spec": 0.54,
                                   "acc": 0.55, "auc": 0.60}
             win._set_result_banner()
-            assert "NESTED HONEST" in win.banner_plain.text()
-            assert win.stat_values["f1"].text() == "0.550"
-            assert win.stat_values["sens"].text() == "0.560"
-            # Result page: the same honest numbers, honest AUC preferred
+            assert "WINNER (cross-validated)" in win.banner_plain.text()
+            assert "benchmark" in win.banner_plain.text()
+            assert "NOT this model" in win.banner_plain.text()
+            assert win.stat_values["f1"].text() == "0.900"
+            assert win.stat_values["sens"].text() == "0.900"
+            # Result page: the same winner numbers
             win.render_result_page()
-            assert win.r_stats["f1"].text() == "0.550"
-            assert win.r_stats["auc"].text() == "0.600"
-            assert "NESTED HONEST" in win.r_model_note.text()
+            assert win.r_stats["f1"].text() == "0.900"
             # reports carry the honest values (fixed APP_DIR paths)
             win.save_result_report()
             txt = open(os.path.join(td, "result_report.txt"),
                        encoding="utf-8").read()
-            assert "0.550" in txt and "NESTED HONEST" in txt
+            assert "0.900" in txt and "winner" in txt
             assert "SELECTION ranking" in txt
             _info = QtWidgets.QMessageBox.information
             QtWidgets.QMessageBox.information = staticmethod(
@@ -3659,16 +3867,79 @@ def test_honest_numbers_are_the_displayed_numbers():
                 QtWidgets.QMessageBox.information = _info
             html = open(os.path.join(td, "result_report.html"),
                         encoding="utf-8").read()
-            assert "0.550" in html and "NESTED HONEST" in html
-            # pending-honest tag reappears when honest never ran
-            win._honest_result = None
-            win.render_result_page()
-            assert "PRELIMINARY" in win.r_model_note.text()
-            # saved-bundle fallback after a restore
-            win.bundle = {"model_name": "x", "nested_honest_f1": (0.61, 0.0)}
+            assert "0.900" in html and "WINNER" in html
+            # 3SSE chain winner: its own numbers + the CHAIN note
+            win.winner.macro = {"f1": (0.65, 0.0), "sens": (0.65, 0.0),
+                                "spec": (0.65, 0.0)}
+            win._is_chain_winner = lambda: True
             win._set_result_banner()
-            assert win.stat_values["f1"].text() == "0.610"
-            assert "SAVED model" in win.banner_plain.text()
+            assert "3SSE CHAIN" in win.banner_plain.text()
+            assert win.stat_values["f1"].text() == "0.650"
+            assert "benchmark" in win.banner_plain.text()   # note only
+            del win._is_chain_winner
+            # benchmark absent -> note says winner, no benchmark line
+            win._honest_result = None
+            win._set_result_banner()
+            assert "WINNER (cross-validated)" in win.banner_plain.text()
+            assert "benchmark" not in win.banner_plain.text()
+            # saved-bundle fallback only in a winner-less (restore)
+            # session; the note labels it a benchmark
+            win.winner = None
+            win.bundle = {"model_name": "x", "nested_honest_f1": (0.61, 0.0)}
+            _s, _p, f1v, note = win._honest_display_numbers()
+            assert f1v == 0.610 and "SAVED model" in note
+    finally:
+        gui.APP_DIR = _saved
+        win.close()
+
+
+def test_literature_comparison_report_section():
+    """2026-09-16: the txt/HTML reports gain a literature-protocol
+    comparison — the SAME winner scored spectrum-level (leaky,
+    INFLATED-labeled) next to the grouped number; degraded paths
+    (no data / unknown model) must skip the section, never raise."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import gui
+    app, win = _isolated_main_window()
+    _saved = gui.APP_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            gui.APP_DIR = td
+            # degraded path 1: no training data -> None, no crash
+            assert win._literature_comparison() is None
+            # degraded path 2: unknown model name, no pipeline
+            win._lc_data = (np.zeros((4, 3)), ["A", "B", "A", "B"],
+                            ["P1", "P1", "P2", "P2"])
+            w = modeling.ModelResult(name="No Such Model",
+                                     classes=["A", "B"])
+            win.winner = w
+            assert win._literature_comparison() is None
+            # real path: a fast plain model on separable synthetic data
+            rng = np.random.default_rng(7)
+            y = ["A", "B"] * 30
+            g = [f"P{i // 6}" for i in range(60)]
+            X = np.vstack([
+                rng.normal(0, 0.05, 60) + (1.0 if lab == "B" else 0.0)
+                for lab in y])
+            w2 = modeling.ModelResult(name="Random Forest",
+                                      classes=["A", "B"])
+            w2.macro = {"f1": (0.8, 0.0), "sens": (0.8, 0.0),
+                        "spec": (0.8, 0.0)}
+            w2.pipeline = modeling.clone(next(
+                s for s in modeling.model_specs()
+                if s["name"] == "Random Forest")["estimator"])
+            win.winner = w2
+            win._lc_data = (X, y, g)
+            win._lc_data_key = "synthetic"
+            res = win._literature_comparison()
+            assert res is not None and len(res) == 2
+            assert all(np.isfinite(v) and 0.0 <= v <= 1.0 for v in res)
+            assert res == win._literature_comparison()   # cached
+            win.save_result_report()
+            txt = open(os.path.join(td, "result_report.txt"),
+                       encoding="utf-8").read()
+            assert "Literature-protocol comparison" in txt
+            assert "INFLATED" in txt and "PATIENT-GROUPED" in txt
     finally:
         gui.APP_DIR = _saved
         win.close()
@@ -3912,7 +4183,7 @@ def test_trainworker_success_path():
                 assert len(win.spectra) == 30 and win.grid is not None
                 X = win.get_processed_X()
                 names = [n for n, cb in win.model_checks.items()
-                         if cb.isChecked() and n == "PCA + LDA"]
+                         if cb.isChecked() and n == "Random Forest"]
                 assert len(names) == 1
                 results, winner = modeling.evaluate_models(
                     X, list(win.labels), names, 3, 42,
@@ -3987,7 +4258,7 @@ for cls, gain in (("C1", 0.4), ("C8", 1.6)):
 win.load_folder(os.path.join(td, "flat"), quiet=True)
 win.chk_auto_diags.setChecked(False)
 for name, cb in win.model_checks.items():
-    cb.setChecked(name == "PCA + LDA")
+    cb.setChecked(name == "Random Forest")
 win.spin_folds.setValue(3)
 win.start_training()                       # the REAL QThread path
 

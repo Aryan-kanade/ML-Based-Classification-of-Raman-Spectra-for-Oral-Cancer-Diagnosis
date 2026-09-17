@@ -41,7 +41,9 @@ MODELS = [
     "PCA + SVM (RBF)", "Ensemble (top-3)",
 ]
 
-DEFAULTS = pp.PreprocessParams().validate()          # crop 500-2000 d0 vector
+DEFAULTS = pp.PreprocessParams(   # pre-2026-09-12 defaults (baseline)
+    crop_min=500.0, crop_max=2000.0, sg_deriv=0, norm="vector",
+).validate()
 WINNER = pp.PreprocessParams(                        # §52 paired winner
     crop_min=0.0, crop_max=0.0, sg_deriv=2, norm="none",
     sg_window=11, sg_poly=4, wavelet_name="db6", wavelet_level=2,

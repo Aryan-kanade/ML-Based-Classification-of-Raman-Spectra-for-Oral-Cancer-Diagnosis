@@ -1,0 +1,7 @@
+{
+  "seed": 42,
+  "n_ext": 2830,
+  "spectrum_f1_at_0.5": 0.4327500283157775,
+  "patient_f1": 0.5849519525659375,
+  "verdict": "ComBat-pooled standard-arm spectrum F1 0.433 \u00b7 patient F1 0.585 (std baseline ~0.62, program baseline 0.753)"
+}
