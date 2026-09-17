@@ -4040,3 +4040,57 @@ all-model runs launched 2026-09-17 evening (23 models / 11,155 archs,
 k=10 then k=5, study_run_3sse_k10 paused @ 149 archs, k5 running)
 were unaffected semantically (both already screened at true k).
 Gates: ruff clean, test_all 132/132, gui_test PASS.
+
+## 78. 2026-09-17 — WHOLE-UI HONESTY AUDIT: every "shows X, backend
+## does Y" gap fixed (user directive after §77)
+
+User: "check whole UI ... showing something and doing something I
+don't want this."  Two Explore agents audited every control and every
+displayed number.  Policy (user-confirmed): impossible promises → run
+at the largest supportable value + LOUD note; disclosed opt-in
+approximations (Turbo/Fast) stay with caption promises made true;
+everything else honors the shown value or is surfaced visibly — never
+log-only.
+
+BATCH 1 — headline numbers (commit 12ac8e7):
+- modeling.effective_folds() exposes the silent k clip; training log,
+  banner protocol text, Result bits and freeze manifest (folds +
+  folds_requested) show the ACTUAL fold count.  3SSE chain banner note
+  derives the protocol instead of hardcoded "5-fold".
+- Turbo caption promise made true: banner note + train status +
+  saved bundle/manifest carry "TURBO (approximate tuning)"; deep card
+  prints ACTUAL seed count + LOPO sampling flag stored with results.
+- 3SSE restore: real acc/auc (was hardcoded 0.000), restored-singles
+  note says NESTED-VALIDATED (was mislabeled screening), fair-pass
+  failure disclosed in dialog + per-row "*" fallback markers,
+  INCOMPLETE_RUN_NOTE.txt folders never restored, tree mismatch
+  surfaces on the seq_phase label (was hidden-dock-only).
+- Triage fallback: tooltips/notes say when tiers use the 0.5/threshold
+  fallback rule instead of validated two-tier op-points.
+- _effective_spike_exclusion(): ONE rule (checkbox AND not despike)
+  for training/Optimize/honest/Model Lab (Lab ignored the checkbox);
+  checkbox disables itself with an explanation while despiking runs.
+- Baseline chip: "skipped (deriv ≥1)" + graying when the pipeline
+  skips baseline (was an active-looking "als λ10^5").
+
+BATCH 2 — parameter honesty (commit 174a829):
+- validate(notes) reports every clamp → CHANGES & RESET panel shows
+  "Effective after clamping: …".  Optimize tooltip states the REAL
+  contract (15-config grid, 5-fold seed-42, non-swept params reset to
+  defaults, grouped only ≥5 patients).  Model Lab tooltip states its
+  fixed protocol.  arPLS = 5× shown iterations.  Repeat-×3 tooltip
+  limits its claim in 3SSE mode.  Conformal column explains why it is
+  unavailable without in-app training.  Dropped saved settings
+  (version gates) announced on the status bar.
+
+BATCH 3 — text truthing (commit 63bbf1a):
+- Leaderboard/"current best" labeled "(screening)"; search-space text
+  discloses the top-50-pair beam; Proven tooltip derives 16 (was
+  stale "18"); fast preset names all 4 skipped models; hero/how-to say
+  "selectable" 23 (was 25 incl. non-creatable biochem models);
+  summary_row "± –" for placeholder zero stds; METRIC_HELP aligned
+  with the banner's optimism note; HTML winner heading
+  "nested-validated"; Reload warns about discarded Class edits;
+  LikelihoodMeter documents fixed visual zones.
+All three batches: ruff clean, test_all 132/132 (one text pin updated
+to the honest count), gui_test PASS, deep_test 23/23.
