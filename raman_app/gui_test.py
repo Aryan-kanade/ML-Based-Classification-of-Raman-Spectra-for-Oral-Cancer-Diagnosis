@@ -222,6 +222,18 @@ def main() -> int:
     print("[5c] legacy protocol preset OK (mode/params/folds/models); "
           "weak-family warning + restore button present")
 
+    # --- [5c-bis] Reset-to-best button -------------------------------------
+    # §72: the 'Reset to best parameters' button (renamed from 'Reset
+    # to defaults') restores the §52 winner set even right after the
+    # legacy combo was applied
+    win.reset_params()
+    _pw = win.read_params().validate()
+    _pwin = __import__("preprocessing").PreprocessParams().validate()
+    assert _pw == _pwin, "reset must yield the winner (default) set"
+    assert _pw.crop_min == 0.0 and _pw.sg_deriv == 2 \
+        and _pw.norm == "none", _pw
+    print("[5c-bis] reset-to-best restores the §52 winner set")
+
     # --- [6] report writer -------------------------------------------------
     win.save_result_report()
     # APP_DIR was redirected to a temp dir at startup — the report lands

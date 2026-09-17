@@ -2884,9 +2884,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.params_diff_label.setObjectName("CardHint")
         self.params_diff_label.setWordWrap(True)
         rp.addWidget(self.params_diff_label)
-        self.b_params_reset = QtWidgets.QPushButton("↺ Reset to defaults")
-        self.b_params_reset.setToolTip("Restore every preprocessing "
-                                       "parameter to its default value.")
+        self.b_params_reset = QtWidgets.QPushButton(
+            "↺ Reset to best parameters")
+        self.b_params_reset.setToolTip(
+            "Restore the BEST measured preprocessing set (2026-09-12 "
+            "deep-search winner for PAIRED mode: no crop, derivative 2, "
+            "db6 L2, SG 11/4, no normalization) — the set behind the "
+            "proven 0.757 chain. This IS the factory default since "
+            "2026-09-15; 'Standard preset' is the different standard-"
+            "mode winner.")
         self.b_params_reset.clicked.connect(self.reset_params)
         rp.addWidget(self.b_params_reset)
         b_saliva = QtWidgets.QPushButton("🧪 Saliva preset")
@@ -3080,10 +3086,16 @@ class MainWindow(QtWidgets.QMainWindow):
                         "All parameters match the defaults.")
 
     def reset_params(self):
-        """Restore every preprocessing parameter to its default value."""
+        """Restore the BEST measured preprocessing set — the §52
+        deep-search winner for paired mode, which is the factory
+        default (user request 2026-09-17: the reset button must give
+        the best parameters)."""
         self._apply_params(asdict(PreprocessParams()))
         self._update_pipeline_strip()
-        self.log("Preprocessing parameters reset to defaults.")
+        self.log("Preprocessing parameters reset to the BEST measured "
+                 "set (§52 winner: paired, no-crop, deriv-2, db6 L2, "
+                 "SG 11/4, no norm) — the set behind the proven 0.757 "
+                 "chain.")
 
     # ---------------------------------------------------------- Train page
     def _build_train_page(self):

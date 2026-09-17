@@ -3888,3 +3888,16 @@ Beyond that: acquisition upgrades + ~2x cohort (§60 dossier).
   PASS, deep_test 23/23, ruff clean; e2e: champion d2 restored
   (0.757/0.800 pills), patient line live, weak-model warning,
   restore-proven button.
+
+## 73. 2026-09-17 — "Reset to defaults" → "Reset to best parameters"
+
+User request: the reset button must give the best parameter set.  The
+factory defaults HAVE been the §52 winner set since §54, so the
+change is explicitness: button relabeled "↺ Reset to best
+parameters", tooltip states it restores the deep-search winner for
+PAIRED mode (no crop / d2 / db6 L2 / SG 11/4 / no norm — the set
+behind the proven 0.757 chain) and distinguishes it from the
+'Standard preset' (the different standard-mode winner); log line says
+the same.  Pin: gui_test [5c-bis] — reset right after the legacy
+combo yields exactly PreprocessParams().validate().  Gates: ruff
+clean, gui_test PASS.
