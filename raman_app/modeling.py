@@ -1895,6 +1895,21 @@ def _run_cv_model(name: str, estimator, grid, X, ye, groups_arr,
     return res, best_tpl
 
 
+def effective_folds(k_folds: int, y, groups=None) -> int:
+    """The fold count evaluate_models will actually run: k is clipped to
+    the smallest class (max 10) and to the number of distinct subjects.
+    The GUI surfaces this instead of silently training at fewer folds
+    than the spinner shows (user honesty directive 2026-09-17)."""
+    counts = Counter(y)
+    if not counts:
+        return 2
+    min_class = min(counts.values())
+    k = int(np.clip(int(k_folds), 2, min(10, min_class)))
+    if groups is not None:
+        k = int(np.clip(k, 2, len(set(groups))))  # <= distinct subjects
+    return int(k)
+
+
 def evaluate_models(X: np.ndarray, y: list[str],
                     model_names: list[str] | None = None,
                     k_folds: int = 5, seed: int = RANDOM_STATE,

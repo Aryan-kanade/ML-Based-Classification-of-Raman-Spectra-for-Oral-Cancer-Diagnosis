@@ -23,6 +23,7 @@ import threading
 import time
 import traceback
 import json
+from collections import Counter
 from dataclasses import asdict
 from math import log10
 
@@ -397,8 +398,10 @@ class SeqSearchWorker(QtCore.QThread):
                 self.seed, groups=self.groups, repeats=self.repeats,
                 wavenumbers=self.wavenumbers)
         except Exception:
-            # bookkeeping must never fail the search (§26 lesson)
+            # bookkeeping must never fail the search (§26 lesson) — but
+            # the dialog must not silently claim these numbers are fair
             FILE_LOG.exception("fair singles evaluation failed")
+            self.fair_failed = True
             return singles
         by_name = {r.name: r for r in results if r.error is None}
         for row in rows:
@@ -507,7 +510,9 @@ class SeqSearchWorker(QtCore.QThread):
             self.done.emit({"board": board, "validated": validated,
                             "winner": winner, "k": k_eff,
                             "seed": self.seed, "groups": self.groups,
-                            "significance": sig})
+                            "significance": sig,
+                            "fair_failed": getattr(self, "fair_failed",
+                                                   False)})
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -1324,19 +1329,36 @@ class SeqResultsDialog(QtWidgets.QDialog):
                         "spectra")
         else:
             mode_txt = ""
-        # fast-screening / restored runs show screening numbers on the
-        # Single Models tab (no metrics_fair) — the note must say so
+        # the Single Models tab provenance must match its numbers:
+        # fair = re-scored with the Train-page protocol; restored =
+        # the run's own nested-VALIDATED singles (not screening);
+        # otherwise (fast screening) they really are screening estimates
         fair = any(isinstance(e.get("metrics_fair"), dict)
                    for e in board["singles"]) if board["singles"] else False
+        restored_singles = bool(payload.get("restored"))
+        fair_failed = bool(payload.get("fair_failed"))
         note = QtWidgets.QLabel(
-            ("Single Models tab: nested CV with tuned hyperparameters — "
+            ("Single Models tab: the FAIR RE-SCORE FAILED — these are "
+             "screening estimates at default hyperparameters, not the "
+             "Train-page-identical nested numbers."
+             if fair_failed else
+             "Single Models tab: nested CV with tuned hyperparameters — "
              "the SAME number a Train-page run of that model shows (same "
              "data mode, folds, seed, repeat setting)."
              if fair else
-             "Single Models tab: this run used FAST SCREENING or was "
-             "restored from disk — these are screening estimates, not "
-             "the Train-page-identical nested numbers (run a full "
-             "search for those).")
+             "Single Models tab: these are the restored run's own "
+             "NESTED-VALIDATED numbers (tuned hyperparameters), not "
+             "screening estimates."
+             if restored_singles else
+             "Single Models tab: this run used FAST SCREENING — these "
+             "are screening estimates, not the Train-page-identical "
+             "nested numbers (run a full search for those).")
+            + (" A '*' marks a model whose fair re-score failed — its "
+               "row shows the screening number instead."
+               if fair and any(
+                   isinstance(e.get("metrics"), dict)
+                   and not isinstance(e.get("metrics_fair"), dict)
+                   for e in board["singles"]) else "")
             + "\n2-Model / 3-Model tabs: quick "
             "screening estimates at default hyperparameters — compare "
             "them only to each other; the Overall Winner tab holds the "
@@ -1354,7 +1376,7 @@ class SeqResultsDialog(QtWidgets.QDialog):
         self._tabs = tabs
         self._tab_models: list[tuple[str, ArchTableModel]] = []
         for level, key, title in level_meta:
-            rows = self._rows(board[key], level)
+            rows = self._rows(board[key], level, fair=fair)
             model = ArchTableModel(rows)
             tabs.addTab(self._table(model), f"{title} ({len(rows)})")
             self._tab_models.append((title, model))
@@ -1517,26 +1539,33 @@ class SeqResultsDialog(QtWidgets.QDialog):
         return e.get("metrics") or {}
 
     @classmethod
-    def _rows(cls, entries, level):
+    def _rows(self, entries, level, fair=False):
         # 2026-09-06: error-tolerant screening records failed archs as
         # {"arch", "level", "error"} WITHOUT metrics — sorting those by
         # f1 crashed the dialog with KeyError('f1') on saved runs
         scored = sorted(
             (e for e in entries
              if isinstance(e.get("metrics"), dict)
-             and isinstance(cls._disp_metrics(e, level).get("f1"),
+             and isinstance(self._disp_metrics(e, level).get("f1"),
                             (int, float))),
-            key=lambda e: (-(cls._disp_metrics(e, level).get("f1", -1.0)),
-                           -(cls._disp_metrics(e, level).get("sens", -1.0)),
-                           -(cls._disp_metrics(e, level).get("spec", -1.0))))
+            key=lambda e: (-(self._disp_metrics(e, level).get("f1", -1.0)),
+                           -(self._disp_metrics(e, level).get("sens", -1.0)),
+                           -(self._disp_metrics(e, level).get("spec", -1.0))))
         label = {1: "Single", 2: "2-Model", 3: "3-Model"}[level]
         nan = float("nan")
 
         def _m(e, k):
-            v = cls._disp_metrics(e, level).get(k, nan)
+            v = self._disp_metrics(e, level).get(k, nan)
             return v if isinstance(v, (int, float)) else nan
+
+        # rows that fell back to screening while the tab is otherwise
+        # fair get a "*" so the mixed provenance is visible per row
+        def _tag(e):
+            return ("*" if level == 1 and fair
+                    and not isinstance(e.get("metrics_fair"), dict)
+                    else "")
         return [[i + 1, label, " → ".join(e["arch"]),
-                 f"{_m(e, 'f1'):.3f}", f"{_m(e, 'sens'):.3f}",
+                 f"{_m(e, 'f1'):.3f}{_tag(e)}", f"{_m(e, 'sens'):.3f}",
                  f"{_m(e, 'spec'):.3f}", f"{_m(e, 'auc'):.3f}",
                  f"{_m(e, 'acc'):.3f}"]
                 for i, e in enumerate(scored)]
@@ -2030,6 +2059,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if os.path.isfile(os.path.join(os.path.dirname(wpath),
                                            "NOT_ADOPTED.txt")):
                 continue
+            # an interrupted/incomplete run is never a restoration
+            # candidate, however high its partial F1 reads
+            if os.path.isfile(os.path.join(
+                    os.path.dirname(wpath), "INCOMPLETE_RUN_NOTE.txt")):
+                continue
             try:
                 with open(wpath, encoding="utf-8") as fh:
                     m = (_json.load(fh).get("metrics") or {})
@@ -2114,6 +2148,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     for k, v in
                     modeling.class_metrics_from_cm(winner.cm).items()}
             oof = m.get("oof_proba")
+            mismatch_note = ""
             if oof:
                 winner.oof_proba = np.asarray(oof, dtype=float)
                 winner.y_true_encoded = np.asarray(
@@ -2128,12 +2163,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     n_sess = (len(self.groups)
                               if self.groups is not None else 0)
-                    self.log(
-                        "3SSE restore: winner OOF has "
+                    mismatch_note = (
+                        " — winner OOF has "
                         f"{len(winner.oof_proba)} rows but the session "
-                        f"dataset has {n_sess} — patient-level line "
-                        "hidden (the run was measured on a different "
-                        "data tree; retrain to regenerate it)")
+                        f"dataset has {n_sess}: the run was measured on "
+                        "a DIFFERENT data tree; patient-level line "
+                        "hidden (retrain to regenerate it)")
+                    self.log("3SSE restore:" + mismatch_note)
             winner.threshold = data.get("threshold")
             # the 2026-09-13 d2 artifact persisted threshold=null (its
             # threshold pass never ran) — derive the F1-optimal
@@ -2219,6 +2255,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     pass
             # comparison table: the run's validated single models
             results = []
+            results_raw: list = []          # (ModelResult, metrics dict)
             vpath = os.path.join(folder, "validated.json")
             if os.path.isfile(vpath):
                 try:
@@ -2235,6 +2272,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                    "f1": (mm.get("f1", 0.0), 0.0),
                                    "prec": (mm.get("prec", 0.0), 0.0)}
                         results.append(r)
+                        results_raw.append((r, mm))
                 except Exception:
                     pass
             if not results:
@@ -2257,9 +2295,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._seq_payload = {"board": {"singles": [
                 {"arch": (r.name,), "level": 1, "metrics": {
                     "f1": r.macro["f1"][0], "sens": r.macro["sens"][0],
-                    "spec": r.macro["spec"][0], "acc": 0.0}}
-                for r in results if r is not winner],
+                    "spec": r.macro["spec"][0],
+                    **({"acc": mm["acc"]} if "acc" in mm else {}),
+                    **({"auc": mm["auc"]} if "auc" in mm else {})}}
+                for r, mm in results_raw if r is not winner],
                 "pairs": [], "triples": [], "total": 0, "pruned": 0},
+                "restored": True,
                 "validated": {},
                 "winner": {"arch": data["arch"],
                            "metrics": {k: m[k] for k in
@@ -2267,8 +2308,10 @@ class MainWindow(QtWidgets.QMainWindow):
                                         "acc") if k in m}},
                 "significance": sig}
             self.seq_phase.setText(
-                f"Best 3SSE winner restored: {' → '.join(data['arch'])} "
-                f"(nested F1 {m['f1']:.3f}).")
+                f"Best 3SSE winner restored: "
+                f"{' → '.join(data['arch'])} "
+                f"(nested F1 {m['f1']:.3f})."
+                + mismatch_note)
             self.log("Restored best 3SSE winner "
                      f"({' → '.join(data['arch'])}, F1 {m['f1']:.3f}) "
                      "into the Train page")
@@ -3044,8 +3087,16 @@ class MainWindow(QtWidgets.QMainWindow):
             "smooth": (f"④ Smooth SG {self.spin_sg_window.value()}/"
                        f"{self.spin_sg_poly.value()}·d"
                        f"{self.combo_deriv.currentIndex()}", False),
-            "baseline": (f"⑤ Baseline {self.combo_baseline.currentText()} "
-                         f"λ10^{self.spin_lambda_exp.value()}", False),
+            # honesty (2026-09-17): the pipeline SKIPS baseline
+            # correction when sg_deriv != 0 (the derivative already
+            # removes smooth baselines) — the chip said "als λ10^5"
+            # while the backend did nothing
+            "baseline": ("⑤ Baseline " + (
+                f"{self.combo_baseline.currentText()} "
+                f"λ10^{self.spin_lambda_exp.value()}"
+                if self.combo_deriv.currentIndex() == 0
+                else "skipped (deriv ≥1)"),
+                self.combo_deriv.currentIndex() != 0),
             "normalize": ("⑥ Normalize " + self.combo_norm.currentText(),
                           self.combo_norm.currentText() == "none"),
         }
@@ -3055,6 +3106,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 chip.setText(text)
                 chip.setProperty("tone", "off" if is_off else "")
                 uh.repolish(chip)
+        # Train-page coupling (2026-09-17 honesty): with despiking ON the
+        # exclusion checkbox is INERT (the shared helper ignores it) —
+        # disable it and say why instead of silently ignoring the tick
+        chk = getattr(self, "chk_exclude_flagged", None)
+        if chk is not None and self.spike_flags is not None:
+            despiking = self.chk_despike.isChecked()
+            chk.setEnabled(not despiking)
+            chk.setToolTip(
+                "Despiking is ON — it repairs spiked spectra, so "
+                "excluding them is inactive."
+                if despiking else
+                "Spectra with cosmic-ray spikes (see Quality column on "
+                "the Data page) are left out of training, preprocessing "
+                "optimization, the honest benchmark and Model Lab. "
+                "Usually helps.")
         self._update_modified_markers()
 
     def _update_modified_markers(self):
@@ -4112,8 +4178,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "patient's spectra")
         self.r_pat_table.horizontalHeaderItem(5).setToolTip(
             "clinical tier from the mean P(positive) against the "
-            "rule-out / rule-in thresholds: NEGATIVE / INDETERMINATE / "
-            "POSITIVE")
+            "rule-out / rule-in thresholds when validated ones exist "
+            "(else the single-threshold fallback): NEGATIVE / "
+            "INDETERMINATE / POSITIVE")
         self.r_pat_table.horizontalHeader().setSectionResizeMode(
             0, HEADER_STRETCH)
         self.r_pat_table.horizontalHeader().setSectionResizeMode(
@@ -4269,7 +4336,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "n_patients": len(set(self.groups)) if self.groups else 0,
             "paired_mode": self._paired_mode,
             "seed": self.spin_seed.value(),
-            "folds": self.spin_folds.value(),
+            "turbo": self._turbo(),
+            # the fold count the run ACTUALLY used (evaluate_models clips
+            # k to the smallest class / patient count)
+            "folds": (getattr(self, "_k_effective", None)
+                      or self.spin_folds.value()),
+            **({"folds_requested": self.spin_folds.value()}
+               if getattr(self, "_k_effective", None)
+               and self._k_effective != self.spin_folds.value() else {}),
             # TRAINING-time params (a post-training GUI tweak used to be
             # recorded as if the winner had used it)
             "preprocessing": asdict(
@@ -4434,7 +4508,15 @@ class MainWindow(QtWidgets.QMainWindow):
                                    lo, hi, fallback=threshold)
             it2 = QtWidgets.QTableWidgetItem(tier or "—")
             it2.setTextAlignment(ALIGN_CENTER)
-            it2.setToolTip(clin.TRIAGE_ACTIONS.get(tier, ""))
+            tip2 = clin.TRIAGE_ACTIONS.get(tier, "")
+            if tier and not (lo is not None and hi is not None):
+                # provenance honesty: this tier came from the fallback
+                # rule, not from validated rule-out/rule-in thresholds
+                tip2 += (f" [fallback rule: p ≥ {threshold:.2f}"
+                         if threshold is not None
+                         else " [fallback rule: p ≥ 0.50")
+                tip2 += " — no tuned two-tier thresholds available]"
+            it2.setToolTip(tip2)
             if tier in tri:
                 it2.setForeground(qc.QtGui.QColor(tri[tier]))
                 f2 = it2.font()
@@ -4827,10 +4909,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return (f"{meta['k']}-fold "
                     + ("patient-grouped CV" if grouped
                        else "CV (spectrum-level)"))
-        return (f"{self.spin_folds.value()}-fold "
-                + ("patient-grouped CV"
+        # live train: show the fold count the data actually supported
+        # (evaluate_models clips k to the smallest class / patient count)
+        k_eff = getattr(self, "_k_effective", None)
+        k_txt = f"{k_eff}-fold" if k_eff \
+            else f"{self.spin_folds.value()}-fold"
+        return (k_txt + getattr(self, "_k_note", "")
+                + (" patient-grouped CV"
                    if getattr(w, "groups", None) or self.groups
-                   else "CV (spectrum-level)"))
+                   else " CV (spectrum-level)"))
 
     def _op_points_full(self) -> tuple:
         """
@@ -5105,7 +5192,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if getattr(w, "train_meta", None):
                 bits.append(self._protocol_text(w))
             else:
-                bits.append(f"{self.spin_folds.value()}-fold CV")
+                k_eff = getattr(self, "_k_effective", None)
+                bits.append(
+                    f"{k_eff or self.spin_folds.value()}-fold CV"
+                    + getattr(self, "_k_note", ""))
                 if self.chk_repeat.isChecked():
                     bits.append("repeated ×3")
                 if self.groups:
@@ -5123,6 +5213,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if lo is not None and hi is not None:
                 bits.append(f"rule-out p≤{lo:.2f} (sens ≥90%) · "
                             f"rule-in p≥{hi:.2f} (spec ≥90%)")
+            elif len(w.classes) == 2 and w.threshold is None:
+                bits.append("no tuned thresholds — triage tiers use the "
+                            "plain 0.5 rule")
             _ds = self._decided_summary()
             if _ds and _ds["conf"] is not None:
                 _c = _ds["conf"]
@@ -5304,12 +5397,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"LOPO: macro-F1 {lo_['f1']:.3f} over "
                 f"{lo_['n_patients']} unseen patients"
                 + (f", AUC {lo_['auc']:.3f}"
-                   if np.isfinite(lo_["auc"]) else ""))
+                   if np.isfinite(lo_["auc"]) else "")
+                + (" · TURBO (estimate over every 2nd patient)"
+                   if lo_.get("turbo_sampled") else ""))
         if self._seed_result:
             f1s_ = self._seed_result
             bits.append(f"Seed stability: {np.mean(f1s_):.3f} ± "
                         f"{np.std(f1s_):.3f} "
-                        f"({len(SEED_STABILITY_SEEDS)} seeds)")
+                        f"({len(f1s_)} seeds)")
         if self._noise_result:
             nr_ = self._noise_result
             bits.append(f"Noise: F1 {nr_[0][1]:.3f} → {nr_[-1][1]:.3f} "
@@ -5502,10 +5597,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.r_pat_table.setItem(r, c, it)
         if pats:
             n_pos = sum(1 for p in pats if pos and p[4] == pos)
+            _lo, _hi, _s, _sp = self._op_points_full()
+            _rule = ("validated rule-out/rule-in thresholds"
+                     if (_lo is not None and _hi is not None)
+                     else "the fallback threshold rule (no tuned "
+                          "thresholds available)")
             self.r_pat_hint.setText(
                 f"{plural(len(pats), 'patient')} — {n_pos} called "
                 f"{pos if pos else 'positive'} (verdict = mean "
-                "P(positive) at the tuned threshold; vote counts shown "
+                f"P(positive) at {_rule}; vote counts shown "
                 "for reference)")
         else:
             self.r_pat_hint.setText(
@@ -5833,7 +5933,7 @@ class MainWindow(QtWidgets.QMainWindow):
                   f"{np.mean(lo_['accs']):.3f}")
         if self._seed_result:
             deep.append(
-                f"Seed stability ({len(SEED_STABILITY_SEEDS)} seeds): "
+                f"Seed stability ({len(self._seed_result)} seeds): "
                 f"macro-F1 {np.mean(self._seed_result):.3f} ± "
                 f"{np.std(self._seed_result):.3f}")
         if self._noise_result:
@@ -7284,8 +7384,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "No data yet", "Load data first (Start page).")
             return
         exclude = None
-        if (self.spike_flags is not None
-                and self.chk_exclude_flagged.isChecked()):
+        if self._effective_spike_exclusion():
             exclude = self.spike_flags
         self._opt_btn = self.sender()          # None when called w/o a button
         if self._opt_btn is not None:
@@ -7459,8 +7558,7 @@ class MainWindow(QtWidgets.QMainWindow):
         groups_l = list(self.groups)
         grid_full = np.asarray(self.grid)
         keep = [i for i, lab in enumerate(labels) if lab.strip()]
-        if not self.read_params().validate().despike \
-                and self.spike_flags is not None:
+        if self._effective_spike_exclusion():
             keep = [i for i in keep if not self.spike_flags[i]]
         Xk = X_raw[keep]
         yk = [labels[i] for i in keep]
@@ -7779,6 +7877,16 @@ class MainWindow(QtWidgets.QMainWindow):
         w = self._analysis_worker
         if w is not None:
             w.progress.emit(str(msg))
+
+    def _effective_spike_exclusion(self) -> bool:
+        """The ONE spike-exclusion rule (2026-09-17 honesty audit): the
+        checkbox AND despiking off — despiking repairs spiked spectra,
+        so excluding them too would double-punish.  Training, Optimize,
+        the honest benchmark and Model Lab all read this helper, so
+        they can never silently run on different datasets again."""
+        return (self.spike_flags is not None
+                and self.chk_exclude_flagged.isChecked()
+                and not self.read_params().despike)
 
     def _turbo(self) -> bool:
         """⚡Turbo results toggle (2026-09-12 speed program): lighter
@@ -8124,8 +8232,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Another analysis is still running — wait for it.")
             return
         exclude = (self.spike_flags
-                   if (self.spike_flags is not None
-                       and self.chk_exclude_flagged.isChecked()) else None)
+                   if self._effective_spike_exclusion() else None)
         # only a real button counts — sender() inside the auto-chain is
         # the emitting worker object, not None (would crash on setEnabled)
         btn = self.sender()
@@ -8391,6 +8498,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def done(out):
             self._lopo_result = out
+            if self._turbo():
+                # provenance travels with the result: the Result-page
+                # deep card prints the caveat from THIS flag, not a
+                # hardcoded assumption
+                out["turbo_sampled"] = True
             worst = sorted(out["per_patient"], key=lambda r: r[2])[:3]
             turbo_note = (" · TURBO (estimate over every 2nd patient)"
                           if self._turbo() else "")
@@ -8588,10 +8700,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{unlabeled} spectra have no class label (see Data "
                 "page). They will be EXCLUDED from training.")
         keep = [i for i, l in enumerate(self.labels) if l.strip()]
-        params_now0 = self.read_params().validate()
-        if (self.spike_flags is not None
-                and self.chk_exclude_flagged.isChecked()
-                and not params_now0.despike):
+        if self._effective_spike_exclusion():
             # despiking RECOVERS spiked spectra; exclusion only applies
             # when the user turned despiking off
             n_flagged = sum(1 for i in keep if self.spike_flags[i])
@@ -8641,9 +8750,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.X_raw, self.labels, self.groups, self.grid,
                     self._params_at_train,
                     exclude=(self.spike_flags
-                             if (self.spike_flags is not None
-                                 and self.chk_exclude_flagged.isChecked()
-                                 and not self.read_params().despike)
+                             if self._effective_spike_exclusion()
                              else None),
                     use_pqn=(data == "paired-pqn"))
                 X, yy, gg = pd_.X, pd_.y, pd_.groups
@@ -8700,8 +8807,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self._train_row_map = (None if (paired_mode or averaged)
                                else list(keep))
         repeats = 3 if self.chk_repeat.isChecked() else 1
+        # honesty (2026-09-17): show the fold count the data can actually
+        # support — evaluate_models clips k to the smallest class and the
+        # patient count; the banner/manifest must never claim more
+        k_req = self.spin_folds.value()
+        self._k_effective = modeling.effective_folds(k_req, yy, gg)
+        if self._k_effective != k_req:
+            if gg and len(set(gg)) < k_req:
+                why = f"only {len(set(gg))} patients"
+            else:
+                why = ("smallest class has "
+                       f"{min(Counter(yy).values())} spectra")
+            self.log(f"WARNING: {k_req}-fold requested but the data "
+                     f"supports only {self._k_effective}-fold ({why}) — "
+                     "training runs at "
+                     f"{self._k_effective} folds.")
+        else:
+            why = ""
+        self._k_note = (f" (reduced from {k_req}: {why})" if why else "")
         self.log(f"Training {len(names)} models, "
-                 f"{self.spin_folds.value()}-fold CV"
+                 f"{self._k_effective}-fold CV"
                  + (f" x{repeats}" if repeats > 1 else "")
                  + f", n={X.shape[0]}, "
                  f"features={X.shape[1]}, classes={sorted(set(yy))}"
@@ -8825,11 +8950,11 @@ class MainWindow(QtWidgets.QMainWindow):
                      "this model's performance.")
         if w is not None:
             if self._is_chain_winner():
-                note = ("3SSE CHAIN — nested validated, patient-grouped "
-                        "5-fold. The architecture was searched on this "
-                        "data, so the number is slightly optimistic; the "
-                        "locked test-set evaluation is the one-shot "
-                        "confirmation.")
+                note = (f"3SSE CHAIN — nested validated, "
+                        f"{self._protocol_text(w)}. The architecture was "
+                        "searched on this data, so the number is "
+                        "slightly optimistic; the locked test-set "
+                        "evaluation is the one-shot confirmation.")
             else:
                 note = ("WINNER (cross-validated) — best of the models "
                         "you selected, scored on held-out patients. "
@@ -8837,6 +8962,10 @@ class MainWindow(QtWidgets.QMainWindow):
                         "number is slightly optimistic; the locked "
                         "test-set evaluation is the one-shot "
                         "confirmation.")
+            if self._turbo():
+                # the tooltip promises every turbo result is captioned —
+                # the headline number is the one that must never lie
+                note += " · TURBO (approximate tuning)"
             return (w.macro["sens"][0], w.macro["spec"][0], w.macro_f1(),
                     note + bench)
         saved = (self.bundle or {}).get("nested_honest_f1")
@@ -9038,7 +9167,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_result_banner()
         self.train_status.setText(
             f"Done — best: {winner.name} (validated macro-F1 "
-            f"{f1:.3f}). The banner shows these numbers; the "
+            f"{f1:.3f})"
+            + (" · TURBO (approximate tuning)" if self._turbo() else "")
+            + (self._k_note if getattr(self, "_k_note", "") else "")
+            + ". The banner shows these numbers; the "
             "single-model benchmark adds context when it lands.")
         self.log(f"Training complete. Winner: {winner.name} "
                  f"(macro sens {sens:.3f} / spec {spec:.3f} / F1 {f1:.3f})"
@@ -9887,6 +10019,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                  dataset_name=self.folder_edit.text(),
                                  paired=self._paired_mode,
                                  pqn=self._pqn_mode,
+                                 turbo=self._turbo(),
                                  region_bands=self._region_bands,
                                  op_points=op_extra,
                                  calibrator=calibrator,
