@@ -3185,11 +3185,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.read_params().validate(clamp_notes)
             except Exception:
                 clamp_notes = []
+            # data-dependent runtime behavior — same honesty rule: if
+            # the backend would deviate from the shown value ON THIS
+            # GRID, say so before any training happens
+            try:
+                grid = getattr(self, "grid", None)
+                if grid is not None:
+                    import warnings as _warnings
+                    pr = self.read_params().validate()
+                    with _warnings.catch_warnings():
+                        _warnings.simplefilter("ignore")
+                        m = preprocessing.crop_mask(
+                            np.asarray(grid, dtype=float), pr)
+                    if (pr.crop_min or pr.crop_max) and bool(m.all()):
+                        clamp_notes.append(
+                            "region keeps no data on this grid — no "
+                            "crop applied")
+                    if pr.wavelet and preprocessing.HAS_PYWT:
+                        import pywt
+                        cap = pywt.dwt_max_level(
+                            int(m.sum()),
+                            pywt.Wavelet(pr.wavelet_name).dec_len)
+                        if pr.wavelet_level > cap:
+                            clamp_notes.append(
+                                f"wavelet level {pr.wavelet_level} → "
+                                f"{cap} on this grid")
+            except Exception:
+                pass
             base_txt = ("Modified vs defaults: " + ", ".join(changed)
                         if changed else
                         "All parameters match the defaults.")
             lbl.setText(base_txt
-                        + ("  ·  Effective after clamping: "
+                        + ("  ·  Effective on this data: "
                            + "; ".join(clamp_notes)
                            if clamp_notes else ""))
 
