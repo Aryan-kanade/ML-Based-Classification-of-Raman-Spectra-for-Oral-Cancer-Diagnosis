@@ -42,3 +42,6 @@ raman_app/model_*_card.md
 
 # captured warning sweep output (2026-09-12 audit)
 raman_app/warnings_capture.log
+
+# user archived copy of an older project state (kept on disk, not in repo)
+pro_fixed/
