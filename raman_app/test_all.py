@@ -1164,10 +1164,11 @@ def test_then_now_record_matches_presept9():
     import json
     import gui as _gui
     rec = _gui.THEN_NOW_RECORD
-    assert len(rec) == 3
+    assert len(rec) == 4
     old_label, old_f1, old_auc, old_note = rec[0]
     hist_label, hist_f1, hist_auc, hist_note = rec[1]
     honest_label, honest_f1, honest_auc, honest_note = rec[2]
+    now_label, now_f1, now_auc, now_note = rec[3]
     assert "pre-2026-09-09" in old_label and old_f1 == 0.702 \
         and old_auc == 0.788
     assert "OWN record" in hist_label and hist_f1 == 0.829 \
@@ -1175,6 +1176,7 @@ def test_then_now_record_matches_presept9():
     assert "honest" in honest_label and honest_f1 == 0.639 \
         and honest_auc == 0.682
     assert "0.572" in honest_note  # the old 3SSE chain's honest F1
+    assert "TODAY" in now_label and now_f1 == 0.696 and now_auc == 0.763
     p9 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                       "experiments", "presept9.json")
     if os.path.isfile(p9):

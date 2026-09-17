@@ -3740,3 +3740,33 @@ state, untouched.
   labeled numbers; validation count 132/132.
 - Gates: 132/132, gui PASS (+[5c] warning/button pins), deep 23/23,
   ruff clean, e2e verified.
+
+## 67. 2026-09-17 — the honest number on TODAY's tree: 0.696 (the
+## provenance break, quantified)
+
+eval_winner_now.py (new): the EXACT d2 winner chain (PLS + XGBoost ->
+RF -> ET), same §52 paired params, same honest nested validate_arch,
+on the CURRENT Data tree — 237 rows / 55 patients (262 loaded minus
+18 spike-flagged; 18 cross-class duplicates + 4 references already
+excluded by the loader), seeds 42/43/44:
+
+  pooled F1 0.685 / 0.703 / 0.701  →  MEAN 0.696 ± 0.008
+  AUC ~0.756-0.770 · sens ~0.90 · spec ~0.48-0.50
+  vs the 2026-09-13 record 0.757/0.791 on 287 rows/64 patients
+  → **-0.060** (experiments/winner_chain_now.json)
+
+Interpretation: the tree change cost ~0.06 F1, carried almost
+entirely by SPECIFICITY (0.61 -> ~0.49 on today's tree) — the
+18 cross-class duplicates (pure leakage) were propping the old
+number up, exactly as the leakage model predicts.  0.757 is now
+formally a HISTORICAL record; today's honest number for the best
+chain on today's cleaned data is ~0.70 (spectrum level, paired).
+Shown on the Result page as the 4th then-vs-now row; dashboard row
+appended.  Consequences: (a) any NEW search on today's tree should
+be judged against ~0.70, not 0.757; (b) the restored d2 artifact's
+banner numbers carry the tree-mismatch log; (c) the fastest honest
+lever remains data acquisition + the 2 flagged labels (review sheet:
+experiments/label_review_checklist.md — its row-map is stale for the
+new tree, re-run eval_label_errors.py AFTER a fresh winner OOF).
+Also this hour: label review sheet written; screen-band test pin;
+README policy/workflow updates.

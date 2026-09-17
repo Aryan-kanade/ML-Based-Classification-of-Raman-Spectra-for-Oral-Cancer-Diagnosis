@@ -134,6 +134,9 @@ THEN_NOW_RECORD = (
      "307 paired-PQN rows incl. since-removed cross-class duplicates"),
     ("Same old config, honest protocol (2026-09-16)", 0.639, 0.682,
      "old 3SSE chain: 0.725 reported → 0.572 honest"),
+    ("Proven chain on TODAY's tree (3 seeds, 2026-09-17)", 0.696, 0.763,
+     "237 rows — duplicates + spiked spectra removed; "
+     "experiments/winner_chain_now.json"),
 )
 THEN_NOW_TAKEAWAY = (
     "The 0.829 row is the old protocol's real recorded number: selection "
@@ -3944,7 +3947,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.r_tnow_table.verticalHeader().setVisible(False)
         self.r_tnow_table.setEditTriggers(EDIT_NO)
         self.r_tnow_table.setAlternatingRowColors(True)
-        self.r_tnow_table.setMaximumHeight(140)
+        self.r_tnow_table.setMaximumHeight(170)
         self.r_tnow_table.setToolTip(
             "Old record: paired Extra Trees, 2026-08-30 study. Honest "
             "re-measurement: experiments/presept9.json (2026-09-16). "
