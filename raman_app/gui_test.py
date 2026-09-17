@@ -186,6 +186,27 @@ def main() -> int:
     print(f"[5b] then-vs-now card + selective-prediction lines OK "
           f"({len(dlines)} binary lines)")
 
+    # --- [5c] legacy 2026-09-08 protocol preset ---------------------------
+    # §64: one click reproduces the protocol that DISPLAYED 0.83
+    win._apply_legacy_preset()
+    assert win.data_mode() == "paired-pqn", win.data_mode()
+    assert win.trainer_kind() == "seq"
+    assert win.spin_folds.value() == 5 and win.chk_repeat.isChecked()
+    assert all(cb.isChecked() for cb in win.model_checks.values())
+    _p = win.read_params().validate()
+    assert _p.crop_min == 500.0 and _p.crop_max == 2000.0
+    assert _p.sg_deriv == 0 and _p.norm == "vector"
+    assert _p.wavelet_name == "sym8" and _p.wavelet_level == 4
+    # the legacy combo must NOT collide with the purged 2026-09-01
+    # bad-session signature (crop_max 1800 there vs 2000 here)
+    from dataclasses import asdict as _asdict
+    assert gui._sanitize_params(
+        _asdict(win.read_params())) == _asdict(win.read_params())
+    # the historical card reads APP_DIR/legacy_run_2026-09-08 — absent
+    # in the redirected test APP_DIR, so the card must hide cleanly
+    assert win.r_hist_card.isHidden()
+    print("[5c] legacy protocol preset OK (mode/params/folds/models)")
+
     # --- [6] report writer -------------------------------------------------
     win.save_result_report()
     # APP_DIR was redirected to a temp dir at startup — the report lands

@@ -1158,15 +1158,20 @@ def test_decided_case_selective_prediction():
 
 def test_then_now_record_matches_presept9():
     """The on-screen 'Then vs now' record must equal the measured
-    honest re-run (experiments/presept9.json), not drift as text."""
+    honest re-run (experiments/presept9.json), not drift as text.
+    §64: a third row carries the old protocol's OWN 2026-09-08
+    record (selection CV), matching the imported artifact."""
     import json
     import gui as _gui
     rec = _gui.THEN_NOW_RECORD
-    assert len(rec) == 2
+    assert len(rec) == 3
     old_label, old_f1, old_auc, old_note = rec[0]
-    honest_label, honest_f1, honest_auc, honest_note = rec[1]
+    hist_label, hist_f1, hist_auc, hist_note = rec[1]
+    honest_label, honest_f1, honest_auc, honest_note = rec[2]
     assert "pre-2026-09-09" in old_label and old_f1 == 0.702 \
         and old_auc == 0.788
+    assert "OWN record" in hist_label and hist_f1 == 0.829 \
+        and hist_auc == 0.888
     assert "honest" in honest_label and honest_f1 == 0.639 \
         and honest_auc == 0.682
     assert "0.572" in honest_note  # the old 3SSE chain's honest F1
@@ -1180,6 +1185,26 @@ def test_then_now_record_matches_presept9():
         assert round(data["old_record"]["paired_et_auc"], 3) == old_auc
         assert round(data["paired_extra_trees"]["f1"], 3) == honest_f1
         assert round(data["paired_extra_trees"]["auc"], 3) == honest_auc
+
+
+def test_legacy_record_artifact():
+    """The imported 2026-09-08 record (selection-CV protocol) must
+    match the THEN_NOW historical row; numbers only — the leakage-era
+    model file is deliberately absent (§64)."""
+    import gui as _gui
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     _gui.LEGACY_RECORD_DIR)
+    assert os.path.isfile(os.path.join(d, "winner.json"))
+    assert os.path.isfile(os.path.join(d, "PROVENANCE.txt"))
+    assert not os.path.isfile(os.path.join(d, "winner.joblib")), \
+        "the leakage-era fitted model must NOT be imported"
+    rec = _gui.load_legacy_record()
+    assert rec is not None and rec["arch"] == ["Random Forest",
+                                               "Extra Trees"]
+    _label, hist_f1, hist_auc, _note = _gui.THEN_NOW_RECORD[1]
+    assert round(rec["f1"], 3) == hist_f1
+    assert round(rec["auc"], 3) == hist_auc
+    assert rec["n_oof"] == 307
 
 
 def test_calibration_and_dca():

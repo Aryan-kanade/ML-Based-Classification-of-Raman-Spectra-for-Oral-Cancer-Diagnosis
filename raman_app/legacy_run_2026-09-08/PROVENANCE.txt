@@ -1,0 +1,41 @@
+HISTORICAL RECORD — 2026-09-08 (imported 2026-09-17 from the user's
+archived copy "BARC (6)")
+====================================================================
+
+WHAT THIS IS
+  The result the app displayed on 2026-09-08 before the honest-number
+  change: result_report.txt is the 12:09 report (3SSE Spectral + band
+  features -> TabPFN, macro-F1 0.830); winner.json is the same day's
+  later 3SSE run (Random Forest -> Extra Trees, F1 0.8289, AUC 0.888,
+  307 out-of-fold rows, threshold 0.481).
+
+HOW IT WAS MEASURED (why it reads 0.8+)
+  * SELECTION-CV protocol: the architecture was picked AND scored on
+    the same data - there was no outer holdout, so the number carries
+    selection optimism (the winner is the best draw, not an unbiased
+    estimate).
+  * Paired+PQN mode on the PRE-dedup data tree: 317 loaded spectra /
+    72 patients -> 307 deviation spectra / 68 patients.  That tree
+    still contained 18 cross-class duplicate spectra (identical files
+    in both classes) that the current loader correctly excludes as
+    pure leakage - duplicates make memorization easy and inflate CV.
+  * Preprocessing fixed outside the folds (crop 500-2000, sym8 L4,
+    SG 11/3 deriv 0, vector norm, ALS, user-tuned despike/detrend/
+    wn_calibrate), 5-fold patient-grouped x3 repeats, seed 42.
+  * Spectrum-LEVEL number: the same run's patient-level F1 was 0.519
+    (winner.json pat_f1) - at the patient level the old protocol did
+    NOT read 0.8.
+
+HONEST RE-MEASUREMENT (2026-09-16, experiments/presept9.json)
+  The old PAIRED (no-PQN) configuration re-measured under today's
+  protocol: paired Extra Trees 0.639 / AUC 0.682 - far below the
+  0.702/0.788 it reported then.  Today's proven winner (3SSE-d2,
+  PLS + XGBoost -> RF -> Extra Trees) measures 0.757 / 0.791 honestly.
+
+DELIBERATELY NOT IMPORTED
+  winner.joblib (the fitted leakage-era chain) - a model whose
+  training data contained cross-class duplicates must never be
+  deployed for prediction.  Numbers only.
+
+Current app policy: the honest nested/validated number stays the
+headline; this record is displayed as history, clearly labeled.

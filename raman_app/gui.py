@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import traceback
+import json
 from dataclasses import asdict
 from math import log10
 
@@ -129,14 +130,45 @@ PROVEN_EXCLUDE = frozenset({
 THEN_NOW_RECORD = (
     ("Old record AS REPORTED (pre-2026-09-09)", 0.702, 0.788,
      "rule-out sens 0.91 / rule-in spec 0.91"),
+    ("Old protocol's OWN record (2026-09-08, selection CV)", 0.829, 0.888,
+     "307 paired-PQN rows incl. since-removed cross-class duplicates"),
     ("Same old config, honest protocol (2026-09-16)", 0.639, 0.682,
      "old 3SSE chain: 0.725 reported → 0.572 honest"),
 )
 THEN_NOW_TAKEAWAY = (
-    "The pre-Sept-9 numbers were optimistic: evaluation bugs and leakage "
-    "fixed 2026-09-05→12. Measured fairly, the old configuration scores "
-    "LOWER than today's model — the current winner beats the old record "
-    "under the same honest protocol.")
+    "The 0.829 row is the old protocol's real recorded number: selection "
+    "CV (winner picked and graded on the same data) on a tree that still "
+    "contained cross-class duplicates. The honest re-measurement of the "
+    "old configuration is 0.639, and today's proven winner measures "
+    "0.757 honestly — the current model is the best fair result.")
+
+# The imported 2026-09-08 historical record (selection-CV protocol).
+# Numbers only — the leakage-era fitted model is deliberately NOT in
+# the repo (see legacy_run_2026-09-08/PROVENANCE.txt).
+LEGACY_RECORD_DIR = "legacy_run_2026-09-08"
+
+
+def load_legacy_record() -> dict | None:
+    """The 2026-09-08 historical 3SSE record (winner.json) when the
+    imported folder is present; None otherwise.  Display-only: the
+    archived model itself is not shipped."""
+    try:
+        with open(os.path.join(APP_DIR, LEGACY_RECORD_DIR, "winner.json"),
+                  encoding="utf-8") as fh:
+            d = json.load(fh)
+        m = d.get("metrics") or {}
+        f1 = m.get("f1")
+        if not isinstance(f1, (int, float)) or isinstance(f1, bool):
+            return None
+        return {"arch": list(d.get("arch") or []),
+                "f1": float(f1),
+                "auc": (float(m["auc"])
+                        if isinstance(m.get("auc"), (int, float)) else None),
+                "threshold": d.get("threshold"),
+                "n_oof": len(m.get("oof_proba") or []),
+                "pat_f1": m.get("pat_f1")}
+    except (OSError, ValueError):
+        return None
 
 # every GUI log line is mirrored to a rotating session log on disk
 import logging                                    # noqa: E402
@@ -3191,6 +3223,23 @@ class MainWindow(QtWidgets.QMainWindow):
             b.clicked.connect(
                 lambda _=False, p=preset: self._apply_model_preset(p))
             sel_row.addWidget(b)
+        # the 2026-09-08 protocol that DISPLAYED 0.83 (user request:
+        # reproduce the old numbers) — one click sets mode, params,
+        # folds/repeats and models; numbers land in the banner labeled
+        b_legacy = QtWidgets.QPushButton("⏳ Legacy 2026-09-08 protocol")
+        b_legacy.setFlat(True)
+        b_legacy.setCursor(qc.POINTING_HAND)
+        b_legacy.setToolTip(
+            "Reproduces the protocol that displayed 0.83 on "
+            "2026-09-08: Paired+PQN data, crop 500–2000 + sym8 L4 + "
+            "deriv 0 + vector norm, 5-fold ×3 repeats, all models, "
+            "3SSE search. Today's run reports BOTH numbers — the "
+            "honest headline and the old-style selection F1. Digits "
+            "will differ from 0.829 because the current data tree no "
+            "longer contains the cross-class duplicates and spiked "
+            "spectra that run included.")
+        b_legacy.clicked.connect(self._apply_legacy_preset)
+        sel_row.addWidget(b_legacy)
         sel_row.addStretch(1)
         cv.addLayout(sel_row)
         self._models_changed()               # initial counter + 3SSE card
@@ -3712,7 +3761,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 ("sens", "SENSITIVITY", "positives caught"),
                 ("spec", "SPECIFICITY", "negatives cleared"),
                 ("f1", "Macro-F1", "balance of both"),
-                ("auc", "ROC AUC", "ranking quality")):
+                ("auc", "ROC AUC", "ranking quality"),
+                ("sel", "SELECTION F1", "old display style — the "
+                 "number the pre-Sept-8 app showed")):
             block = QtWidgets.QWidget()
             bx = QtWidgets.QVBoxLayout(block)
             bx.setContentsMargins(0, 0, 0, 0)
@@ -3875,6 +3926,39 @@ class MainWindow(QtWidgets.QMainWindow):
         tnowv.addWidget(self.r_tnow_hint)
         self.r_tnow_card = tnow
         v.addWidget(tnow)
+
+        # 2c. historical record card — the REAL 2026-09-08 numbers the
+        # user remembers (imported from the archived copy), displayed
+        # with provenance; never as current performance
+        legacy = load_legacy_record()
+        hist, histv = self.card(
+            "Historical record (2026-09-08, old protocol)",
+            "The number the app showed on 2026-09-08, imported from the "
+            "archived copy. It is a selection-CV number (the winner was "
+            "picked and graded on the same 307-row dataset, which still "
+            "contained cross-class duplicates since removed) — display "
+            "it next to, not instead of, today's honest numbers.")
+        self.r_hist_table = QtWidgets.QTableWidget(2, 4)
+        self.r_hist_table.setHorizontalHeaderLabels(
+            ["Record", "Macro-F1", "ROC AUC", "Architecture / note"])
+        self.r_hist_table.horizontalHeader().setSectionResizeMode(
+            0, HEADER_STRETCH)
+        self.r_hist_table.verticalHeader().setVisible(False)
+        self.r_hist_table.setEditTriggers(EDIT_NO)
+        self.r_hist_table.setAlternatingRowColors(True)
+        self.r_hist_table.setMaximumHeight(110)
+        histv.addWidget(self.r_hist_table)
+        self.r_hist_hint = QtWidgets.QLabel(
+            "Full provenance: legacy_run_2026-09-08/PROVENANCE.txt — "
+            "the archived model itself is not shipped (its training "
+            "data included cross-class duplicates; never deploy it).")
+        self.r_hist_hint.setObjectName("CardHint")
+        self.r_hist_hint.setWordWrap(True)
+        histv.addWidget(self.r_hist_hint)
+        self.r_hist_card = hist
+        self._legacy_record = legacy
+        hist.setVisible(legacy is not None)
+        v.addWidget(hist)
 
         # 3. prediction details + distribution chart
         mid = QtWidgets.QSplitter(QT_HORIZONTAL)
@@ -4879,7 +4963,9 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 auc_val = None
             for key, val in (("sens", hs), ("spec", hp), ("f1", hf1),
-                             ("auc", auc_val)):
+                             ("auc", auc_val),
+                             ("sel", w.macro_f1()
+                              if w is not None else None)):
                 lbl = self.r_stats[key]
                 lbl.setText(f"{val:.3f}"
                             if val is not None and np.isfinite(val)
@@ -5054,6 +5140,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 if c_i:
                     it.setTextAlignment(ALIGN_CENTER)
                 self.r_tnow_table.setItem(r_i, c_i, it)
+
+        # ---- historical record card (imported 2026-09-08 artifacts) ----
+        if self._legacy_record is not None:
+            leg = self._legacy_record
+            hist_rows = [
+                ("Report record (TabPFN chain, 12:09)", "0.830", "–",
+                 "result_report.txt headline of that day"),
+                ("Saved winner (RF → Extra Trees)",
+                 f"{leg['f1']:.3f}",
+                 f"{leg['auc']:.3f}" if leg.get("auc") is not None
+                 else "–",
+                 (f"{len(leg['arch'])}-model chain · "
+                  f"{leg.get('n_oof', 0)} OOF rows"
+                  + (f" · patient-level F1 {leg['pat_f1']:.3f}"
+                     if isinstance(leg.get("pat_f1"), (int, float))
+                     else ""))),
+            ]
+            for r_i, (c0, c1, c2, c3) in enumerate(hist_rows):
+                for c_i, txt in enumerate((c0, c1, c2, c3)):
+                    it = QtWidgets.QTableWidgetItem(txt)
+                    if c_i:
+                        it.setTextAlignment(ALIGN_CENTER)
+                    self.r_hist_table.setItem(r_i, c_i, it)
 
         # ---- deep evaluation summary ---------------------------------------
         bits = []
@@ -5737,6 +5846,9 @@ class MainWindow(QtWidgets.QMainWindow):
             lines.append(f"  sensitivity {_n(hs)} · specificity {_n(hp)}"
                          f" · macro-F1 {_n(hf1)}")
             lines.append(f"  {hnote}")
+            lines.append(f"  Selection CV (old display style — picked "
+                         f"the winner, optimistic): "
+                         f"{w.macro_f1():.3f}")
             if w.threshold is not None:
                 lines.append(f"  decision threshold {w.threshold:.3f}")
             if self._region_bands:
@@ -6050,7 +6162,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"<tr><th>Sensitivity / Specificity / macro-F1</th>"
                 f"<td>{_n(hs)} / {_n(hp)} / {_n(hf1)}"
                 "</td></tr>"
-                f"<tr><th>Protocol</th><td>{esc(hnote)}</td></tr>")
+                f"<tr><th>Protocol</th><td>{esc(hnote)}</td></tr>"
+                "<tr><th>Selection CV (old display style)</th>"
+                f"<td>{w.macro_f1():.3f} — picked the winner, "
+                "optimistic</td></tr>")
             lo_r, hi_r = self._op_points_now()
             if lo_r is not None and hi_r is not None:
                 parts.append(
@@ -8711,6 +8826,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     + "\n" + "  ·  ".join(dlines))
         except Exception:
             pass
+        # the OLD display style (2026-09-17 user request: show the old
+        # numbers again) — the same selection-CV statistic the pre-Sept-8
+        # banner printed verbatim, now always labeled and paired with
+        # the honest headline above
+        try:
+            self.banner_plain.setText(
+                self.banner_plain.text()
+                + "\nOld display style (selection CV — picked the "
+                  f"winner, optimistic): F1 {w.macro_f1():.3f}")
+        except Exception:
+            pass
 
     def on_train_done(self, results, winner):
         self.results, self.winner = results, winner
@@ -8835,6 +8961,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.models_count.setStyleSheet(
             "color:#b91c1c;" if n < 3 else "")
         self._update_seq_card()
+
+    def _apply_legacy_preset(self):
+        """One click reproduces the 2026-09-08 protocol that DISPLAYED
+        0.83 (user request): Paired+PQN data, the run's preprocessing,
+        5-fold ×3, all models, 3SSE trainer.  The banner will show the
+        honest headline AND the old-style selection F1 — the digits
+        differ from 0.829 because the current data tree excludes the
+        cross-class duplicates and spiked spectra that run contained."""
+        from dataclasses import asdict as _asdict
+        import preprocessing as _pp
+        try:
+            p = _asdict(_pp.PreprocessParams().validate())
+            p.update({
+                "crop_min": 500.0, "crop_max": 2000.0,
+                "despike": True,
+                "wavelet_name": "sym8", "wavelet_level": 4,
+                "wavelet_cycle": 4,
+                "sg_window": 11, "sg_poly": 3, "sg_deriv": 0,
+                "detrend": True, "norm": "vector",
+                "wn_calibrate": True,
+            })
+            self._apply_params(p)
+        except Exception:
+            self.log("Legacy preset: applying preprocessing failed:\n"
+                     + traceback.format_exc())
+        self.set_mode_kind("seq-paired-pqn")
+        self.spin_folds.setValue(5)
+        self.chk_repeat.setChecked(True)
+        for cb in self.model_checks.values():
+            cb.setChecked(True)
+        self.train_status.setText(
+            "Legacy 2026-09-08 protocol set (Paired+PQN, sym8/deriv-0, "
+            "5-fold ×3, all models). Run 3SSE — the banner reports the "
+            "honest number and the old-style selection F1 together.")
+        self.log("Legacy 2026-09-08 protocol applied — this is the "
+                 "configuration whose SELECTION number was 0.830; the "
+                 "current tree (no duplicates/spiked) will read "
+                 "differently")
 
     def _apply_model_preset(self, preset: str):
         """Check/uncheck the model boxes per preset."""

@@ -1,0 +1,266 @@
+Raman Classifier — final result report
+Generated: 2026-09-08 12:09:04
+============================================================
+Dataset: 317 spectra, 2 classes, 72 patients
+Preprocessing (as trained): PreprocessParams(crop_min=500.0, crop_max=2000.0, despike=True, despike_z=7.0, despike_window=5, wavelet=True, wavelet_name='sym8', wavelet_level=4, wavelet_threshold='universal', wavelet_mode='soft', wavelet_cycle=4, sg_window=11, sg_poly=3, sg_deriv=0, detrend=True, baseline_method='als', als_lambda=100000.0, als_p=0.01, als_niter=10, norm='vector', wn_calibrate=True)
+
+Winning model: 3SSE: Spectral + band features → TabPFN (foundation model)
+  sensitivity 0.832 · specificity 0.832 · macro-F1 0.830
+  decision threshold 0.503
+  top discriminative bands: 527 cm-1, 1455 cm-1  (CH2 lipids/proteins), 1509 cm-1
+
+Model comparison (macro-F1):
+  3SSE: Spectral + band features → TabPFN (foundation model) 0.830
+  PCA + SVM (RBF)                  0.810
+  PCA + Gaussian Naive Bayes       0.807
+  Ensemble (top-3)                 0.803
+  TabPFN (foundation model)        0.790
+  Hist Gradient Boosting           0.782
+  Spectral + band features         0.774
+  Extra Trees                      0.764
+  Random Forest                    0.763
+  XGBoost                          0.744
+  CatBoost                         0.737
+  Peak bands + RF                  0.734
+  LightGBM                         0.728
+  t-test filter + XGBoost          0.725
+  PLS + XGBoost                    0.710
+  PCA + MLP (neural net)           0.710
+  PLS-DA                           0.699
+  PCA + Logistic Regression        0.664
+  PCA + LDA                        0.651
+  PCA + XGBoost                    0.638
+  Isolation Forest (one-vs-rest)   0.356
+
+Predictions (180 spectra):
+  Tumor: 148
+  Normal: 32
+  mean P(Tumor) = 0.811 — HIGH signal (threshold 0.503)
+  triage: POSITIVE 142 / INDETERMINATE 38 / NEGATIVE 0
+
+file                                     class          prob  triage
+1712024TOC15TH0_interpolated.csv         Normal        0.600  INDETERMINATE
+17122024TDOC15TH0_interpolated.csv       Normal        0.599  INDETERMINATE
+17122024TDOC15TH1_interpolated.csv       Normal        0.646  INDETERMINATE
+26122024TDOC0016TH0_interpolated.csv     Normal        0.648  INDETERMINATE
+26122024TDOC0016TH1_interpolated.csv     Normal        0.557  INDETERMINATE
+02012025TDOC17TH0_interpolated.csv       Normal        0.613  INDETERMINATE
+02012025TDOC17TH1_interpolated.csv       Normal        0.659  INDETERMINATE
+07012025TDOC18TH01_interpolated.csv      Normal        0.674  INDETERMINATE
+07012025TDOC18TH02_interpolated.csv      Tumor         0.975  POSITIVE
+08012025TDOC19TH0_interpolated.csv       Normal        0.629  INDETERMINATE
+x24TH0_1_csv_interpolated.csv            Tumor         0.933  POSITIVE
+x24TH0_2_csv_interpolated.csv            Tumor         0.957  POSITIVE
+x27TH0_1_csv_interpolated.csv            Normal        0.636  INDETERMINATE
+x27TH0_2_csv_interpolated.csv            Normal        0.548  INDETERMINATE
+x29TH0_1_csv_interpolated.csv            Tumor         0.756  POSITIVE
+x29TH0_2_csv_interpolated.csv            Tumor         0.961  POSITIVE
+x30TH0_1_csv_interpolated.csv            Tumor         0.918  POSITIVE
+x30TH0_2_csv_interpolated.csv            Tumor         0.916  POSITIVE
+x32TH0_1_csv_interpolated.csv            Normal        0.604  INDETERMINATE
+x41TH0_1_csv_interpolated.csv            Tumor         0.950  POSITIVE
+x41TH0_2_csv_interpolated.csv            Tumor         0.952  POSITIVE
+x42TH0_2_csv_interpolated.csv            Tumor         0.950  POSITIVE
+x42TH0_3_csv_interpolated.csv            Tumor         0.926  POSITIVE
+x42TH0_4_csv_interpolated.csv            Tumor         0.969  POSITIVE
+x43TH0_1_csv_interpolated.csv            Tumor         0.965  POSITIVE
+x44TH0_1_csv_interpolated.csv            Tumor         0.974  POSITIVE
+x44TH0_2_csv_interpolated.csv            Tumor         0.969  POSITIVE
+x44TH0_4_csv_interpolated.csv            Tumor         0.965  POSITIVE
+x45TH0_1_csv_interpolated.csv            Tumor         0.962  POSITIVE
+x45TH0_2_csv_interpolated.csv            Tumor         0.888  POSITIVE
+x45TH0_3_csv_interpolated.csv            Tumor         0.928  POSITIVE
+x46TH0_2_csv_interpolated.csv            Tumor         0.947  POSITIVE
+x46TH0_3_csv_interpolated.csv            Tumor         0.899  POSITIVE
+x47TH0_1_csv_interpolated.csv            Tumor         0.910  POSITIVE
+x47TH0_2_csv_interpolated.csv            Tumor         0.952  POSITIVE
+x47TH0_3_csv_interpolated.csv            Tumor         0.952  POSITIVE
+x48TH0_1_csv_interpolated.csv            Tumor         0.862  POSITIVE
+x48TH0_2_csv_interpolated.csv            Tumor         0.914  POSITIVE
+x49TH0_4_csv_interpolated.csv            Tumor         0.895  POSITIVE
+x49TH0_5_csv_interpolated.csv            Tumor         0.796  POSITIVE
+x49TH0_6_csv_interpolated.csv            Tumor         0.890  POSITIVE
+x50TH0_4_csv_interpolated.csv            Tumor         0.967  POSITIVE
+x51TH0_3_csv_interpolated.csv            Tumor         0.784  POSITIVE
+x52TH0_1_csv_interpolated.csv            Tumor         0.942  POSITIVE
+x52TH0_2_csv_interpolated.csv            Tumor         0.935  POSITIVE
+x52TH0_4_csv_interpolated.csv            Tumor         0.953  POSITIVE
+x53TH0_2_2sec__csv_interpolated.csv      Tumor         0.925  POSITIVE
+x53TH0_3_2sec__csv_interpolated.csv      Tumor         0.942  POSITIVE
+x53TH0_4_2sec__csv_interpolated.csv      Tumor         0.892  POSITIVE
+x54TH0_2_csv_interpolated.csv            Tumor         0.960  POSITIVE
+x54TH0_3_csv_interpolated.csv            Tumor         0.943  POSITIVE
+x54TH0_4_csv_interpolated.csv            Tumor         0.962  POSITIVE
+x55TH0_1_csv_interpolated.csv            Tumor         0.941  POSITIVE
+x56TH0_2_csv_interpolated.csv            Tumor         0.968  POSITIVE
+x56TH0_3_csv_interpolated.csv            Tumor         0.976  POSITIVE
+x57TH0_2_csv_interpolated.csv            Tumor         0.948  POSITIVE
+x57TH0_3_csv_interpolated.csv            Tumor         0.939  POSITIVE
+21112024TDOC004TH0_interpolated.csv      Tumor         0.561  INDETERMINATE
+21112024TDOC004TH1_interpolated.csv      Tumor         0.627  INDETERMINATE
+22112024TDOC005T.H0_interpolated.csv     Tumor         0.949  POSITIVE
+22112024TDOC005TH0_interpolated.csv      Normal        0.653  INDETERMINATE
+26112024TDOC006TH0_interpolated.csv      Tumor         0.929  POSITIVE
+26112024TDOC006TH1_interpolated.csv      Tumor         0.907  POSITIVE
+29112024TDOC10TH0_interpolated.csv       Tumor         0.815  POSITIVE
+29112024TDOC10TH1_interpolated.csv       Tumor         0.870  POSITIVE
+30112024TDOC11TH1_interpolated.csv       Normal        0.630  INDETERMINATE
+1712024TOC15TH0_interpolated.csv         Normal        0.600  INDETERMINATE
+17122024TDOC15TH0_interpolated.csv       Normal        0.599  INDETERMINATE
+17122024TDOC15TH1_interpolated.csv       Normal        0.646  INDETERMINATE
+26122024TDOC0016TH0_interpolated.csv     Normal        0.648  INDETERMINATE
+26122024TDOC0016TH1_interpolated.csv     Normal        0.557  INDETERMINATE
+02012025TDOC17TH0 (2)_interpolated.csv   Normal        0.550  INDETERMINATE
+02012025TDOC17TH0_interpolated.csv       Normal        0.613  INDETERMINATE
+02012025TDOC17TH1_interpolated.csv       Normal        0.659  INDETERMINATE
+07012025TDOC18TH01_interpolated.csv      Normal        0.674  INDETERMINATE
+07012025TDOC18TH02_interpolated.csv      Tumor         0.975  POSITIVE
+08012025TDOC19TH0_interpolated.csv       Normal        0.629  INDETERMINATE
+08032025TDOC35TH01_interpolated.csv      Tumor         0.936  POSITIVE
+08032025TDOC35TH02_interpolated.csv      Tumor         0.970  POSITIVE
+0842025TDOC35TH0_interpolated.csv        Tumor         0.946  POSITIVE
+09032025TDOC36TH01_interpolated.csv      Tumor         0.968  POSITIVE
+09032025TDOC36TH0_interpolated.csv       Tumor         0.959  POSITIVE
+21042025TDOC037TH0(Lft)_interpolated.csv Normal        0.505  INDETERMINATE
+21042025TDOC037TH0(rght)_interpolated.csv Tumor         0.646  INDETERMINATE
+21042025TDOC037TH01(rght)_interpolated.csv Tumor         0.914  POSITIVE
+04082025TDOC058TH0.csv                   Normal        0.551  INDETERMINATE
+04082025TDOC058TH01.csv                  Tumor         0.965  POSITIVE
+04082025TDOC058TH02.csv                  Tumor         0.926  POSITIVE
+02092025TD0C060TH01.csv                  Tumor         0.934  POSITIVE
+02092025TDOC060TH0.csv                   Tumor         0.932  POSITIVE
+08092025TDOC061TH0.csv                   Tumor         0.880  POSITIVE
+08092025TDOC061TH01.csv                  Tumor         0.867  POSITIVE
+22092025TDOC62TH0.csv                    Tumor         0.925  POSITIVE
+22092025TDOC62TH01.csv                   Tumor         0.917  POSITIVE
+22092025TDOC62TH02.csv                   Tumor         0.874  POSITIVE
+22092025TDOC62TH03.csv                   Tumor         0.734  POSITIVE
+23092025TDOC63TH0.csv                    Normal        0.504  INDETERMINATE
+23092025TDOC63TH01.csv                   Tumor         0.653  POSITIVE
+08102025TDOC064TH0.csv                   Tumor         0.879  POSITIVE
+08102025TDOC064TH01.csv                  Tumor         0.962  POSITIVE
+15102025TDOC065TH01.csv                  Tumor         0.901  POSITIVE
+15102025TDOC065TH02.csv                  Tumor         0.892  POSITIVE
+18112025TDOC066TH0.csv                   Tumor         0.960  POSITIVE
+18112025TDOC066TH01.csv                  Tumor         0.878  POSITIVE
+18112025TDOC066TH02.csv                  Tumor         0.969  POSITIVE
+02122025TDOC067TH0.csv                   Tumor         0.956  POSITIVE
+02122025TDOC067TH02.csv                  Tumor         0.965  POSITIVE
+02122025TDOC068TH0.csv                   Tumor         0.911  POSITIVE
+02122025TDOC068TH01.csv                  Tumor         0.895  POSITIVE
+02122025TDOC068TH02.csv                  Tumor         0.950  POSITIVE
+02122025TDOC068TH03.csv                  Tumor         0.669  POSITIVE
+09122025TDOC069TH0.csv                   Tumor         0.926  POSITIVE
+09122025TDOC069TH01.csv                  Tumor         0.908  POSITIVE
+06012026TDOC070TH0.csv                   Tumor         0.974  POSITIVE
+06012026TDOC070TH01.csv                  Tumor         0.949  POSITIVE
+06012026TDOC070TH05.csv                  Tumor         0.935  POSITIVE
+06012026TDOC070TH06.csv                  Tumor         0.867  POSITIVE
+06012026TDOC70TH02.csv                   Tumor         0.933  POSITIVE
+06012026TDOC70TH04.csv                   Tumor         0.953  POSITIVE
+02022026TDOC071TH0.csv                   Tumor         0.953  POSITIVE
+02022026TDOC071TH01.csv                  Tumor         0.875  POSITIVE
+02022026TDOC071TH02.csv                  Tumor         0.865  POSITIVE
+02022026TDOC071TH03.csv                  Tumor         0.948  POSITIVE
+02022026TDOC072TH0.csv                   Normal        0.638  INDETERMINATE
+02022026TDOC072TH01.csv                  Normal        0.533  INDETERMINATE
+02022026TDOC072TH02.csv                  Normal        0.663  INDETERMINATE
+02022026TDOC073TH0.csv                   Normal        0.622  INDETERMINATE
+02022026TDOC073TH01.csv                  Normal        0.606  INDETERMINATE
+20022026TDOC075TH01.csv                  Tumor         0.968  POSITIVE
+20022026TDOC075TH02.csv                  Tumor         0.895  POSITIVE
+24022026TDOC076TH0.csv                   Tumor         0.936  POSITIVE
+24022026TDOC076TH01.csv                  Tumor         0.757  POSITIVE
+24022026TDOC076TH04.csv                  Tumor         0.950  POSITIVE
+24022026TDOC76TH03.csv                   Tumor         0.926  POSITIVE
+06032026TDOC077TH0.csv                   Tumor         0.960  POSITIVE
+06032026TDOC077TH01.csv                  Tumor         0.941  POSITIVE
+06032026TDOC077TH02.csv                  Tumor         0.930  POSITIVE
+12032026TDOC078TH0.csv                   Tumor         0.958  POSITIVE
+12032026TDOC078TH02.csv                  Tumor         0.920  POSITIVE
+12062026TDOC078TH01.csv                  Tumor         0.975  POSITIVE
+31032026TDOC079TH0.csv                   Tumor         0.966  POSITIVE
+31032026TDOC079TH02.csv                  Tumor         0.796  POSITIVE
+31032026TDOC79TH01.csv                   Tumor         0.946  POSITIVE
+09042026TDOC080TH0.csv                   Tumor         0.879  POSITIVE
+09042026TDOC080TH02.csv                  Tumor         0.975  POSITIVE
+09042026TDOC080TH03.csv                  Tumor         0.935  POSITIVE
+15042025TDOC081TH0.csv                   Tumor         0.983  POSITIVE
+15042025TDOC081TH01.csv                  Tumor         0.974  POSITIVE
+21042026TDOC082TH0.csv                   Tumor         0.949  POSITIVE
+21042026TDOC082TH01.csv                  Tumor         0.959  POSITIVE
+21042026TDOC082TH02.csv                  Tumor         0.941  POSITIVE
+22042026TDOC083TH0.csv                   Tumor         0.876  POSITIVE
+22042026TDOC083TH01.csv                  Tumor         0.833  POSITIVE
+22042026TDOC083TH02.csv                  Tumor         0.945  POSITIVE
+22042026TDOC083TH03.csv                  Tumor         0.901  POSITIVE
+29042026TDOC084TH0.csv                   Tumor         0.896  POSITIVE
+29042026TDOC084TH01.csv                  Tumor         0.752  POSITIVE
+29042026TDOC085TH0.csv                   Tumor         0.891  POSITIVE
+29042026TDOC085TH02.csv                  Tumor         0.743  POSITIVE
+30042026TDOC086TH0.csv                   Tumor         0.922  POSITIVE
+30042026TDOC086TH02.csv                  Tumor         0.907  POSITIVE
+30062026TDOC086TH01.csv                  Tumor         0.967  POSITIVE
+04052026TDOC087TH0.csv                   Tumor         0.925  POSITIVE
+04052026TDOC087TH01.csv                  Tumor         0.865  POSITIVE
+04052026TDOC087TH04.csv                  Tumor         0.949  POSITIVE
+06052026TDOC088TH01.csv                  Tumor         0.714  POSITIVE
+06052026TDOC088TH02.csv                  Tumor         0.609  INDETERMINATE
+06052026TDOC088TH03.csv                  Tumor         0.580  INDETERMINATE
+06052026TDOC089TH0.csv                   Tumor         0.944  POSITIVE
+06052026TDOC089TH01.csv                  Tumor         0.924  POSITIVE
+06052026TDOC089TH02.csv                  Tumor         0.723  POSITIVE
+12052026TDOC090TH0.csv                   Tumor         0.806  POSITIVE
+12052026TDOC090TH02.csv                  Tumor         0.909  POSITIVE
+12052026TDOC090TH03.csv                  Tumor         0.596  INDETERMINATE
+18052026TDOC091TH0.csv                   Tumor         0.962  POSITIVE
+18052026TDOC091TH01.csv                  Tumor         0.954  POSITIVE
+18052026TDOC091TH02.csv                  Tumor         0.934  POSITIVE
+25052026TDOC092TH0.csv                   Tumor         0.908  POSITIVE
+25052026TDOC092TH01.csv                  Tumor         0.966  POSITIVE
+25052026TDOC092TH02.csv                  Tumor         0.922  POSITIVE
+
+The winning model (3SSE: Spectral + band features → TabPFN (foundation model)) catches 83% of positive cases (sensitivity) and correctly clears 83% of negative cases (specificity) under patient-grouped cross-validation.
+
+Margin mode (paired normal reference): every spectrum is classified by its deviation from the same patient's normal tissue — the same principle as intraoperative margin assessment with fiber-optic Raman (~91% accuracy in 2025 in-vivo work). New predictions need a normal reference from the same patient.
+
+What a positive call is worth depends on where you stand: at a lesion-clinic prevalence (~30%) a positive is right about 68% of the time (PPV); in low-prevalence screening (~5%) only 21%. Negative calls stay reliable in both (92% NPV at 30%).
+
+Calibration (Brier score): 0.143 — 0 is perfect, 0.25 is chance; the closer the probabilities are to reality, the more you can trust a 0.8 vs a 0.55.
+
+On the 180 spectra you just classified, 148 were called Tumor. Spectra near the decision threshold (probability 0.4-0.6) are the least certain — check them individually.
+
+These numbers come from patient-grouped cross-validation on 68 patients; expect larger variation on new patients. This is research triage support for trained clinicians — not a medical diagnosis; histopathology remains the reference standard.
+
+Compared with the published literature
+------------------------------------------------------------
+Test (validation method)                 sens   spec
+This study (patient-grouped CV)          0.83   0.83
+Han 2022 meta (13 studies)               0.89   0.84
+2025 meta-analysis (OSCC subgroup)       0.89   0.91
+Purohit 2026 review (pooled)             0.90   0.89
+VELscope autofluorescence (typical)     ~0.84  ~0.45
+Toluidine blue (typical)                ~0.63  ~0.83
+
+Caveat: most published Raman studies validate with spectrum-level random splits, which lets spectra from the SAME patient appear in both train and test and optimistically inflates the numbers. This project evaluates with PATIENT-GROUPED cross-validation — a stricter standard; the two kinds of numbers are not directly comparable. Adjunct devices (VELscope, toluidine blue) are shown for clinical context.
+
+Predictive values by clinical setting
+------------------------------------------------------------
+setting              prevalence    PPV    NPV
+dental screening             5%    21%    99%
+lesion clinic               30%    68%    92%
+biopsy queue                60%    88%    77%
+PPV/NPV move strongly with prevalence (Bayes) — read them against the setting you work in.
+
+Reporting (TRIPOD+AI style)
+------------------------------------------------------------
+Participants: 317 spectra from 72 patients (paired design)
+Outcomes: class labels from the top-level folders (histopathology-confirmed tissue sites)
+Analysis: patient-grouped CV (StratifiedGroupKFold); repeated x3 when enabled; preprocessing re-chosen inside every fold for the nested honest estimate — no patient leaks between train and test (PROBAST+AI analysis domain)
+Intended use: research triage support for trained clinicians; not a diagnosis — histopathology is the reference standard
+Limitations: single centre; no external validation; spectrum-level sample sizes overstate statistical power; anatomical site, keratinisation and tobacco history are not recorded and may confound
+
+Per-patient performance (out-of-fold)
+------------------------------------------------------------
+  worst 5: S27 33% (n=3), S16 50% (n=4), S32 50% (n=2), S4 50% (n=4), S49 50% (n=6)
+  HARD patients (<50% spectra correct): S27 33%

@@ -3658,3 +3658,46 @@ ARTIFACTS: stale 131 MB loose TabPFN joblib at app root DELETED
 counts 97→131 + removed dead doc references; RELEASE_NOTES annotated
 as v1.0.0 point-in-time.  Commit: this message's hash includes the
 whole Sep 13–17 working tree (first commit since 81b8943).
+
+## 64. 2026-09-17 — the old 0.8s back on screen (user request: "take
+## from the old copy, implement it, keep new things")
+
+User brought an archived pre-fix copy (Desktop "BARC (6)") whose
+banner showed 0.8+ and asked to implement its numbers.  EXPLORED the
+copy: the old number = the winner's pooled SELECTION-CV macro-F1
+displayed verbatim (pre-Sept-8 commit 4c01fc7 banner/report), measured
+2026-09-08 on 307 paired-PQN rows from the PRE-dedup tree (317/72 →
+incl. 18 cross-class duplicate spectra since removed as leakage),
+old preprocessing (crop 500–2000/sym8 L4/deriv 0/vector), no outer
+holdout.  Records on disk: report 0.830 (TabPFN chain, 12:09) +
+winner.json 0.8289/AUC 0.888 (RF → ET, 307 rows, threshold 0.481,
+pat_f1 0.519 — patient level never was 0.8).  Same data honestly
+re-measured 2026-09-16: 0.639.
+
+SHIPPED (honest headline unchanged):
+- legacy_run_2026-09-08/ imported (winner.json + result_report.txt +
+  PROVENANCE.txt; the leakage-era winner.joblib deliberately NOT
+  imported — never deploy a model trained on cross-class duplicates).
+- Result page "Historical record (2026-09-08, old protocol)" card:
+  0.830 report row + 0.829/0.888 winner row with provenance hint;
+  hides cleanly when the folder is absent.
+- THEN_NOW_RECORD grows a third row (0.829/0.888, labeled "selection
+  CV, incl. since-removed duplicates") — the full story is one table:
+  0.829 old-record → 0.639 honest old-config → 0.757 honest winner.
+- "Old display style" selection stat EVERYWHERE the honest number
+  shows: banner line ("selection CV — picked the winner, optimistic"),
+  Result-page 5th stat block (SELECTION F1), txt + HTML report rows.
+  This is literally the statistic the pre-Sept-8 app printed as its
+  headline — now always labeled and paired with the honest number.
+- "⏳ Legacy 2026-09-08 protocol" button (Train page): one click sets
+  Paired+PQN + the run's preprocessing (crop 500–2000/sym8 L4/cycle 4/
+  deriv 0/vector/detrend/despike/wn_calibrate) + 5-fold ×3 + all
+  models + 3SSE trainer.  Tooltip + log state plainly that digits
+  will differ from 0.829 (no duplicates/spiked in today's tree); the
+  combo does NOT collide with the purged 2026-09-01 bad-session
+  signature (crop_max 2000 vs 1800) — pinned in gui_test [5c].
+
+Gates: test_all 132/132 (+test_legacy_record_artifact, then-now pin
+extended to 3 rows), gui_test PASS (+[5c]), deep_test 23/23, ruff
+clean, real-workspace e2e: historical card visible, selection stat
+live (0.757), legacy button present.
