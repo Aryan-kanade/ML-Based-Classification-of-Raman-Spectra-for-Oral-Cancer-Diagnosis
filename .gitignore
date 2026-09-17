@@ -45,3 +45,7 @@ raman_app/warnings_capture.log
 
 # user archived copy of an older project state (kept on disk, not in repo)
 pro_fixed/
+
+# external reference clones (kept on disk, not part of the repo)
+ponytail/
+strix/

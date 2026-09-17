@@ -37,6 +37,33 @@ NEMENYI_Q = {2: 1.960, 3: 2.349, 4: 2.569, 5: 2.728, 6: 2.850, 7: 2.949,
              8: 3.031, 9: 3.102, 10: 3.164}
 
 
+def _encode(y, classes) -> np.ndarray:
+    """Map class labels to indices via the shared label LUT (modeling
+    imports this — the one canonical encoder in the suite)."""
+    lut = {c: i for i, c in enumerate(classes)}
+    return np.array([lut[v] for v in y], dtype=int)
+
+
+def midrank(v, descending: bool = False) -> np.ndarray:
+    """Midranks with ties averaged (DeLong's tie-corrected ranks);
+    descending=True ranks the largest value 1 (Nemenyi per-block ranks).
+    clinical.py imports this — the one canonical midrank in the suite."""
+    v = np.asarray(v)
+    if descending:
+        v = -v
+    order = np.argsort(v, kind="mergesort")
+    sv = v[order]
+    out = np.empty(len(v), dtype=float)
+    i = 0
+    while i < len(sv):
+        j = i
+        while j + 1 < len(sv) and sv[j + 1] == sv[i]:
+            j += 1
+        out[order[i:j + 1]] = 0.5 * (i + j) + 1.0
+        i = j + 1
+    return out
+
+
 def _nemenyi_q(k: int) -> float:
     """Nemenyi q at alpha=0.05 for k classifiers (exact table for
     k<=10; scipy.stats.studentized_range for larger k)."""
@@ -218,8 +245,7 @@ def lopo_evaluate(X, y, groups, estimator, params: dict,
     X = np.asarray(X)
     groups = np.asarray(groups)
     y = list(y)
-    lut = {c: i for i, c in enumerate(classes)}
-    ye = np.array([lut[v] for v in y], dtype=int)
+    ye = _encode(y, classes)
     patients = sorted(set(groups.tolist()))
     if stride > 1:
         patients = patients[::stride]
@@ -332,19 +358,7 @@ def friedman_nemenyi(scores: dict[str, list[float]],
     # average ranks per block (1 = best, ties averaged)
     ranks = np.zeros_like(mat)
     for j in range(n_blocks):
-        order = np.argsort(-mat[:, j], kind="mergesort")
-        sorted_vals = mat[order, j]
-        r = np.empty(len(names))
-        i = 0
-        while i < len(sorted_vals):
-            k = i
-            while k + 1 < len(sorted_vals) and sorted_vals[k + 1] == \
-                    sorted_vals[i]:
-                k += 1
-            avg = 0.5 * (i + k) + 1.0
-            r[order[i:k + 1]] = avg
-            i = k + 1
-        ranks[:, j] = r
+        ranks[:, j] = midrank(mat[:, j], descending=True)
     avg_ranks = ranks.mean(axis=1)
     k = len(names)
     q = alpha_q if alpha_q is not None else _nemenyi_q(k)
@@ -403,8 +417,7 @@ def seed_stability(X, y, groups, estimator, params, classes: list[str],
     cancelled by user'); `progress(msg)` fires after every seed
     (2026-09-06: chain winners make this take minutes — the user must
     SEE movement)."""
-    lut = {c: i for i, c in enumerate(classes)}
-    ye = np.array([lut[v] for v in y], dtype=int)
+    ye = _encode(y, classes)
     if jobs > 1 and len(seeds) > 1:
         from joblib import Parallel, delayed
         _set_threads_budget(jobs)
@@ -450,8 +463,7 @@ def noise_robustness(X, y, groups, estimator, params, classes: list[str],
     from sklearn.metrics import f1_score
     from sklearn.model_selection import StratifiedGroupKFold
 
-    lut = {c: i for i, c in enumerate(classes)}
-    ye = np.array([lut[v] for v in y], dtype=int)
+    ye = _encode(y, classes)
     X = np.asarray(X, dtype=float)
     n_groups = len(set(np.asarray(groups).tolist()))
     k = int(min(k, n_groups))
@@ -514,8 +526,7 @@ def patient_level_metrics(y, groups, oof_proba) -> dict | None:
     if not len(y) or len(set(groups.tolist())) < 2:
         return None
     classes = sorted(set(y))
-    lut = {c: i for i, c in enumerate(classes)}
-    ye = np.array([lut[v] for v in y], dtype=int)
+    ye = _encode(y, classes)
     y_pat, p_pat = [], []
     for g in sorted(set(groups.tolist())):
         m = groups == g
@@ -543,8 +554,7 @@ def per_patient_rollup(y, groups, oof_proba, classes: list[str],
     sorted worst-first — the 'hard patients' failure analysis.
     """
     ye_pred = np.argmax(np.asarray(oof_proba), axis=1)
-    lut = {c: i for i, c in enumerate(classes)}
-    ye = np.array([lut[v] for v in y], dtype=int)
+    ye = _encode(y, classes)
     groups = np.asarray(groups)
     rows = []
     for g in sorted(set(groups.tolist())):

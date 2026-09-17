@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from study_stats import midrank as _midrank
+
 TRIAGE_NEGATIVE = "NEGATIVE"
 TRIAGE_INDETERMINATE = "INDETERMINATE"
 TRIAGE_POSITIVE = "POSITIVE"
@@ -406,21 +408,6 @@ def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     c = (ph + z * z / (2 * n)) / d
     h = z * np.sqrt(ph * (1 - ph) / n + z * z / (4 * n * n)) / d
     return (max(0.0, c - h), min(1.0, c + h))
-
-
-def _midrank(v: np.ndarray) -> np.ndarray:
-    """Midranks with ties averaged (DeLong's tie-corrected ranks)."""
-    order = np.argsort(v, kind="mergesort")
-    sv = np.asarray(v)[order]
-    out = np.empty(len(v), dtype=float)
-    i = 0
-    while i < len(sv):
-        j = i
-        while j + 1 < len(sv) and sv[j + 1] == sv[i]:
-            j += 1
-        out[order[i:j + 1]] = 0.5 * (i + j) + 1.0
-        i = j + 1
-    return out
 
 
 def delong_auc_ci(y_true, p_pos: np.ndarray, z: float = 1.96):

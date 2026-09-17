@@ -41,6 +41,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.svm import SVC
 
+from study_stats import _encode
+
 try:
     from xgboost import XGBClassifier
     HAS_XGB = True
@@ -1031,26 +1033,27 @@ def lorentzian_synthesize(X: np.ndarray, n_new: int, wn=None,
 
 
 # --------------------------------------------------------------------------
+def _pca_clf(clf) -> Pipeline:
+    """StandardScaler → PCA(0.95) → clf, shared by every "PCA + …" spec
+    (grids key everything clf__*, so the step names are load-bearing)."""
+    return Pipeline([("sc", StandardScaler()),
+                     ("pca", PCA(n_components=0.95,
+                                 random_state=RANDOM_STATE)),
+                     ("clf", clf)])
+
+
 def model_specs() -> list[dict]:
     """Candidate models: {name, estimator, grid}."""
     specs = [
         {
             "name": "PCA + SVM (RBF)",
-            "estimator": Pipeline([
-                ("sc", StandardScaler()),
-                ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
-                ("clf", CalibratedSVC()),
-            ]),
+            "estimator": _pca_clf(CalibratedSVC()),
             "grid": {"clf__C": [1, 10, 100],
                      "clf__gamma": ["scale", 0.01]},
         },
         {
             "name": "PCA + LDA",
-            "estimator": Pipeline([
-                ("sc", StandardScaler()),
-                ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
-                ("clf", LinearDiscriminantAnalysis()),
-            ]),
+            "estimator": _pca_clf(LinearDiscriminantAnalysis()),
             "grid": [
                 {"clf__solver": ["lsqr"], "clf__shrinkage": [None, "auto"]},
                 {"clf__solver": ["svd"], "clf__shrinkage": [None]},
@@ -1058,32 +1061,20 @@ def model_specs() -> list[dict]:
         },
         {
             "name": "PCA + Logistic Regression",
-            "estimator": Pipeline([
-                ("sc", StandardScaler()),
-                ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
-                ("clf", LogisticRegression(max_iter=5000,
-                                           class_weight="balanced",
-                                           random_state=RANDOM_STATE)),
-            ]),
+            "estimator": _pca_clf(LogisticRegression(
+                max_iter=5000, class_weight="balanced",
+                random_state=RANDOM_STATE)),
             "grid": {"clf__C": [0.1, 1, 10]},
         },
         {
             "name": "PCA + KNN",
-            "estimator": Pipeline([
-                ("sc", StandardScaler()),
-                ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
-                ("clf", KNeighborsClassifier()),
-            ]),
+            "estimator": _pca_clf(KNeighborsClassifier()),
             "grid": {"clf__n_neighbors": [3, 5, 7],
                      "clf__weights": ["uniform", "distance"]},
         },
         {
             "name": "PCA + Gaussian Naive Bayes",
-            "estimator": Pipeline([
-                ("sc", StandardScaler()),
-                ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
-                ("clf", GaussianNB()),
-            ]),
+            "estimator": _pca_clf(GaussianNB()),
             "grid": {"clf__var_smoothing": [1e-9, 1e-7]},
         },
         {
@@ -1104,13 +1095,9 @@ def model_specs() -> list[dict]:
         },
         {
             "name": "Hist Gradient Boosting",
-            "estimator": Pipeline([
-                ("sc", StandardScaler()),
-                ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
-                ("clf", HistGradientBoostingClassifier(
-                    learning_rate=0.1, class_weight="balanced",
-                    random_state=RANDOM_STATE)),
-            ]),
+            "estimator": _pca_clf(HistGradientBoostingClassifier(
+                learning_rate=0.1, class_weight="balanced",
+                random_state=RANDOM_STATE)),
             "grid": {"clf__max_iter": [100, 300]},
         },
         {
@@ -1131,13 +1118,9 @@ def model_specs() -> list[dict]:
         },
         {
             "name": "PCA + MLP (neural net)",
-            "estimator": Pipeline([
-                ("sc", StandardScaler()),
-                ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
-                ("clf", MLPClassifier(hidden_layer_sizes=(64,),
-                                      max_iter=1500,
-                                      random_state=RANDOM_STATE)),
-            ]),
+            "estimator": _pca_clf(MLPClassifier(
+                hidden_layer_sizes=(64,), max_iter=1500,
+                random_state=RANDOM_STATE)),
             "grid": {"clf__alpha": [1e-3, 1e-1]},
         },
         {
@@ -1514,11 +1497,6 @@ class ModelResult:
 # --------------------------------------------------------------------------
 # Cross-validated evaluation of the full suite
 # --------------------------------------------------------------------------
-def _encode(y: list[str], classes: list[str]) -> np.ndarray:
-    lut = {c: i for i, c in enumerate(classes)}
-    return np.array([lut[v] for v in y], dtype=int)
-
-
 def _tune_hyperparams(estimator, grid, Xtr, ytr, min_class: int, groups=None):
     """Inner GridSearchCV; returns (best_estimator_fitted_on_Xtr, best_params).
 
@@ -2687,6 +2665,48 @@ def _reject_degenerate(xc: np.ndarray):
             "preprocessing)")
 
 
+def _as_params(p):
+    from preprocessing import PreprocessParams
+    # bundles store PreprocessParams, but tolerate plain dicts at this
+    # trust boundary (hand-made or future writers)
+    return p if hasattr(p, "validate") else PreprocessParams(**p)
+
+
+def _sorted_and_guarded(wn, it, grid) -> tuple[np.ndarray, np.ndarray]:
+    """Shared intake of one raw spectrum for both predict paths: reject
+    mismatched/empty arrays, sort ascending, fail loudly on NaN/Inf
+    input, on grid non-coverage (np.interp CONSTANT-extrapolates, so a
+    short axis would silently be filled with edge intensities) and on
+    degenerate raw input; return the sorted arrays."""
+    # release-gate: mismatched/empty arrays crashed at the sort itself
+    # (IndexError) before any guard could speak — reject cleanly FIRST
+    if len(wn) != len(it) or len(it) == 0:
+        raise ValueError(
+            f"empty or mismatched spectrum arrays ({len(wn)} "
+            f"wavenumbers vs {len(it)} intensities) — the file is corrupt")
+    order = np.argsort(wn)
+    w, x = np.asarray(wn)[order], np.asarray(it)[order]
+    # non-finite guard (2026-09-08 audit BUG-1): an all-NaN spectrum used
+    # to reach the classifier as zeros and came back with MAXIMAL
+    # confidence (Tumor p=1.0) — silent garbage.  Fail loudly instead.
+    n_bad = int(np.count_nonzero(~np.isfinite(x)))
+    if n_bad:
+        raise ValueError(
+            f"spectrum contains {n_bad} NaN/Inf intensity points — fix "
+            "or re-measure the file; predicting on it would fabricate a "
+            "confident answer")
+    # overlap guard (2026-09-05); 1 cm-1 tolerance for boundary rounding.
+    lo, hi = float(grid.min()), float(grid.max())
+    if float(w[0]) > lo + 1.0 or float(w[-1]) < hi - 1.0:
+        raise ValueError(
+            f"spectrum axis {float(w[0]):.1f}-{float(w[-1]):.1f} cm-1 "
+            f"does not cover the model's wavenumber range "
+            f"{lo:.1f}-{hi:.1f} — interpolation would fabricate the "
+            f"missing region")
+    _reject_raw_degenerate(x)
+    return w, x
+
+
 def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
                         intensities: np.ndarray,
                         reference: np.ndarray | None = None) -> dict:
@@ -2698,46 +2718,11 @@ def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
     probabilities (and the stored threshold, which is saved in
     CALIBRATED units) are mapped through it first.
     """
-    from preprocessing import (PreprocessParams, align_to_grid, crop_mask,
-                               preprocess_spectrum)
+    from preprocessing import align_to_grid, crop_mask, preprocess_spectrum
 
-    def _as_params(p):
-        # bundles store PreprocessParams, but tolerate plain dicts at this
-        # trust boundary (hand-made or future writers)
-        return p if hasattr(p, "validate") else PreprocessParams(**p)
-
-    # release-gate: mismatched/empty arrays crashed at the sort itself
-    # (IndexError) before any guard could speak — reject cleanly FIRST
-    if len(wavenumbers) != len(intensities) or len(intensities) == 0:
-        raise ValueError(
-            f"empty or mismatched spectrum arrays ({len(wavenumbers)} "
-            f"wavenumbers vs {len(intensities)} intensities) — the "
-            "file is corrupt")
-    order = np.argsort(wavenumbers)
-    wn, it = np.asarray(wavenumbers)[order], np.asarray(intensities)[order]
-    # non-finite guard (2026-09-08 audit BUG-1): an all-NaN spectrum used
-    # to reach the classifier as zeros and came back with MAXIMAL
-    # confidence (Tumor p=1.0) — silent garbage.  Fail loudly instead.
-    n_bad = int(np.count_nonzero(~np.isfinite(it)))
-    if n_bad:
-        raise ValueError(
-            f"spectrum contains {n_bad} NaN/Inf intensity points — fix "
-            "or re-measure the file; predicting on it would fabricate a "
-            "confident answer")
     grid = np.asarray(bundle["wavenumbers"], dtype=float)
-    # overlap guard (2026-09-05): np.interp CONSTANT-extrapolates, so a
-    # spectrum whose measured axis does not span the training grid would
-    # silently be filled with edge intensities and confidently
-    # mispredicted.  1 cm-1 tolerance for boundary rounding.
-    lo, hi = float(grid.min()), float(grid.max())
-    if float(wn[0]) > lo + 1.0 or float(wn[-1]) < hi - 1.0:
-        raise ValueError(
-            f"spectrum axis {float(wn[0]):.1f}-{float(wn[-1]):.1f} cm-1 "
-            f"does not cover the model's wavenumber range "
-            f"{lo:.1f}-{hi:.1f} — interpolation would fabricate the "
-            f"missing region")
-    _reject_raw_degenerate(it)
-    y = np.interp(grid, wn, it)
+    w, x = _sorted_and_guarded(wavenumbers, intensities, grid)
+    y = np.interp(grid, w, x)
     params = _as_params(bundle["prep_params"])
     # 2026-09-06: bundles trained with wn_calibrate=True were predicted
     # WITHOUT the Phe-1003 alignment — every deploy-time feature was
@@ -2745,7 +2730,7 @@ def predict_with_bundle(bundle: dict, wavenumbers: np.ndarray,
     # (all-Normal→Tumor).  align_to_grid mirrors preprocess_matrix's
     # calibrate-then-crop order so deploy features match training.
     if params.wn_calibrate:
-        y = align_to_grid(wn, it, grid, params)
+        y = align_to_grid(w, x, grid, params)
     # apply the crop range exactly as at training time (the model expects
     # the cropped feature count); fall back to the uncropped vector for
     # bundles that were trained without cropping
@@ -2831,11 +2816,7 @@ def predict_with_bundle_many(bundle: dict, spectra: list,
     (results, errors): results[i] is the result dict or None; errors
     maps i -> message for the failed rows.
     """
-    from preprocessing import (PreprocessParams, align_to_grid, crop_mask,
-                               preprocess_spectrum)
-
-    def _as_params(p):
-        return p if hasattr(p, "validate") else PreprocessParams(**p)
+    from preprocessing import align_to_grid, crop_mask, preprocess_spectrum
 
     spectra = list(spectra)
     refs = list(references) if references is not None \
@@ -2846,34 +2827,9 @@ def predict_with_bundle_many(bundle: dict, spectra: list,
     exp = _expected_features(bundle)
     groups: dict[int, list[tuple[int, np.ndarray]]] = {}
     errors: dict[int, str] = {}
-    lo, hi = float(grid.min()), float(grid.max())
     for i, ((wn, it), ref) in enumerate(zip(spectra, refs, strict=True)):
         try:
-            # release-gate: mismatched/empty arrays crashed at the sort
-            # itself before any guard could speak — reject cleanly FIRST
-            if len(wn) != len(it) or len(it) == 0:
-                raise ValueError(
-                    f"empty or mismatched spectrum arrays ({len(wn)} "
-                    f"wavenumbers vs {len(it)} intensities) — the file "
-                    "is corrupt")
-            order = np.argsort(wn)
-            w, x = np.asarray(wn)[order], np.asarray(it)[order]
-            # BUG-1 guards (2026-09-08): identical to the single-spectrum
-            # path — non-finite input and degenerate features must land
-            # in errors[i], never in a confident prediction
-            n_bad = int(np.count_nonzero(~np.isfinite(x)))
-            if n_bad:
-                raise ValueError(
-                    f"spectrum contains {n_bad} NaN/Inf intensity points "
-                    "— fix or re-measure the file; predicting on it "
-                    "would fabricate a confident answer")
-            if float(w[0]) > lo + 1.0 or float(w[-1]) < hi - 1.0:
-                raise ValueError(
-                    f"spectrum axis {float(w[0]):.1f}-{float(w[-1]):.1f} "
-                    f"cm-1 does not cover the model's wavenumber range "
-                    f"{lo:.1f}-{hi:.1f} — interpolation would fabricate "
-                    f"the missing region")
-            _reject_raw_degenerate(x)
+            w, x = _sorted_and_guarded(wn, it, grid)
             y = np.interp(grid, w, x)
             if params.wn_calibrate:
                 y = align_to_grid(w, x, grid, params)
