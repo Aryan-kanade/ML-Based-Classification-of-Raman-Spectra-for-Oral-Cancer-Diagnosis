@@ -1,0 +1,5 @@
+These 55 spectra (20 patients, TDOC073-092) were found here
+misplaced and were RESTORED into D:\BARC\Data on 2026-09-17
+(byte-identical copies; verified).  This folder is kept only as a
+staging marker — the live training tree is D:\BARC\Data.  Do NOT
+train on this folder (it would double-count the recovered patients).

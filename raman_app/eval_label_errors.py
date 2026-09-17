@@ -40,22 +40,52 @@ def main() -> int:
     oof = np.asarray(best["metrics"]["oof_proba"])
     y_enc = np.asarray(best["metrics"]["y_true"])
 
-    # rebuild the keep order to name rows (same recipe as d2's
-    # _prepare_winner: load order minus unlabeled/flagged)
+    # rebuild the keep order to name rows — replicating
+    # paired_features' EXACT row order (per patient: normals first,
+    # then tumors; single-normal Normals dropped), because paired
+    # reorders rows and the old keep-order/tail-truncation mapping
+    # mislabeled flagged rows (2026-09-17)
     cd = load_clinical_dataset(sequential.DEFAULT_DATA)
     labels = [s.label for s in cd.spectra]
     flagged = cd.flagged or [False] * len(labels)
     keep = [i for i, lab in enumerate(labels)
             if lab.strip() and (WINNER.despike or not flagged[i])]
-    names = [cd.spectra[i].name for i in keep]
-    classes = sorted(set(labels[i].strip() for i in keep))
-    if len(names) != len(y_enc):
-        names = names[-len(y_enc):]     # paired_features may drop rows
+    names_kept = [cd.spectra[i].name for i in keep]
+    labels_kept = [labels[i].strip() for i in keep]
+    groups_kept = [cd.groups[i] for i in keep]
+    classes = sorted(set(labels_kept))
+    by_patient: dict[str, dict[str, list[int]]] = {}
+    for i, (g, lab) in enumerate(zip(groups_kept, labels_kept,
+                                     strict=True)):
+        by_patient.setdefault(g, {}).setdefault(lab, []).append(i)
+    paired_names: list[str] = []
+    for g, cls_idx in by_patient.items():
+        normals = cls_idx.get("Normal") or cls_idx.get("normal")
+        tumors = cls_idx.get("Tumor") or cls_idx.get("tumor")
+        if not normals or not tumors:
+            continue
+        for lab, idxs in (("Normal", normals), ("Tumor", tumors)):
+            for i in idxs:
+                if lab == "Normal" and len(normals) == 1:
+                    continue     # dropped: single normal, no ref
+                paired_names.append(names_kept[i])
+    if len(paired_names) >= len(y_enc):
+        names = paired_names[:len(y_enc)]
+    else:
+        names = (paired_names
+                 + [f"row{i}"
+                    for i in range(len(y_enc) - len(paired_names))])
+    if len(paired_names) != len(y_enc):
+        lines_note = (f"  [WARN row map {len(paired_names)} != "
+                      f"{len(y_enc)} — tail rows unnamed]")
+    else:
+        lines_note = "  [row map exact]"
 
     rows = modeling.label_error_report(oof, y_enc)
     lines = [f"label-error review — {stamp()}",
              f"arch: {' -> '.join(best['arch'])}",
-             f"rows: {len(y_enc)} · flagged: {len(rows)}", ""]
+             f"rows: {len(y_enc)} · flagged: {len(rows)}",
+             lines_note, ""]
     for r in rows[:40]:
         nm = names[r["i"]] if r["i"] < len(names) else f"row{r['i']}"
         lines.append(

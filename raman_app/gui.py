@@ -2014,6 +2014,12 @@ class MainWindow(QtWidgets.QMainWindow):
         best: tuple[float, float, str] | None = None
         for wpath in glob.glob(os.path.join(
                 APP_DIR, "study_run_3sse*", "winner.json")):
+            # a folder adjudicated NOT adopted (3-seed + McNemar lost
+            # to the champion) is skipped even if its single-seed F1
+            # is higher — selection draws never outrank the verdict
+            if os.path.isfile(os.path.join(os.path.dirname(wpath),
+                                           "NOT_ADOPTED.txt")):
+                continue
             try:
                 with open(wpath, encoding="utf-8") as fh:
                     m = (_json.load(fh).get("metrics") or {})
@@ -2147,6 +2153,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
             # the fitted SequentialChain from the run's bundle
+            bundle = None
             bpath = os.path.join(folder, "winner.joblib")
             want_name = "3SSE: " + " → ".join(data["arch"])
             if os.path.isfile(bpath):
@@ -2174,6 +2181,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.log("3SSE restore: winner.joblib missing — metrics "
                          "restored but no deployable pipeline (Save "
                          "stays disabled); retrain to get one")
+            # with the recovered tree the session IS the run's tree —
+            # rebuild the paired groups from the session data so the
+            # banner's patient-level line works at startup (row-count
+            # guarded; §72)
+            if (winner.oof_proba is not None
+                    and winner.groups is None
+                    and getattr(self, "_source_folder", None)
+                    and self.X_raw is not None):
+                try:
+                    import paired as paired_mod
+                    _bp = (bundle or {}).get("prep_params") \
+                        if isinstance(bundle, dict) else None
+                    if _bp:
+                        _pp2 = (preprocessing.PreprocessParams(**_bp)
+                                if isinstance(_bp, dict) else _bp)
+                        _pd2 = paired_mod.paired_features(
+                            self.X_raw, self.labels, self.groups,
+                            self.grid, _pp2,
+                            exclude=self.spike_flags)
+                        if len(_pd2.groups) == len(winner.oof_proba):
+                            winner.groups = [str(g) for g in _pd2.groups]
+                            self.log("3SSE restore: patient groups "
+                                     f"rebuilt ({len(_pd2.groups)} rows) "
+                                     "— patient-level line enabled")
+                except Exception:
+                    pass
             # comparison table: the run's validated single models
             results = []
             vpath = os.path.join(folder, "validated.json")

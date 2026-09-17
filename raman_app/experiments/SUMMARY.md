@@ -71,3 +71,4 @@ Baseline = L4 multi-seed mean of the d2 winner (PLS + XGBoost -> RF -> ET): **0.
 | label-fix | SIM exclude 2 flagged (current tree) | 0.711 | -0.042 | drop | vs baseline 0.731 - removal LOSES signal; hard cases, not mislabels |
 | label-fix | SIM flip 2 flagged (current tree) | 0.724 | -0.029 | drop | vs baseline 0.731 - flipping also worse; label lever is EXHAUSTED |
 | d3-final | exhaustive search winner (HGB->RF->ET) 3-seed | 0.730 | -0.023 | drop | McNemar vs d2 p=0.219; d2 0.734 stays champion - search space exhausted |
+| L11 label-errors | review-list | 0.757 | +0.004 | tie | 2 flagged (0 likely) — human review next; cleaning confirmed mislabels is a legitimate lift |

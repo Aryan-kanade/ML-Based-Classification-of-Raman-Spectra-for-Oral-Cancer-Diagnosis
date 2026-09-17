@@ -3863,3 +3863,28 @@ All-cases honest maximum: **0.731-0.757** depending on seed draw.
 The 0.8+ that exists: decided F1 0.800 @ 56% / screen 0.907 @ 23% /
 rule-out-in 90/91 (selective prediction with stated coverage).
 Beyond that: acquisition upgrades + ~2x cohort (§60 dossier).
+
+## 72. 2026-09-17 (close-out) — remaining tasks completed
+
+- eval_label_errors.py: row mapping now replicates paired_features'
+  EXACT row order (per-patient normals-then-tumors, single-normal
+  drop) with a map-exactity note in the output — the stale
+  tail-truncation map that produced the contradictory TDOC083/085
+  flags is gone.  Re-generated on the recovered tree: 2 'review'
+  flags, 0 likely (review sheet unchanged in substance).
+- Zero-row question CLOSED empirically: the 19 k=1-normal Normals
+  are exact zero rows (n_self_ref_rows); excluding them DROPS the
+  chain to 0.707 ± 0.014 (vs 0.734) — they act as a "perfect
+  Normal" anchor and STAY (paired.py unchanged).
+- Startup restore: paired groups rebuilt from the session (bundle
+  prep_params, spike-flag exclusion, row-count guarded) — the
+  banner's PATIENT-LEVEL line now works at startup for restored
+  winners whose tree matches.  Restore also SKIPS folders carrying
+  NOT_ADOPTED.txt (d3 marked) so a selection draw can never
+  outrank an adjudication verdict.
+- Hygiene: the misplaced-data staging folder renamed
+  data_recovered_2026-09-17 with NOTE.txt (do-not-train warning).
+- Final gates on the closed state: test_all 132/132, gui_test
+  PASS, deep_test 23/23, ruff clean; e2e: champion d2 restored
+  (0.757/0.800 pills), patient line live, weak-model warning,
+  restore-proven button.
