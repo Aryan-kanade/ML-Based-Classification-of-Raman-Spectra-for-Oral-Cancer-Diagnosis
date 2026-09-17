@@ -9,7 +9,13 @@
 > the matching section below. Keep the "Last updated" stamp current.
 > Keep it dense — tables and one-liners, no prose padding.
 
-Last updated: 2026-09-16 (METHOD-DISCOVERY LOOP §58: external-data
+Last updated: 2026-09-17 (PONYTAIL CLEANUP §76: ponytail rule adopted
+into .agents/rules/ + AGENTS.md; 8,053 lines deleted — 35 eval_* one-off
+scripts + the closed discovery loop's harness + stale experiments/
+outputs; duplicates consolidated: _pca_clf, _sorted_and_guarded,
+study_stats._encode / .midrank; ZERO behavior change — gates ruff
+clean, test_all 132/132, gui_test PASS, deep_test 23/23;
+previously 2026-09-16/17 (METHOD-DISCOVERY LOOP §58: external-data
 verdicts (RSClass chance-level — all transfer arms DROPPED), patient
 MEDIAN-aggregation discovery (patient F1 0.484→0.638), RankNet
 within-patient arm (0.570), params-version incident (v4 sessions
@@ -145,35 +151,49 @@ python stress_audit.py                          # crash-class stress: real loky 
 Tests hardcode `C:\Windows\Fonts` — Linux CI would need patching (no CI
 exists). `matplotlib.use("Agg")` for all headless figure writing.
 
-## 3. File map (raman_app/, 12.2k lines)
+## 3. File map (raman_app/, 29.1k lines after the 2026-09-17 Ponytail pass)
 
 | File | ~Lines | Role |
 |---|---|---|
-| `gui.py` | 6261 | 6-page MainWindow, 5 QThread workers, all slots. See §14. |
-| `modeling.py` | 1346 | Model registry + nested grouped CV + bundles + importance + bootstrap/McNemar. §7-8, 12. |
-| `test_all.py` | 1054 | 47 unit tests incl. regressions for the 2026-08-30 fixes, new models, data-root discovery. |
-| `deep_test.py` | 716 | 18 adversarial GUI/CLI scenarios; `wait_analysis()` helper. |
-| `stress_audit.py` | ~430 | Crash-class stress: real loky+Qt in SUBPROCESSES (A=crash repro on real data, B=overlap guards, C=close-mid-work, D=ui-churn); B-D re-run inside deep_test. |
-| `vit_train.py` / `vit_model.py` / `vit_test.py` | 551/207/144 | Secondary ViT track (torch). §15. |
-| `plotting.py` | 439 | rcParams theme, `MatplotlibCanvas` (lazy Qt-binding pin), plot helpers. |
-| `ui_helpers.py` | 387 | QSS stylesheet, `pill()`, tooltips, HOW_TO/METRIC_HELP, settings I/O. |
-| `study_stats.py` | 375 | Friedman+Nemenyi, LOPO, seed/noise checks, BH-FDR band stats. §10. |
-| `clinical_data.py` | 324 | `load_clinical_dataset()` → `ClinicalData` + hygiene + report. §5. |
-| `reproduce_study.py` | 285 | One-shot headless study (works on real data since 2026-08-30). |
-| `clinical.py` | 259 | TRIPOD layer: Platt, DeLong, operating points, triage, PPV/NPV, DCA. §9. |
-| `preprocessing.py` | 254 | `PreprocessParams` + spectrum pipeline. §6. |
-| `biochemistry.py` | 250 | BANDS/RATIOS tables, NMF, keratin flags, plausibility. §11. |
-| `optimize.py` | 228 | Preprocessing auto-tune. §15. |
-| `prep_deep_search.py` | ~640 | Deep combinatorial preprocessing search (staged factorial, both modes). §52. |
+| `gui.py` | 10625 | 6-page MainWindow, 5 QThread workers, all slots. See §14. |
+| `modeling.py` | 3242 | Model registry + nested grouped CV + bundles + importance + bootstrap/McNemar. §7-8, 12. |
+| `test_all.py` | 4755 | 132 unit tests incl. regressions for the 2026-08-30 fixes, new models, data-root discovery. |
+| `deep_test.py` | 909 | 23 adversarial GUI/CLI scenarios; `wait_analysis()` helper. |
+| `sequential.py` | 1616 | 3SSE architecture search (screening + nested validation + chain). §15. |
+| `vit_train.py` / `vit_model.py` / `vit_test.py` | 700/221/144 | Secondary ViT track (torch). §15. |
+| `study_stats.py` | 676 | Friedman+Nemenyi, LOPO, seed/noise checks, BH-FDR band stats + the canonical `_encode`/`midrank`. §10. |
+| `preprocessing.py` | 673 | `PreprocessParams` + spectrum pipeline. §6. |
+| `prep_deep_search.py` | 642 | Deep combinatorial preprocessing search (staged factorial, both modes). §52. |
+| `plotting.py` | 541 | rcParams theme, `MatplotlibCanvas` (lazy Qt-binding pin), plot helpers. |
+| `biochemistry.py` | 448 | BANDS/RATIOS tables, NMF, keratin flags, plausibility. §11. |
+| `ui_helpers.py` | 441 | QSS stylesheet, `pill()`, tooltips, HOW_TO/METRIC_HELP, settings I/O. |
+| `clinical.py` | 432 | TRIPOD layer: Platt, DeLong, operating points, triage, PPV/NPV, DCA. §9. |
+| `clinical_data.py` | 395 | `load_clinical_dataset()` → `ClinicalData` + hygiene + report. §5. |
+| `stress_audit.py` | 398 | Crash-class stress: real loky+Qt in SUBPROCESSES (A=crash repro on real data, B=overlap guards, C=close-mid-work, D=ui-churn); B-D re-run inside deep_test. |
+| `optimize.py` | 381 | Preprocessing auto-tune. §15. |
+| `reproduce_study.py` | 359 | One-shot headless study (works on real data since 2026-08-30). |
+| `reproduce_report.py` / `validate_external.py` | 307/192 | Report replication + external-validation checks (both test-imported). |
+| `paired.py` | 212 | Within-patient deviation features. §4. |
+| `bench.py` | 175 | README-documented scorecard CLI (writes bench/latest.json). |
 | `dataset.py` | 148 | Flat loader, `common_grid`, `to_matrix`. §5. |
-| `paired.py` | 160 | Within-patient deviation features. §4. |
 | `gui_test.py` / `main.py` / `qt_compat.py` | small | Harnesses / entry points. |
 
-Root: `AGENTS.md` (pointer here), `.gitignore` —
+2026-09-17 Ponytail deletion: the closed discovery loop's 35 `eval_*.py`
+one-offs + harness (`exp_common`/`pat_common`/`discover_batch`/
+`run_3sse_d2|d3|proven`/`method_bank`/`push_08`/`run_program_queue`/
+`calc_patient_count`/`convert_rsclass`) + one-off verify/prep checks +
+root `audit_metrics_independent.py` + stale `experiments/` outputs
+(kept `presept9.json` — test cross-check reads it — and
+`winner_chain_now.json` — cited by the Then-vs-now card).  Findings
+survive in §58-§72 + git history.
+
+Root: `AGENTS.md` (pointer here + the `.agents/rules/ponytail.md`
+lazy-senior-dev rule), `.gitignore` —
 excludes `Data/`, `Documatation/`, `_external/`,
 `renders/`, `study_run*/`, `*.joblib`, `study_manifest.json`,
 `result_report.*`, `settings.json`, `session.log`,
-`vit_outputs/`, `__pycache__/`, `*.zip`.
+`vit_outputs/`, `__pycache__/`, `*.zip`, `ponytail/`, `strix/`
+(external reference clones).
 
 ## 4. Data flow (memorize this)
 
@@ -984,9 +1004,14 @@ with default hyperparameters (identical for all 4,369 — fair).
    in the source tree** (known leftover).
 9. PLS-DA probabilities are softmax-of-scores (pseudo-probs). Friedman
     q_alpha hand-tabulated. `band_stats_paired` returns only FDR p.
-10. Duplicated helpers (consolidate someday): `_encode` ×3, PCA builders
-    ×6 + optimize copy, rank-with-ties ×2; optimize uses
-    random_state=0 vs suite 42.
+10. ~~Duplicated helpers (consolidate someday)~~ RESOLVED 2026-09-17
+    (§76): `_encode` = study_stats._encode, midrank =
+    study_stats.midrank(descending=), PCA pipelines = modeling._pca_clf,
+    predict guards = modeling._sorted_and_guarded.  Remaining
+    divergences are INTENTIONAL — do not "fix": optimize.py
+    random_state=0 vs suite 42, `_pin_threads` (sequential, flips
+    torch+env) vs `_pin_child` (study_stats, env-only), per-site
+    degenerate-metric fallbacks (NaN vs 0.0 vs max(x,1)).
 11. Library modules `print` instead of logging (dataset, optimize,
     vit_train) — GUI mirrors prints into session.log.
 12. sklearn "delayed/Parallel" UserWarnings in paired runs + joblib/
@@ -3365,7 +3390,9 @@ program (user directive: D:\BARC\Data only).
   patient score separation insufficient (honest negative).
 
 **METHOD BANK** (`method_bank.py` + `discover_batch.py` +
-`eval_agg_batch.py`): jsonl+MD catalog, tiers vs baseline 0.753 —
+`eval_agg_batch.py`; **scripts DELETED 2026-09-17 §76** — the loop is
+closed, findings below + git history are the record): jsonl+MD catalog,
+tiers vs baseline 0.753 —
 works = F1≥0.740 (std≤0.030, seeds 42/43/44) OR patient F1≥0.500;
 strong ≥0.753; breakthrough ≥0.758 + McNemar<0.10. Batches so far:
 A (8 feature-compression rowmaps) ALL FAIL 0.50–0.63 — compressing
@@ -3938,3 +3965,52 @@ so module tests, CLI baselines, bench.py keep passing):
 Tests updated: §57 startup-default expected set minus BIOCHEM_MODELS;
 diag-queue order without run_band_agreement (plain + chain branches).
 Gates: test_all 132/132, gui_test PASS, ruff clean.
+
+## 76. 2026-09-17 — Ponytail cleanup: 8,053 lines deleted, duplicates
+## consolidated, ZERO behavior change
+
+User adopted the ponytail rule (lazy senior dev: deletion over
+addition, reuse before writing) into `.agents/rules/ponytail.md` +
+AGENTS.md, then asked for a whole-project pass "as per ponytail but
+keep working as it is".
+
+DELETIONS (all git-recoverable; every one verified unreferenced by
+app/tests/CI before `git rm`):
+- 35 `eval_*.py` discovery scripts + harness consumed only by them:
+  exp_common, pat_common, discover_batch, run_3sse_d2/d3/proven,
+  method_bank, push_08, run_program_queue, calc_patient_count,
+  convert_rsclass (+ root audit_metrics_independent.py).
+- One-off checks: verify_deploy_fix, verify_worker_refs,
+  prep_3sse_check, prep_chain_prep_search, prep_cnn_ab,
+  prep_locked_check.
+- experiments/ outputs except presept9.json (test_all cross-check
+  reads it when present) and winner_chain_now.json (Then-vs-now
+  citation).  method_bank.jsonl + oof_bank/ npz + SUMMARY.md gone.
+- Stale optuna note in requirements.txt (its only cited consumer,
+  eval_deep_arms.py, deleted); disk-only warnings_capture.log (38 MB),
+  crash.log, data_report.txt; .gitignore += ponytail/ + strix/ (the
+  external clones the user references — never commit them).
+
+CONSOLIDATIONS (behavior-preserving, test-pinned):
+- modeling._pca_clf(): 7 identical StandardScaler→PCA(0.95)→clf blocks
+  in model_specs collapsed (step names sc/pca/clf unchanged — grids
+  key clf__*).
+- modeling._as_params() hoisted to module level (was nested ×2);
+  modeling._sorted_and_guarded() = the twin length/sort/NaN/coverage/
+  raw-degenerate guard chains of predict_with_bundle +
+  predict_with_bundle_many (error strings + 1.0 cm-1 tolerance
+  byte-identical).
+- study_stats._encode(): the one label-LUT encoder (modeling imports
+  it; 5 inline copies replaced).
+- study_stats.midrank(descending=): the one tie-averaged midrank —
+  clinical._midrank deleted (imported under the old name) and the
+  friedman_nemenyi inline loop now calls it (descending negation
+  bit-identical to the old argsort(-x)).
+Deliberately NOT merged (intentional divergence = behavior):
+optimize random_state=0, inline StratifiedGroupKFold sites,
+sequential._pin_threads vs study_stats._pin_child, per-site
+degenerate-metric fallbacks.  Gotcha #10 updated accordingly.
+
+Tree: 35,847 → 29,109 lines.  §3 file map refreshed.
+Gates (all green, same session): ruff clean, test_all 132/132,
+gui_test PASS, deep_test 23/23 (incl. stress B/C/D subprocesses).
