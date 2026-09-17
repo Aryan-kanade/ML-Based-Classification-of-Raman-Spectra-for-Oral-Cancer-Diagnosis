@@ -214,7 +214,13 @@ def main() -> int:
     # the historical card reads APP_DIR/legacy_run_2026-09-08 — absent
     # in the redirected test APP_DIR, so the card must hide cleanly
     assert win.r_hist_card.isHidden()
-    print("[5c] legacy protocol preset OK (mode/params/folds/models)")
+    # the seq card must warn when measured-weak families are included
+    win._update_seq_card()
+    assert "measured-weak" in win.seq_counts.text(), win.seq_counts.text()
+    # and the restore-proven button must exist beside Run
+    assert "Restore proven winner" in win.b_3sse_restore.text()
+    print("[5c] legacy protocol preset OK (mode/params/folds/models); "
+          "weak-family warning + restore button present")
 
     # --- [6] report writer -------------------------------------------------
     win.save_result_report()

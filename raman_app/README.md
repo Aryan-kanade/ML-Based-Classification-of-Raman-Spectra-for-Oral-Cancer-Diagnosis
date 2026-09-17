@@ -222,21 +222,36 @@ semantics" and "GPU stress/soak test").
 
 ## Performance reporting policy
 
-The number the GUI and reports show as performance is the **nested
-honest estimate** (preprocessing re-chosen inside every CV fold,
-pooled confusion matrix) — not the selection-CV numbers, which are
-labeled as a "selection ranking". Supplementary scientific metrics
-(balanced accuracy, MCC, PR-AUC, Brier, ECE, explicit TP/TN/FP/FN,
-threshold-stability stats with an instability warning) are shown
-separately, with PATIENT-level and SPECTRUM-level results explicitly
-labeled and never mixed.
+Four numbers, each labeled everywhere it appears:
+
+* **Honest F1 (the headline)** — the trained winner's validated
+  number under patient-grouped CV; for single models the nested
+  estimate (preprocessing re-chosen inside every fold, pooled
+  confusion matrix).
+* **Decided F1 (the 0.8s)** — selective prediction: accuracy on the
+  cases the two-tier rule confidently answers, with the deferred
+  fraction always stated (banner 4th pill; d2 winner: 0.800 on 56%
+  of cases; confident-screen band 0.867 on 23%).
+* **Selection F1 (old display style)** — the winner picked and
+  graded on the same data; the statistic the pre-Sept-8 app showed
+  as its headline. Shown labeled "optimistic" beside the honest
+  number.
+* **Historical record** — the 2026-09-08 imported measurement
+  (0.830 report / 0.829 saved winner), selection-CV protocol on the
+  pre-dedup dataset; `legacy_run_2026-09-08/PROVENANCE.txt` has the
+  full story.
+
+Supplementary scientific metrics (balanced accuracy, MCC, PR-AUC,
+Brier, ECE, explicit TP/TN/FP/FN, threshold-stability stats with an
+instability warning) are shown separately, with PATIENT-level and
+SPECTRUM-level results explicitly labeled and never mixed.
 
 ## Validation summary
 
 Five audit rounds + a formula audit + a GPU implementation audit + a
 long-running GPU soak test (the round-by-round record lives in
 `Brain.md` at the repo root — the per-round report files were removed
-in the 2026-09-06 workspace cleanup). Final state: **131/131 unit ·
+in the 2026-09-06 workspace cleanup). Final state: **132/132 unit ·
 23/23 deep · GUI suite · ruff clean · 25/25 registry (proven 3SSE
 chain F1 0.757 / AUC 0.791) · zero patient-level leakage (fingerprint
 probes at chance) · persistence bit-exact across processes · all

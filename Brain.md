@@ -3718,3 +3718,25 @@ deep 23/23, ruff clean, e2e: pills {0.753/0.753/0.757/0.800}.
 settings.json observation: the user's live session shows the ⏳
 Legacy button in active use (legacy params + all-25 saved) — their
 state, untouched.
+
+## 66. 2026-09-17 (round 2) — "keep improving" package
+
+- 3SSE card: "⭐ Restore proven winner (F1 0.757)" button (one click
+  back to the best winner after a weaker search; reuses
+  restore_last_3sse best-folder logic).
+- seq_counts now warns BEFORE the hours are spent when any of the 7
+  measured-weak families are checked ("⚠ N measured-weak model(s)…
+  ⭐ Proven excludes them") — the §57/§62 all-25 failure mode, made
+  visible at planning time.
+- Screen band surfaced: _decided_summary adds conf_screen
+  (decided_case on the fixed [0.30, 0.70] band); _decided_lines +
+  DECIDED-pill tooltip carry it.  On the restored d2 winner it
+  measures **F1 0.907 on 23% of cases** — the program's best honest
+  number yet displayed.
+- Start page: "Which number is which?" card (honest / decided /
+  selection / historical, one sentence each).
+- Hygiene: warnings_capture.log untracked + gitignored.
+- README "Performance reporting policy" rewritten around the four
+  labeled numbers; validation count 132/132.
+- Gates: 132/132, gui PASS (+[5c] warning/button pins), deep 23/23,
+  ruff clean, e2e verified.

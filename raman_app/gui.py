@@ -2444,6 +2444,22 @@ class MainWindow(QtWidgets.QMainWindow):
         htxt.setWordWrap(True)
         hov.addWidget(htxt)
         left_col.addWidget(how, 2)
+        # "which number is which" (2026-09-17): four numbers, one
+        # sentence each — the repeated source of confusion
+        nums, nsv = self.card("Which number is which?")
+        ntxt = QtWidgets.QLabel(
+            "<b>Honest F1 (headline)</b> — patients the model never "
+            "trained on; the fair number to trust.<br>"
+            "<b>Decided F1 (0.8s)</b> — accuracy on confident cases "
+            "only; the deferred share is always stated.<br>"
+            "<b>Selection F1 (old display)</b> — the pre-Sept-8 style: "
+            "winner picked and graded on the same data; optimistic.<br>"
+            "<b>Historical 0.829 (Sept 8)</b> — real record of the old "
+            "protocol on the old dataset, kept for reference.")
+        ntxt.setWordWrap(True)
+        ntxt.setTextFormat(TEXT_RICH)
+        nsv.addWidget(ntxt)
+        left_col.addWidget(nums, 1)
         columns.addLayout(left_col, 3)
 
         # ---- right ~40%: progress + quick actions -----------------------
@@ -3121,6 +3137,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "is shown below and the app stays responsive.")
         self.b_3sse_run.clicked.connect(self.run_3sse_now)
         sb.addWidget(self.b_3sse_run)
+        # one click back to the proven best (2026-09-17): a finished
+        # search that scores lower must not leave the user stuck with it
+        self.b_3sse_restore = QtWidgets.QPushButton(
+            "⭐ Restore proven winner (F1 0.757)")
+        self.b_3sse_restore.setToolTip(
+            "Load the best completed 3SSE winner from disk (the "
+            "2026-09-13 proven chain: PLS + XGBoost → Random Forest → "
+            "Extra Trees, nested F1 0.757 / AUC 0.791) back into this "
+            "page — useful right after a fresh search that scored "
+            "lower.")
+        self.b_3sse_restore.clicked.connect(self.restore_last_3sse)
+        sb.addWidget(self.b_3sse_restore)
         run_row = QtWidgets.QHBoxLayout()
         self.chk_3sse_fast = QtWidgets.QCheckBox(
             "Fast screening (skip slow models)")
@@ -4809,6 +4837,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"(sens {conf['sens']:.3f} / spec {conf['spec']:.3f}) "
                 f"on {conf['coverage']:.0%} of cases — the "
                 f"indeterminate band is deferred, not scored")
+        screen = s.get("screen")
+        if screen is not None and conf is not None \
+                and screen["f1"] > conf["f1"]:
+            lines.append(
+                f"Confident-screen band [0.30, 0.70]: F1 "
+                f"{screen['f1']:.3f} on {screen['coverage']:.0%} of "
+                "cases (defers even more; best quality per answered "
+                "case)")
         return lines
 
     def _decided_summary(self) -> dict | None:
@@ -4842,8 +4878,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 conf = c
         except Exception:
             conf = None
+        # the wider SCREEN band (§60): defer even more, keep only the
+        # very confident middle out — measured 0.867 @ 23% coverage
+        screen = None
+        try:
+            if lo > 0.30 and hi < 0.70:
+                sc = clin.decided_case(yv, pv, 0.30, 0.70)
+                if sc["n_decided"]:
+                    screen = sc
+        except Exception:
+            screen = None
         return {"lo": lo, "hi": hi, "sens_at": s_at, "spec_at": sp_at,
-                "conf": conf}
+                "conf": conf, "screen": screen}
 
     def render_result_page(self):
         """Fill the Result page from the current state (called on entry)."""
@@ -8896,6 +8942,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 dec.setStyleSheet(
                     f"color:{uh.metric_fg(conf['f1'])};")
                 dec_note.setText(f"on {conf['coverage']:.0%} of cases")
+                tip = (f"Decided-case = cases the two-tier rule answers "
+                       f"(p≤{s['lo']:.2f} cleared, p≥{s['hi']:.2f} "
+                       "positive); the indeterminate band is deferred, "
+                       "not scored")
+                if s.get("screen") is not None:
+                    _sc = s["screen"]
+                    tip += (f"\nConfident-screen band [0.30, 0.70]: F1 "
+                            f"{_sc['f1']:.3f} on {_sc['coverage']:.0%} "
+                            "of cases")
+                dec.setToolTip(tip)
             else:
                 dec.setText("–")
                 dec.setStyleSheet("")
@@ -9133,13 +9189,25 @@ class MainWindow(QtWidgets.QMainWindow):
             data_note += " — no patient groups loaded, training would stop"
         fast_note = (" · FAST: 2-fold, slow models skipped"
                      if self.chk_3sse_fast.isChecked() else "")
+        # measured cost of the weak families (§57/§62): an all-25
+        # Paired+PQN search wasted hours on the CNNs/TabPFN and picked
+        # a 0.63 chain — say so BEFORE the hours are spent
+        weak = sorted(set(self._seq_effective_models())
+                      & PROVEN_EXCLUDE)
+        weak_names = ", ".join(
+            n.replace(" (foundation model)", "") for n in weak[:3])
+        weak_note = (
+            f" · ⚠ {len(weak)} measured-weak model(s) included "
+            f"({weak_names}{'…' if len(weak) > 3 else ''}) — "
+            "⭐ Proven excludes them"
+            if weak else "")
         self.seq_counts.setText(
             f"Search space: {singles:,} single models · "
             f"{pairs:,} two-model chains · {triples:,} three-model "
             f"chains = {total_arch:,} architectures "
             f"(ordered, no repeats; probabilities chained between "
             f"layers, patient-grouped OOF). Will run on {data_note}"
-            f"{fast_note}.")
+            f"{fast_note}{weak_note}.")
         self.seq_estimate.setText(
             f"Rough time estimate: ≈ {est_min:.0f} min "
             "(screening + nested validation + significance tests; "
