@@ -68,3 +68,5 @@ Baseline = L4 multi-seed mean of the d2 winner (PLS + XGBoost -> RF -> ET): **0.
 | push-0.8 L1 | R-arms v1 F1=1.000 | - | - | INVALID | degenerate zero-deviation normals — bug, purged |
 | push-0.8 L1 | LF drop-influential | 0.750-0.767 | - | diagnostic | outcome-driven removal; p=1.0; not a method |
 | data-drift | d2 winner chain on 2026-09-17 tree (237 rows) | 0.696 | -0.057 | drop | 3-seed mean 0.696 +/- 0.008, AUC ~0.76; -0.06 vs the 287-row 2026-09-13 record (duplicates+spiked removed) |
+| label-fix | SIM exclude 2 flagged (current tree) | 0.711 | -0.042 | drop | vs baseline 0.731 - removal LOSES signal; hard cases, not mislabels |
+| label-fix | SIM flip 2 flagged (current tree) | 0.724 | -0.029 | drop | vs baseline 0.731 - flipping also worse; label lever is EXHAUSTED |

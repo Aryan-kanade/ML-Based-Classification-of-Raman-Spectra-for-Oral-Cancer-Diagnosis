@@ -3790,3 +3790,22 @@ winner params + folds 10 + seed 42 + proven 18 models.  Next "Run
 3SSE" screens at k=10 — expect ~0.70 mean / up to ~0.73 best chain,
 NOT 0.757 (that was the old 287-row tree).  Sweep artifact:
 experiments/best_combo.json.
+
+## 69. 2026-09-17 — label-fix lever TESTED: does NOT give 0.8 (user
+## asked directly)
+
+eval_label_fix_sim.py (SIMULATION, nothing on disk changed): proven
+chain, k=10 seed 42, current 237-row tree.  Flag detection on the
+CURRENT OOF with exact row indices (no name-map): 2 'review' rows
+(70, 226; p_self 0.19/0.22).  Arms:
+  A baseline        F1 0.731
+  B exclude flagged F1 0.711  (worse — they carry signal)
+  C flip labels     F1 0.724  (worse — the given labels are right)
+VERDICT: the label lever is EXHAUSTED — the two spectra are hard
+cases, not mislabels; both simulated "fixes" LOWER the number.
+0.731 stays the honest maximum of the current dataset.  The old
+TDOC083/085 flags came from a stale 287-row name map (checklist
+caveat confirmed).  Remaining road to 0.8 all-cases: acquisition
+upgrades only (§60 dossier); deployment 0.8s stand (decided 0.810 @
+54%, screen 0.935 @ 26%, rule-out/in 90.3/90.3 — measured on the
+current tree at the best combination).
