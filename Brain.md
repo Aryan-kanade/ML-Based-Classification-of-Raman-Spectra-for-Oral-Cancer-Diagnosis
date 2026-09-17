@@ -3809,3 +3809,36 @@ caveat confirmed).  Remaining road to 0.8 all-cases: acquisition
 upgrades only (§60 dossier); deployment 0.8s stand (decided 0.810 @
 54%, screen 0.935 @ 26%, rule-out/in 90.3/90.3 — measured on the
 current tree at the best combination).
+
+## 70. 2026-09-17 — DATA RECOVERED: the 55 "lost" spectra / 20
+## patients found and restored; 0.757 REPRODUCED EXACTLY
+
+User demanded 0.8+.  Forensic inventory (Explore agent) found the
+Sept-13 "provenance break" was NOT deletions: **55 unique spectra
+across 20 entire patients (TDOC073-092, all-even pattern) sat
+misplaced in `raman_app\data`**, byte-identical (MD5) to
+`pro_fixed\pro\Data` (the 341-file union tree).  Zero overlap with
+the current tree; no intra-set duplicates.
+
+RECOVERED: copied into D:\BARC\Data with hygiene fixes
+(`TDOC078 Sceptra pro` -> `Spectra pro` both classes;
+`TDO078` filename typo).  Loader now: **317 spectra / 72 subjects**
+(d2-era tree exactly).
+
+RE-MEASURED (eval_winner_now.py v2, 6 honest nested runs):
+  k=5:  0.757 / 0.726 / 0.718 -> MEAN **0.734 ± 0.017**
+        (seed 42 = **0.757 / AUC 0.791 — the d2 record reproduced
+        EXACTLY**; provenance break CLOSED)
+  k=10: 0.717 / 0.735 / 0.741 -> MEAN 0.731 ± 0.010
+  SELECTIVE (k=5 seed-42 OOF): rule-out sens 0.900 (p≤0.52) /
+  rule-in spec 0.913 (p≥0.68) / decided F1 **0.800 @ 56%** /
+  screen F1 **0.907 @ 23%** — §60 numbers fully restored.
+CONSEQUENCES: folds default back to 5 (k=5 > k=10 at this size);
+then-vs-now row 4 updated (0.734/0.789 recovered-tree mean);
+app pills show 0.753/0.753/0.757/0.800; the 0.696 re-baseline of
+§67 is superseded (that tree was missing the 55).  All-cases
+maximum stays ~0.73-0.76 — the 0.8s remain the decided/screen
+selective numbers; acquisition upgrades (§60) unchanged as the
+road to 0.8 all-cases.
+Gates: ruff clean, gui_test PASS, deep pending at commit time
+(ran green post-§66; no GUI behavior change beyond constants).

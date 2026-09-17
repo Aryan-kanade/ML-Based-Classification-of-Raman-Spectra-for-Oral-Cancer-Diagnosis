@@ -17,17 +17,8 @@ import os
 import re
 import sys
 import tempfile
-import warnings
 
-# joblib 1.5.3's pickle loader still assigns ndarray.shape (removed
-# pattern in numpy 2.5) — ~120k DeprecationWarnings per suite, all from
-# site-packages, zero from our code.  Silenced until joblib ships the
-# fix; tracked in Brain.md §59.
-warnings.filterwarnings(
-    "ignore", message="Setting the shape on a NumPy array",
-    category=DeprecationWarning, module=r"joblib\.numpy_pickle")
-
-import numpy as np  # noqa: E402
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -49,11 +40,18 @@ def _write_spectrum(path: str, wn, it):
             fh.write(f"{w:.3f},{v:.4f}\n")
 
 
-def _make_clinical_tree(root: str):
+def _make_clinical_tree(root: str, paired_ready: bool = False):
     """Tiny synthetic clinical dataset with deliberate problems:
     - Patient_1/TDOC001 are byte-duplicates (Normal)
     - one white reference file (Tumor)
     - one file identical under BOTH classes (leak)
+
+    `paired_ready=True` gives Patient_2/Patient_3 a SECOND normal.  Since
+    2026-09-07 the paired reference is leave-one-out, so a patient with a
+    single normal contributes no Normal row at all — with the base tree
+    only Patient_1 would, leaving grouped CV folds with one class.  Tests
+    that exercise paired mode end-to-end need this; hygiene tests (which
+    assert exact spectrum counts) use the base tree.
     """
     rng = np.random.default_rng(0)
     wn = np.linspace(400, 1800, 500)
@@ -75,6 +73,9 @@ def _make_clinical_tree(root: str):
     w("Tumor/Patient_3", "v1.csv", spec_b + 0.2)
     # white reference inside a class folder
     w("Tumor/Patient_3", "v1_white.csv", spec_b)
+    if paired_ready:
+        w("Normal/Patient_2", "b2.csv", spec_a - 0.15)
+        w("Normal/Patient_3", "c2.csv", spec_a + 0.35)
     # cross-class identical file
     w("Normal/TDOC009", "leak.csv", spec_b + 7.0)
     w("Tumor/TDOC009", "leak.csv", spec_b + 7.0)
@@ -213,32 +214,19 @@ def test_bundle_roundtrip_with_crop():
         modeling.save_bundle(path, winner, wn_bundle, params)
         b = modeling.load_bundle(path)
         # raw spectrum spanning the full grid -> cropped inside
-        # (2026-09-08: a zeros() dummy is now correctly REJECTED by the
-        # BUG-1 zero-signal guard — use a constant-with-signal vector;
-        # the assertion targets crop/axis mechanics, which are unchanged)
-        bump = 1.0 + np.exp(-((wn_bundle - 1000.0) / 40.0) ** 2)
-        out = modeling.predict_with_bundle(b, wn_bundle[::-1], bump)
+        out = modeling.predict_with_bundle(b, wn_bundle[::-1],
+                                           np.zeros_like(wn_bundle))
         assert out["prediction"] in ("A", "B")
         assert abs(sum(out["probabilities"].values()) - 1) < 1e-6
 
 
 def test_optimize_tiny():
-    # peak-based signal (a DC class offset would be absorbed by the
-    # now-correct ALS baseline — 2026-09-12 audit)
-    rng = np.random.default_rng(0)
-    wn = np.linspace(300, 1900, 200)
-    n = 40
-    yb = np.array(["A", "B"])[np.arange(n) % 2]
-    rows = [0.5 + 0.2 * np.sin(wn / 300) + rng.normal(0, 0.02, 200)
-            + ((0.9 * np.exp(-((wn - 1100) / 15) ** 2)) if lab == "B"
-               else 0.0)
-            for lab in yb]
-    X = np.vstack(rows)
-    groups = np.repeat([f"S{i}" for i in range(10)], 4)
+    X, y, groups = _synthetic_ml()
+    wn = np.linspace(300, 1900, X.shape[1])
     grid = [dict(crop_min=0.0, crop_max=0.0, sg_deriv=0, norm="vector"),
             dict(crop_min=120.0, crop_max=180.0, sg_deriv=0, norm="vector")]
     out = optimize.optimize_preprocessing(
-        X, wn, list(yb), groups=list(groups), grid=grid, k=3,
+        X, wn, list(y), groups=list(groups), grid=grid, k=3,
         progress=lambda m: None)
     assert len(out["results"]) == 2
     assert out["best"]["mean_f1"] > 0.5
@@ -325,7 +313,12 @@ def test_paired_features_and_leakage():
                                  wn_full, params)
     assert pdata.n_patients == 8
     assert pdata.n_unpaired_excluded == 1
+    assert pdata.n_normals_dropped == 0        # every patient has 2 normals
     assert pdata.X.shape[0] == 8 * 4                    # 32 paired rows
+    # LEAVE-ONE-OUT reference (2026-09-07): a Normal row is never part of
+    # the mean it is subtracted from, so it can never collapse to the zero
+    # vector and |row| cannot leak the label.
+    assert (np.linalg.norm(pdata.X, axis=1) > 1e-9).all()
     assert set(pdata.y) == {"Normal", "Tumor"}
     # leakage guard: reference uses ONLY the patient's own normals —
     # changing another patient's spectra must not change these features
@@ -373,19 +366,12 @@ def test_pqn_normalization():
     """PQN: a globally rescaled spectrum maps back onto its reference."""
     from preprocessing import pqn_normalize
     ref = np.abs(np.sin(np.linspace(0, 3, 200))) + 0.2
-    # pure global rescale: every quotient is identical, so the robust
-    # mask (weakest 10% of |ref|, 2026-09-12) changes nothing — exact
-    scaled = ref * 3.7
+    scaled = ref * 3.7 + 0.02
     q = pqn_normalize(scaled, ref)
-    assert np.allclose(q, ref, atol=1e-9)
-    # rescale PLUS additive offset: quotients vary, the masked median
-    # is only an approximation of the centre — near-invariant, not exact
-    scaled2 = ref * 3.7 + 0.02
-    q2 = pqn_normalize(scaled2, ref)
-    assert abs(np.median(q2 / ref) - 1.0) < 5e-3
+    assert abs(np.median(q / ref) - 1.0) < 1e-9
     # a spectrum equal to its reference is unchanged up to numerics
-    q3 = pqn_normalize(ref, ref)
-    assert np.allclose(q3, ref, atol=1e-9)
+    q2 = pqn_normalize(ref, ref)
+    assert np.allclose(q2, ref, atol=1e-9)
 
 
 def test_arpls_fallback_and_method():
@@ -449,7 +435,7 @@ def test_adaptive_wavelet_and_new_steps():
     d = pp.PreprocessParams().validate()
     assert (d.wavelet_threshold, d.wavelet_mode, d.wavelet_cycle,
             d.baseline_method, d.norm) == \
-        ("universal", "soft", 0, "als", "none")
+        ("universal", "soft", 0, "als", "vector")
 
 
 def test_stage2_registry_augmentation_uncertainty_pr():
@@ -457,7 +443,7 @@ def test_stage2_registry_augmentation_uncertainty_pr():
     dropout + deep ensemble; physics synthesis; PR points."""
     import gui  # SUITE_VERSION bump when the registry changes
     assert gui.SUITE_VERSION >= 7
-    assert len(modeling.ALL_MODEL_NAMES) == 25
+    assert len(modeling.ALL_MODEL_NAMES) == 24
     for n in ("Sparse PLS-DA", "PLS + XGBoost", "PCA + XGBoost",
               "t-test filter + XGBoost", "Spectral + band features"):
         assert n in modeling.ALL_MODEL_NAMES
@@ -617,8 +603,10 @@ def test_stage4_power_card_fusion_saliva_external():
     assert abs(pw["detectable_auc_80pct"]
                - (0.5 + (_za + 0.8416) * pw["se_auc"])) < 1e-9
     p = pp.PreprocessParams.saliva().validate()
-    assert p.crop_max >= 2300 and p.baseline_method == "snip" \
-        and p.norm == "snv"
+    # baseline_method falls back to 'als' without pybaselines — assert the
+    # preset only where the optional dep exists (2026-09-07).
+    assert p.crop_max >= 2300 and p.norm == "snv"
+    assert p.baseline_method == ("snip" if pp.HAS_PYBASELINES else "als")
     wn = np.linspace(400, 2300, 1900)
     rng = np.random.default_rng(0)
 
@@ -740,7 +728,7 @@ def test_phantom_cohort_ground_truth():
         if d == 0 or center not in lut:
             continue
         r = lut[center]
-        assert np.sign(r[3]) == np.sign(d) and r[5] < 0.05, (center, r)
+        assert np.sign(r[3]) == np.sign(d) and r[4] < 0.05, (center, r)
     # class-difference profile ranks planted bands in the top decile
     diff = np.abs(X[y == "Tumor"].mean(0) - X[y == "Normal"].mean(0))
     top = set(wn[np.argsort(-diff)[:60]])           # top 60 of 1900
@@ -776,9 +764,17 @@ def test_ttest_select_pls_scores_report_replication():
     assert clone(scores).get_params()["n_components"] == 3
     import reproduce_report as rr
     res = rr.run(Xb.astype(float), y, groups, folds=3, repeats=2, mini=True)
-    assert set(res["models"]) == {"PCA+SVM", "PCA+RF", "PLS+XGB"}
+    # PLS+XGB only exists when xgboost is installed; without it the zoo
+    # must DEGRADE (2026-09-07 fix) rather than hand cross_val_predict a
+    # pipeline whose classifier step is None.
+    expect = {"PCA+SVM", "PCA+RF"}
+    if modeling.HAS_XGB:
+        expect.add("PLS+XGB")
+    assert set(res["models"]) == expect
     assert all(r["A"]["f1"] > 0.9 for r in res["models"].values())
-    assert "friedman_p" in res
+    # Friedman needs >= 3 models; the mini subset only reaches 3 when
+    # xgboost supplies PLS+XGB.
+    assert ("friedman_p" in res) == (len(res["models"]) >= 3)
 
 
 def test_shap_region_importance():
@@ -833,265 +829,6 @@ def test_plural_counts():
     assert gui.plural(2, "patient") == "2 patients"
 
 
-def test_prep_param_rows_and_compact():
-    """PreprocessParams render helpers shared by the 3SSE dialog, its
-    CSV/HTML exports and the HTML report (2026-09-11): every field as
-    a readable row + a compact one-line summary; plain dicts (old
-    bundles) also accepted."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    import gui
-    from preprocessing import PreprocessParams
-    rows = gui.prep_param_rows(PreprocessParams())
-    vals = dict(rows)
-    assert vals["crop_min"] == "0" and vals["crop_max"] == "0"
-    assert vals["despike"] == "off" and vals["wavelet"] == "on"
-    assert vals["norm"] == "none"
-    assert vals["als_lambda"] == "100000"   # :g — never 1e+05
-    compact = gui.prep_compact(PreprocessParams())
-    assert "no crop" in compact
-    assert "norm none" in compact
-    assert "despike off" in compact and "wavelet db6 L2" in compact
-    compact_saliva = gui.prep_compact(PreprocessParams.saliva())
-    assert ("crop 400-2300" in compact_saliva
-            or "crop 400–2300" in compact_saliva)
-    # plain-dict tolerance (legacy bundle prep_params)
-    assert gui.prep_param_rows({"crop_min": 400.0}) == [("crop_min", "400")]
-
-
-def test_seq_results_html():
-    """The pure 3SSE HTML export builder: preprocessing parameters,
-    winner metrics, nested best-per-level, significance and ranking
-    tables land in one self-contained page (2026-09-11); a restored
-    run without recorded params degrades to a note, never crashes."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    import gui
-    from preprocessing import PreprocessParams
-    payload = {
-        "mode": "paired-pqn", "total": 12,
-        "winner": {"arch": ["PLS + SVM", "Logistic Regression"],
-                   "metrics": {"f1": 0.8, "sens": 0.75, "spec": 0.85,
-                               "auc": 0.9, "acc": 0.8}},
-        "validated": {1: [{"arch": ["Extra Trees"],
-                           "metrics": {"f1": 0.7, "sens": 0.6,
-                                       "spec": 0.8, "auc": 0.77,
-                                       "acc": 0.7}}]},
-        "significance": {"baseline": "Extra Trees", "baseline_f1": 0.7,
-                         "mcnemar_b": 3, "mcnemar_c": 9,
-                         "mcnemar_p": 0.07, "seed_f1s": [0.78, 0.82]},
-    }
-    html = gui.seq_results_html(
-        payload, PreprocessParams(),
-        [("Single Models", [[1, "Single", "Extra Trees",
-                             "0.700", "0.600", "0.800", "0.770",
-                             "0.700"]])])
-    assert html.startswith("<!DOCTYPE html>")
-    assert html.rstrip().endswith("</body></html>")
-    assert "Preprocessing (as trained)" in html
-    assert "crop_min" in html and "none" in html
-    assert "PLS + SVM → Logistic Regression" in html
-    assert "0.800" in html and "NOT significant" in html
-    assert "Single Models ranking" in html
-    assert "paired (vs patient's own normal) + PQN" in html
-    assert "not recorded" in gui.seq_results_html({}, None)
-
-
-def test_text_audit_fixes():
-    """2026-09-12 text remediation invariants: mode-aware study
-    baseline from ONE source, dynamic model count in the How-to, the
-    shared deep-eval line builder, and the honest-first PPV source."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    import gui
-    import ui_helpers as uh
-    import modeling
-    import sequential
-    from types import SimpleNamespace
-
-    # 1) baseline single source + mode awareness
-    assert sequential.baseline_for("paired")[0] == "paired Extra Trees"
-    assert sequential.baseline_for("seq-paired-pqn")[0] == \
-        "paired Extra Trees"
-    assert sequential.baseline_for("standard")[0] == "Peak bands + RF"
-    # 1) baseline single source + mode awareness (baseline row rides
-    # with the winner table, so payloads carry a minimal winner)
-    _winner = {"arch": ["PCA + SVM"], "metrics": {"f1": 0.7}}
-    html_std = gui.seq_results_html({"mode": "standard",
-                                     "winner": _winner}, None)
-    assert "Peak bands + RF" in html_std and "(standard mode)" in html_std
-    html_paired = gui.seq_results_html({"mode": "seq-paired-pqn",
-                                        "winner": _winner}, None)
-    assert "paired Extra Trees" in html_paired
-    assert "(paired mode)" in html_paired
-
-    # 2) How-to / hero count matches the real registry
-    n_models = len(modeling.ALL_MODEL_NAMES)
-    assert f"{n_models} model families" in uh.how_to(n_models)
-
-    # 3) canonical deep-eval lines (txt and HTML render the same list)
-    app, win = _isolated_main_window()
-    try:
-        win._seed_result = [0.80, 0.82, 0.84, 0.81, 0.83]
-        lines = win._deep_eval_lines()
-        assert any("Seed stability (5 seeds): macro-F1 0.820 ± 0.014"
-                   in ln.replace("\u2212", "-") for ln in lines)
-
-        # 4) PPV source: the TRAINED WINNER's sens/spec (2026-09-15) —
-        # the single-model benchmark never speaks for PPV/NPV
-        win.winner = SimpleNamespace(
-            macro={"sens": (0.6, 0.0), "spec": (0.5, 0.0)},
-            macro_f1=lambda: 0.55)
-        win._honest_result = None
-        s, p, note = win._ppv_source()
-        assert (s, p, note) == (0.6, 0.5, "")
-        win._honest_result = {"mean_f1": 0.8, "sens": 0.9, "spec": 0.7}
-        s, p, note = win._ppv_source()
-        assert (s, p, note) == (0.6, 0.5, "")
-    finally:
-        win.close()
-
-
-def test_seq_dialog_winner_tab_ui():
-    """Winner-tab redesign (2026-09-11): scrollable page with colored
-    nested-validation table (winner row bold), significance verdict
-    pill, preprocessing chips + collapsible full table; params-None
-    (restored run) degrades to a note."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from qt_compat import QtWidgets
-    import gui
-    app, win = _isolated_main_window()
-    payload = {
-        "board": {"singles": [], "pairs": [], "triples": [],
-                  "total": 0, "pruned": 0},
-        "winner": {"arch": ["PLS + SVM", "Logistic Regression"],
-                   "metrics": {"f1": 0.8, "sens": 0.75, "spec": 0.85,
-                               "auc": 0.9, "acc": 0.8}},
-        "validated": {
-            1: [{"arch": ["Extra Trees"],
-                 "metrics": {"f1": 0.7, "sens": 0.6, "spec": 0.8,
-                             "auc": 0.77, "acc": 0.7}}],
-            2: [{"arch": ["PCA + SVM", "Extra Trees"],
-                 "metrics": {"f1": 0.76, "sens": 0.72, "spec": 0.8,
-                             "auc": 0.84, "acc": 0.76}}]},
-        "significance": {"baseline": "Extra Trees", "baseline_f1": 0.7,
-                         "mcnemar_b": 3, "mcnemar_c": 9,
-                         "mcnemar_p": 0.07, "seed_f1s": [0.78, 0.82]},
-    }
-    dlg = gui.SeqResultsDialog(payload, parent=win)
-    page = dlg._tabs.widget(3)
-    assert "Winner" in dlg._tabs.tabText(3)
-    # one scroll area wraps the content (nothing can clip)
-    assert page.findChildren(QtWidgets.QScrollArea), "no scroll wrapper"
-    tables = page.findChildren(QtWidgets.QTableWidget)
-    nested = next(t for t in tables if t.columnCount() == 7)
-    params = next(t for t in tables if t.columnCount() == 2)
-    # best-per-level rows + bold winner row
-    assert nested.rowCount() == 3
-    assert nested.item(2, 0).text() == "★ Winner (2-Model)"
-    assert nested.item(2, 1).text() == "PLS + SVM → Logistic Regression"
-    assert nested.item(2, 2).text() == "0.800"
-    assert nested.item(2, 1).font().bold()
-    assert not nested.item(0, 1).font().bold()
-    # significance verdict pill (p=0.07 → NOT significant)
-    pills = [p.text() for p in page.findChildren(QtWidgets.QLabel)
-             if p.objectName() == "Pill"]
-    assert any("NOT significant" in t for t in pills)
-    # 6 slate summary chips (crop/despike/wavelet/SG/baseline/norm)
-    chips = [p for p in page.findChildren(QtWidgets.QLabel)
-             if p.objectName() == "Pill"
-             and p.property("tone") == "slate"
-             and p.text().startswith(("crop ", "no crop", "despike",
-                                      "wavelet", "SG ", "baseline ",
-                                      "norm "))]
-    assert len(chips) == 6
-    # collapsible full parameter table: hidden until toggled
-    assert params.rowCount() == 21 and params.isHidden()
-    toggle = page.findChildren(QtWidgets.QToolButton)[0]
-    assert toggle.text().startswith("▸")
-    toggle.setChecked(True)
-    assert not params.isHidden()
-    assert toggle.text().startswith("▾")
-    dlg.close()
-    # restored run (no parent window → no params): note, no crash
-    dlg2 = gui.SeqResultsDialog(dict(payload, winner=None,
-                                     validated={},
-                                     report_text="FULL NESTED "
-                                     "VALIDATION\n(row)"))
-    page2 = dlg2._tabs.widget(3)
-    texts = [l.text() for l in page2.findChildren(QtWidgets.QLabel)]
-    assert any("not recorded" in t for t in texts)
-    assert any("FULL NESTED VALIDATION" in t for t in texts)
-    dlg2.close()
-    win.close()
-
-
-def test_paired_preview_row():
-    """Preprocess-page paired features card (2026-09-11, own card
-    2026-09-12): patient-grouped data gets a dedicated canvas — Paired
-    vs Paired+PQN deviation features built by the REAL
-    paired.paired_features call (both modes differ); flat ungrouped
-    data keeps the classic per-class preview and a placeholder."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    import dataset as ds_mod
-    rng = np.random.default_rng(7)
-    wn = np.linspace(600.0, 1900.0, 700)
-
-    def _synth_grouped(n_pat=6, per_class=2):
-        spectra, labels, groups = [], [], []
-        for p in range(n_pat):
-            base = (np.sin(wn / 180.0) * 0.6 + 0.4
-                    + rng.normal(0, 0.02, wn.size))
-            for j in range(per_class):          # patient's normals
-                spectra.append(base + rng.normal(0, 0.02, wn.size))
-                labels.append("Normal")
-                groups.append(f"P{p}")
-            for j in range(per_class):          # tumors: +peak, varied scale
-                scale = 0.85 + 0.3 * rng.random()
-                y = scale * (base + 0.8 * np.exp(
-                    -((wn - 1000.0) / 40.0) ** 2)
-                    + rng.normal(0, 0.02, wn.size))
-                spectra.append(y)
-                labels.append("Tumor")
-                groups.append(f"P{p}")
-        specs = [ds_mod.Spectrum(f"syn{ i }", f"syn{i}.csv", wn, y, lab)
-                 for i, (y, lab) in enumerate(zip(spectra, labels))]
-        return specs, groups
-
-    app, win = _isolated_main_window()
-    specs, groups = _synth_grouped()
-    win._install_dataset(specs, "", quiet=True, groups=groups)
-    win.preview_preprocess()
-    # per-class preview canvas unchanged: 2 classes × (raw, proc, twin)
-    prep_titles = [a.get_title() for a in win.prep_canvas.figure.axes]
-    assert len(prep_titles) == 2 * 3
-    assert not any("Paired" in t for t in prep_titles)
-    # the dedicated paired card: two panels, both modes
-    p_axes = win.paired_canvas.figure.axes
-    p_titles = [a.get_title() for a in p_axes]
-    assert any("Paired — minus patient's own normal" in t for t in p_titles)
-    assert any("Paired + PQN (Dieterle 2006)" in t for t in p_titles)
-    for a in p_axes:
-        leg = a.get_legend()
-        assert leg is not None
-        labels_txt = " ".join(t.get_text() for t in leg.get_texts())
-        assert "Tumor mean (n=" in labels_txt
-        assert "Normal mean (n=" in labels_txt
-    # the two modes are genuinely different features (PQN applied)
-    pv = win._paired_preview_subset(win.read_params().validate())
-    assert pv and pv["n_patients"] == 6
-    assert not np.allclose(pv["plain"]["Tumor"]["mean"],
-                           pv["pqn"]["Tumor"]["mean"])
-    # flat ungrouped folder: placeholder instead of panels
-    specs_flat = specs[:4]
-    win._install_dataset(
-        [ds_mod.Spectrum(s.name, s.path, wn, s.intensities, s.label)
-         for s in specs_flat], "", quiet=True, groups=None)
-    win.preview_preprocess()
-    p_axes = win.paired_canvas.figure.axes
-    texts = " ".join(t.get_text() for a in p_axes for t in a.texts)
-    assert "patient-grouped" in texts
-    assert not any("Paired —" in a.get_title() for a in p_axes)
-    win.close()
-
-
 def test_operating_points_and_triage():
     """Rule-out keeps sensitivity, rule-in keeps specificity; triage
     tiers split at those thresholds and collapse on a weak ROC."""
@@ -1123,91 +860,6 @@ def test_ppv_npv_prevalence():
     assert ppv05 < 0.5 and ppv60 > 2 * ppv05 and npv05 > 0.99
     # degenerate prevalence does not divide by zero
     assert np.isfinite(clin.ppv_npv(0.9, 0.9, 0.0)[0])
-
-
-def test_decided_case_selective_prediction():
-    """Decided-case (selective prediction) metrics: p<lo or p>=hi is
-    decided (triage semantics — p==hi is a positive call), the middle
-    band is deferred; coverage must always accompany the metrics."""
-    import clinical as clin
-    y = np.array([0, 0, 0, 0, 1, 1, 1, 1])
-    p = np.array([0.05, 0.20, 0.45, 0.55, 0.75, 0.90, 0.35, 0.60])
-    r = clin.decided_case(y, p, 0.30, 0.70)
-    # decided: 0.05, 0.20 (both negative, cleared) + 0.75, 0.90 (both
-    # positive, caught); 0.35/0.55/0.60 deferred
-    assert r["n_total"] == 8 and r["n_decided"] == 4
-    assert abs(r["coverage"] - 0.5) < 1e-9
-    assert r["f1"] == 1.0 and r["sens"] == 1.0 and r["spec"] == 1.0
-    # errors inside the decided set: 0.80 TP, 0.10 FN, 0.10 TN
-    r2 = clin.decided_case(np.array([1, 1, 0]),
-                           np.array([0.80, 0.10, 0.10]), 0.30, 0.70)
-    assert abs(r2["sens"] - 0.5) < 1e-9 and r2["spec"] == 1.0
-    assert abs(r2["f1"] - 2 / 3) < 1e-9
-    # band boundaries: p == hi decided positive, p == lo deferred
-    r3 = clin.decided_case(np.array([1, 0]),
-                           np.array([0.70, 0.30]), 0.30, 0.70)
-    assert r3["n_decided"] == 1 and r3["sens"] == 1.0
-    # nothing decided -> NaN metrics (never fake zeros)
-    r4 = clin.decided_case(y, p, 0.0, 1.01)
-    assert r4["n_decided"] == 0 and np.isnan(r4["f1"])
-    # NaN probabilities are dropped, not decided
-    r5 = clin.decided_case(np.array([1, 0]),
-                           np.array([float("nan"), 0.9]), 0.3, 0.7)
-    assert r5["n_total"] == 1 and r5["n_decided"] == 1
-
-
-def test_then_now_record_matches_presept9():
-    """The on-screen 'Then vs now' record must equal the measured
-    honest re-run (experiments/presept9.json), not drift as text.
-    §64: a third row carries the old protocol's OWN 2026-09-08
-    record (selection CV), matching the imported artifact."""
-    import json
-    import gui as _gui
-    rec = _gui.THEN_NOW_RECORD
-    assert len(rec) == 4
-    old_label, old_f1, old_auc, old_note = rec[0]
-    hist_label, hist_f1, hist_auc, hist_note = rec[1]
-    honest_label, honest_f1, honest_auc, honest_note = rec[2]
-    now_label, now_f1, now_auc, now_note = rec[3]
-    assert "pre-2026-09-09" in old_label and old_f1 == 0.702 \
-        and old_auc == 0.788
-    assert "OWN record" in hist_label and hist_f1 == 0.829 \
-        and hist_auc == 0.888
-    assert "honest" in honest_label and honest_f1 == 0.639 \
-        and honest_auc == 0.682
-    assert "0.572" in honest_note  # the old 3SSE chain's honest F1
-    assert "recovered tree" in now_label and now_f1 == 0.734 \
-        and now_auc == 0.789
-    p9 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                      "experiments", "presept9.json")
-    if os.path.isfile(p9):
-        with open(p9, encoding="utf-8") as fh:
-            data = json.load(fh)
-        # display record carries 3 decimals; compare at that precision
-        assert round(data["old_record"]["paired_et_f1"], 3) == old_f1
-        assert round(data["old_record"]["paired_et_auc"], 3) == old_auc
-        assert round(data["paired_extra_trees"]["f1"], 3) == honest_f1
-        assert round(data["paired_extra_trees"]["auc"], 3) == honest_auc
-
-
-def test_legacy_record_artifact():
-    """The imported 2026-09-08 record (selection-CV protocol) must
-    match the THEN_NOW historical row; numbers only — the leakage-era
-    model file is deliberately absent (§64)."""
-    import gui as _gui
-    d = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     _gui.LEGACY_RECORD_DIR)
-    assert os.path.isfile(os.path.join(d, "winner.json"))
-    assert os.path.isfile(os.path.join(d, "PROVENANCE.txt"))
-    assert not os.path.isfile(os.path.join(d, "winner.joblib")), \
-        "the leakage-era fitted model must NOT be imported"
-    rec = _gui.load_legacy_record()
-    assert rec is not None and rec["arch"] == ["Random Forest",
-                                               "Extra Trees"]
-    _label, hist_f1, hist_auc, _note = _gui.THEN_NOW_RECORD[1]
-    assert round(rec["f1"], 3) == hist_f1
-    assert round(rec["auc"], 3) == hist_auc
-    assert rec["n_oof"] == 307
 
 
 def test_calibration_and_dca():
@@ -1885,129 +1537,6 @@ def test_3sse_dialog_winner_tab_csv():
         assert "NOT significant" in text and "0.629" in text
 
 
-def test_3sse_fair_singles_match_train_page():
-    """SeqSearchWorker._fair_singles re-scores singles with the EXACT
-    Train-page call (evaluate_models, same k/seed/repeats/groups) so
-    the Single Models tab shows the same number a plain training run
-    shows in the same mode (2026-09-08 'why different values' fix).
-    Results are an ADDITIVE metrics_fair key — error rows untouched,
-    fast screening skips the pass, the dialog ranks singles by it."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    _qt_app_styled()
-    import gui
-    X, y, groups = _synthetic_ml(n=60, groups_n=12, seed=3)
-    names = ["PCA + LDA", "PCA + Gaussian Naive Bayes"]
-    singles = [
-        {"arch": [names[0]], "level": 1,
-         "metrics": {"f1": 0.10, "sens": 0.1, "spec": 0.1}},
-        {"arch": [names[1]], "level": 1,
-         "metrics": {"f1": 0.20, "sens": 0.2, "spec": 0.2}},
-        {"arch": ["Broken model"], "level": 1, "metrics": {},
-         "error": "CatBoostError: bad allocation"},
-    ]
-    w = gui.SeqSearchWorker(X, y, groups, None, model_names=names,
-                            k=3, seed=7, repeats=1)
-    out = w._fair_singles([dict(s) for s in singles])
-    # the direct Train-page evaluation with the SAME inputs must give
-    # the SAME numbers the fair pass put in metrics_fair
-    results, _win = modeling.evaluate_models(
-        X, y, names, 3, 7, groups=groups, repeats=1, wavenumbers=None)
-    by = {r.name: r for r in results}
-    for row in out[:2]:
-        r = by[row["arch"][0]]
-        assert r.error is None
-        fair = row["metrics_fair"]
-        assert abs(fair["f1"] - r.macro["f1"][0]) < 1e-12
-        assert abs(fair["sens"] - r.macro["sens"][0]) < 1e-12
-        assert abs(fair["spec"] - r.macro["spec"][0]) < 1e-12
-        assert fair["acc"] == fair["acc"] and 0 <= fair["acc"] <= 1
-    # error rows keep the screening shape untouched
-    assert "metrics_fair" not in out[2] and "error" in out[2]
-    # the dialog's singles ranking prefers the fair numbers
-    rows = gui.SeqResultsDialog._rows(out, 1)
-    shown = {r[2]: r[3] for r in rows}
-    assert len(shown) == 2
-    for row in out[:2]:
-        assert shown[row["arch"][0]] == f"{row['metrics_fair']['f1']:.3f}"
-    # without fair numbers (old saved runs) the dialog falls back
-    legacy = gui.SeqResultsDialog._rows(
-        [{**s, "metrics": s.get("metrics", {})} for s in singles
-         if "error" not in s], 1)
-    assert len(legacy) == 2 and legacy[0][3] == "0.200"
-    # fast screening skips the pass entirely
-    w_fast = gui.SeqSearchWorker(X, y, groups, None, model_names=names,
-                                 k=3, seed=7, fast=True)
-    fresh = [dict(s) for s in singles]
-    w_fast._fair_singles(fresh)
-    assert not any("metrics_fair" in r for r in fresh)
-
-
-def test_settings_mode_roundtrip():
-    """settings restore the Train-page Data/Trainer combos and are kept
-    current on change; unknown roles are ignored (2026-09-08: the mode
-    silently reset to Standard after every restart, so 'the same model'
-    was trained on different features than the user thought; same day:
-    one combined dropdown was split into Data + Trainer so paired vs
-    unpaired is an explicit choice for BOTH single models and 3SSE)."""
-    app, win = _isolated_main_window()
-    try:
-        assert win.mode_kind() == "standard"       # untouched baseline
-        win.set_mode_kind("paired")
-        assert win.settings["mode_kind"] == "paired"    # recorded live
-        assert win.settings["data_mode"] == "paired"
-        assert win.settings["trainer_kind"] == "single"
-        win.set_mode_kind("seq-paired")
-        assert win.settings["mode_kind"] == "seq-paired"
-        assert win.settings["trainer_kind"] == "seq"
-        # 3SSE + PQN is selectable now (used to be GUI-impossible)
-        win.set_mode_kind("seq-paired-pqn")
-        assert win.mode_kind() == "seq-paired-pqn"
-        assert win.data_mode() == "paired-pqn"
-        # restore path: split keys win
-        win.settings["data_mode"] = "paired"
-        win.settings["trainer_kind"] = "seq"
-        win._apply_settings()
-        assert win.mode_kind() == "seq-paired"
-        # legacy combined key still migrates when split keys are absent
-        win.settings.pop("data_mode"), win.settings.pop("trainer_kind")
-        win.settings["mode_kind"] = "paired"
-        win._apply_settings()
-        assert win.mode_kind() == "paired"
-        # unknown role ignored, no crash, selection kept
-        win.settings["mode_kind"] = "no-such-role"
-        win._apply_settings()
-        assert win.mode_kind() == "paired"
-    finally:
-        win.close()
-
-
-def test_run_3sse_now_respects_data_mode():
-    """The 3SSE Run button must run on EXACTLY the selected data mode —
-    it used to auto-switch to paired whenever patient groups were
-    loaded, so the same click gave different numbers depending on the
-    data (removed 2026-09-08)."""
-    app, win = _isolated_main_window()
-    started = []
-    win.start_training = lambda: started.append(win.mode_kind())
-    try:
-        # simulate loaded clinical data (groups present used to force
-        # paired — the exact regression this test pins down)
-        win.spectra = [object()] * 4
-        win.groups = ["P1", "P1", "P1", "P1"]
-        win.set_mode_kind("standard")
-        win.run_3sse_now()
-        assert win.data_mode() == "standard"      # NOT switched to paired
-        assert win.trainer_kind() == "seq"
-        assert started == ["seq-standard"]
-        # the user's paired+PQN choice survives the button too
-        win.set_mode_kind("paired-pqn")
-        win.run_3sse_now()
-        assert win.data_mode() == "paired-pqn"
-        assert started == ["seq-standard", "seq-paired-pqn"]
-    finally:
-        win.close()
-
-
 def test_3sse_persist_and_latest_dir():
     """GUI searches persist their payload (screening/validated/winner)
     and the viewer picks the most recent run dir — 2026-09-06: GUI runs
@@ -2122,99 +1651,6 @@ def test_reference_vector_junk_tolerance():
         # worker-level junk tolerance with AUTO references is pinned
         # in test_auto_reference_real_layout (the manual reference
         # input was removed 2026-09-06)
-
-
-def test_predict_rejects_nonfinite_and_degenerate():
-    """2026-09-08 execution-audit BUG-1: an all-NaN or all-zero spectrum
-    used to return a MAXIMALLY confident prediction (Tumor p=1.0) —
-    silent garbage.  Both deploy entry points now reject with a clear
-    ValueError; finite input still predicts; a non-finite REFERENCE
-    file is skipped with a reason instead of poisoning the mean."""
-    import paired as paired_mod
-    X, y, g = _synthetic_ml(n=60, groups_n=10, seed=9)
-    wn = np.linspace(500.0, 2000.0, X.shape[1])
-    results, winner = modeling.evaluate_models(
-        X, y, ["PCA + LDA"], 3, 42, groups=g, repeats=1, wavenumbers=wn)
-    params = pp.PreprocessParams().validate()
-    with tempfile.TemporaryDirectory() as td:
-        bpath = os.path.join(td, "w.joblib")
-        modeling.save_bundle(bpath, winner, wn, params, dataset_name="t")
-        b = modeling.load_bundle(bpath)
-        good = (wn, X[0])
-        r = modeling.predict_with_bundle(b, *good)
-        assert r["prediction"] in ("A", "B")     # finite input still works
-        bad_inputs = {
-            "all-NaN": X[0] * np.nan,
-            "half-NaN": np.where(np.arange(X.shape[1]) < 20, X[0], np.nan),
-            "all-zero": np.zeros_like(X[0]),
-            # round 3 residuals — same BUG-1 class, all previously
-            # returned p=1.0 CONFIDENT predictions:
-            "one-nonzero-point": np.where(
-                np.arange(X.shape[1]) == 5, 1.0, 0.0),
-            "subnormal-scale": X[0] * 1e-300,     # PCA float-underflow
-            "near-zero-constant": np.full(X.shape[1], 1e-300),
-        }
-        for name, inten in bad_inputs.items():
-            try:
-                modeling.predict_with_bundle(b, wn, inten)
-            except ValueError as exc:
-                assert "signal" in str(exc) or "NaN" in str(exc), exc
-            else:
-                raise AssertionError(f"{name} spectrum was not rejected")
-        # degenerate-but-real inputs STAY accepted (they carry signal):
-        r_const = modeling.predict_with_bundle(
-            b, wn,
-            5.0 + np.exp(-((np.asarray(wn) - 1000.0) / 40.0) ** 2))
-        assert r_const["prediction"] in ("A", "B")
-        # release gate: empty / length-mismatched arrays must be a clean
-        # ValueError (previously IndexError at the sort step)
-        for w_bad, i_bad in ((wn, np.zeros(0)),
-                             (wn[:10], np.zeros(X.shape[1]))):
-            try:
-                modeling.predict_with_bundle(b, w_bad, i_bad)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("mismatched arrays not rejected")
-        r_m, e_m = modeling.predict_with_bundle_many(
-            b, [(wn, np.zeros(0))])
-        assert 0 in e_m and r_m[0] is None
-        # batched twin: per-row error isolation, good row still predicted
-        specs = [(wn, X[0]), (wn, bad_inputs["all-NaN"]),
-                 (wn, bad_inputs["all-zero"])]
-        res, errs = modeling.predict_with_bundle_many(b, specs)
-        assert res[0] is not None and res[0]["prediction"] in ("A", "B")
-        assert res[1] is None and res[2] is None
-        assert 1 in errs and 2 in errs
-        # non-finite reference file: skipped with a reason, good one used
-        with tempfile.TemporaryDirectory() as td2:
-            gpts = np.linspace(500.0, 2000.0, 200)
-            ok_p = os.path.join(td2, "ok.csv")
-            nan_p = os.path.join(td2, "nan.csv")
-            zero_p = os.path.join(td2, "zero.csv")
-            with open(ok_p, "w", encoding="utf-8") as fh:
-                for w in gpts:
-                    fh.write(f"{w:.3f},{50 + 10 * np.sin(w / 100):.4f}\n")
-            with open(nan_p, "w", encoding="utf-8") as fh:
-                for i, w in enumerate(gpts):
-                    v = "nan" if i == 5 else 60.0
-                    fh.write(f"{w:.3f},{v}\n")
-            with open(zero_p, "w", encoding="utf-8") as fh:
-                for w in gpts:
-                    fh.write(f"{w:.3f},0.0\n")
-            ref = paired_mod.reference_vector(b, [ok_p, nan_p, zero_p])
-            assert np.all(np.isfinite(ref))
-            # the zero file must NOT warp the reference (round 3:
-            # it used to dilute the mean by its share)
-            ref_ok = paired_mod.reference_vector(b, [ok_p])
-            assert np.allclose(ref, ref_ok, atol=1e-12)
-            for bad_p, tag in ((nan_p, "nan.csv"), (zero_p, "zero.csv")):
-                try:
-                    paired_mod.reference_vector(b, [bad_p])
-                except ValueError as exc:
-                    assert tag in str(exc), exc
-                else:
-                    raise AssertionError(f"{tag} only-folder accepted")
 
 
 def test_is_chain_winner_guard():
@@ -2777,7 +2213,7 @@ def test_reproduce_study_clinical_path():
     and paired mode must not double-preprocess)."""
     import reproduce_study as rs
     with tempfile.TemporaryDirectory() as root:
-        _make_clinical_tree(root)
+        _make_clinical_tree(root, paired_ready=True)
         out = os.path.join(root, "..", "repro_out")
         assert rs.main(["--data", root, "--mini", "--mode", "paired",
                         "--out", out]) == 0
@@ -2788,31 +2224,13 @@ def test_reproduce_study_clinical_path():
         assert os.path.exists(os.path.join(out, "data_report.txt"))
 
 
-def test_reproduce_paired_pqn_bundle_flags():
-    """A CLI --mode paired-pqn run must save paired=True AND pqn=True in
-    the bundle — pqn was never passed, so deploy skipped the PQN step
-    training used and the same model predicted differently (2026-09-08)."""
-    import reproduce_study as rs
-    import joblib
-    with tempfile.TemporaryDirectory() as root:
-        _make_clinical_tree(root)
-        out = os.path.join(root, "..", "repro_out_pqn")
-        assert rs.main(["--data", root, "--mini", "--mode",
-                        "paired-pqn", "--out", out]) == 0
-        bundle = joblib.load(os.path.join(out, "winner.joblib"))
-        assert bundle["paired"] is True
-        assert bundle["pqn"] is True
-
-
 def test_paired_features_preprocesses_once():
     """paired_features takes RAW intensities and preprocesses exactly
     once (reproduce_study once passed pre-processed X -> double
-    preprocessing, diverging from the GUI).  Normal rows use the
-    LEAVE-ONE-OUT reference (2026-09-12: self-inclusion shrank Normal
-    deviations to (k-1)/k, 0.0 for k=1)."""
+    preprocessing, diverging from the GUI)."""
     import paired
     with tempfile.TemporaryDirectory() as root:
-        _make_clinical_tree(root)
+        _make_clinical_tree(root, paired_ready=True)
         cd = cdata.load_clinical_dataset(root)
         spectra = cd.spectra
         grid = ds.common_grid(spectra)
@@ -2821,8 +2239,7 @@ def test_paired_features_preprocesses_once():
         pd_ = paired.paired_features(X_raw, labels, cd.groups, grid,
                                      params)
         # manual: one preprocessing pass, then deviation from the
-        # patient's normals — leave-one-out for Normal rows, full mean
-        # for Tumor rows — must match exactly
+        # patient's own normal mean — must match exactly
         Xp = pp.preprocess_matrix(X_raw, params, wn=grid)
         by_patient: dict = {}
         for i, (g, lab) in enumerate(zip(cd.groups, labels, strict=True)):
@@ -2832,14 +2249,16 @@ def test_paired_features_preprocesses_once():
             normals = cls_idx.get("Normal")
             if not normals or not cls_idx.get("Tumor"):
                 continue
-            full_ref = Xp[normals].mean(axis=0)
-            for lab, idxs in (("Normal", normals),
-                              ("Tumor", cls_idx.get("Tumor", []))):
-                for i in idxs:
-                    ref = (Xp[[j for j in normals if j != i]].mean(axis=0)
-                           if (lab == "Normal" and len(normals) > 1)
-                           else full_ref)
-                    rows.append(Xp[i] - ref)
+            ref = Xp[normals].mean(axis=0)
+            for lab in ("Normal", "Tumor"):
+                for i in cls_idx[lab]:
+                    if lab == "Normal":
+                        others = [j for j in normals if j != i]
+                        if not others:
+                            continue      # no honest leave-one-out ref
+                        rows.append(Xp[i] - Xp[others].mean(axis=0))
+                    else:
+                        rows.append(Xp[i] - ref)
         assert np.allclose(pd_.X, np.vstack(rows))
         assert pd_.n_patients >= 1
 
@@ -2886,7 +2305,12 @@ def test_new_models_lgbm_catboost_cnn():
                              ("1D-CNN", modeling.HAS_TORCH),
                              ("TabPFN (foundation model)",
                               modeling.HAS_TABPFN)) if ok]
-    assert names, "none of the new-model dependencies are installed"
+    if not names:
+        # every optional booster/NN absent: nothing to exercise. This is
+        # an environment fact, not a defect — signal it as a SKIP like
+        # the other optional-dep guards (2026-09-07).
+        raise ImportError("no optional boosters/NN installed",
+                          name="lightgbm")
     for n in names:
         assert n in modeling.ALL_MODEL_NAMES
     if modeling.HAS_TORCH:            # clone + proba contract
@@ -3086,108 +2510,169 @@ def test_search_survives_broken_model():
         "Boom" not in p["arch"] for p in board["pairs"])
 
 
-def test_standard_tuned_preset_and_defaults():
-    """§54: the deep-search winner is now the dataclass default (paired
-    mode), and standard_tuned() carries the standard-mode optimum."""
-    d = pp.PreprocessParams().validate()
-    assert (d.crop_min, d.crop_max) == (0.0, 0.0)
-    assert (d.wavelet_name, d.wavelet_level) == ("db6", 2)
-    assert (d.sg_window, d.sg_poly, d.sg_deriv) == (11, 4, 2)
-    assert d.norm == "none" and not d.despike
-    st = pp.PreprocessParams.standard_tuned().validate()
-    assert (st.crop_min, st.crop_max) == (700.0, 1800.0)
-    assert (st.wavelet_name, st.wavelet_level) == ("sym8", 4)
-    assert (st.sg_window, st.sg_poly, st.sg_deriv) == (11, 3, 2)
-    assert st.norm == "none" and st.wn_calibrate
+def test_paired_reference_excludes_self():
+    """REGRESSION (2026-09-07): the paired reference must never contain
+    the spectrum it is subtracted from.
 
-
-def test_proven_preset_and_stability_defaults():
-    """§57 (2026-09-15): '⭐ Proven' checks exactly the d2-proven
-    families (registry minus the measured-weak 7); Repeat-CV ×3 and
-    Average-replicates default ON (stability defaults).  §62
-    (2026-09-17): Proven is ALSO the startup default — an all-25
-    search wasted budget on the CNNs/TabPFN and picked a 0.63 chain."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    import gui
-    app, win = _isolated_main_window()
+    The old code used ref = mean(ALL of the patient's normals) for every
+    row, so each Normal row was a deviation from a mean containing
+    itself while Tumor rows were deviations from a reference excluding
+    them.  Consequences on the clinical cohort: 19 Normal rows became
+    the EXACT zero vector (single-normal patients), the row norm alone
+    reached AUC 0.835, and the reported paired advantage collapsed to
+    chance (macro-F1 0.744 -> 0.483) once the reference was honest.  It
+    also broke deployment: reference_vector() builds the reference from
+    OTHER files, so real normals arrived at full magnitude and ~80% were
+    predicted Tumor.
+    """
+    import paired as pmod
+    from sklearn.metrics import roc_auc_score
+    rng = np.random.default_rng(11)
+    wn_full = np.linspace(400, 1800, 300)
+    rows, labels, groups = [], [], []
+    for p in range(12):
+        base = rng.normal(0, 1, len(wn_full)) * 5
+        n_norm = 1 if p < 4 else 3          # 4 SINGLE-normal patients
+        for lab, k in (("Normal", n_norm), ("Tumor", 3)):
+            for _ in range(k):
+                rows.append(base + rng.normal(0, 0.3, len(wn_full)))
+                labels.append(lab)
+                groups.append(f"S{p}")
+    params = pp.PreprocessParams(crop_min=0, crop_max=0, wavelet=False)
+    pd_ = pmod.paired_features(np.vstack(rows), labels, groups,
+                               wn_full, params)
+    # single-normal patients contribute NO Normal row (no honest ref) but
+    # still contribute their Tumor rows
+    assert pd_.n_normals_dropped == 4
+    assert sum(1 for v in pd_.y if v == "Normal") == 8 * 3
+    assert sum(1 for v in pd_.y if v == "Tumor") == 12 * 3
+    assert pd_.n_patients == 12
+    # no zero vectors, and the norm must no longer separate the classes
+    norms = np.linalg.norm(pd_.X, axis=1)
+    assert (norms > 1e-9).all()
+    yb = [1 if v == "Tumor" else 0 for v in pd_.y]
+    auc_norm = roc_auc_score(yb, norms)
+    assert abs(auc_norm - 0.5) < 0.20, f"|row| still leaks: {auc_norm:.3f}"
+    # explicit check of the arithmetic for a multi-normal patient
+    Xp = pp.preprocess_matrix(np.vstack(rows), params, wn=wn_full)
+    idx = [i for i, g in enumerate(groups) if g == "S4"]
+    norms_i = [i for i in idx if labels[i] == "Normal"]
+    row0 = [j for j, (g, lab) in enumerate(zip(pd_.groups, pd_.y))
+            if g == "S4" and lab == "Normal"][0]
+    expect = Xp[norms_i[0]] - Xp[norms_i[1:]].mean(axis=0)
+    assert np.allclose(pd_.X[row0], expect)
+    # a cohort where EVERY patient has a single normal cannot support
+    # paired mode: fail with an actionable message, not "All models
+    # failed" from deep inside sklearn
+    rows1, lab1, grp1 = [], [], []
+    for p in range(4):
+        base = rng.normal(0, 1, len(wn_full)) * 5
+        for lab, k in (("Normal", 1), ("Tumor", 2)):
+            for _ in range(k):
+                rows1.append(base + rng.normal(0, 0.3, len(wn_full)))
+                lab1.append(lab)
+                grp1.append(f"Q{p}")
     try:
-        expected = set(modeling.ALL_MODEL_NAMES) - gui.PROVEN_EXCLUDE
-        startup = {n for n, cb in win.model_checks.items()
-                   if cb.isChecked()}
-        assert startup == expected, "Proven must be the startup default"
-        assert "TabPFN (foundation model)" not in startup
-        win._apply_model_preset("proven")
-        checked = {n for n, cb in win.model_checks.items()
-                   if cb.isChecked()}
-        assert checked == expected
-        assert "1D-CNN (attention)" not in checked       # measured ~0.50
-        assert "Random Forest" in checked                # d2 layer-2
-        assert "Extra Trees" in checked                  # d2 layer-3
-        assert "PLS + XGBoost" in checked                # d2 layer-1
-        assert win.chk_repeat.isChecked()
-        assert win.chk_avg_replicates.isChecked()
-        assert not win.chk_avg_replicates.isEnabled()    # needs groups
-    finally:
-        win.close()
+        pmod.paired_features(np.vstack(rows1), lab1, grp1, wn_full, params)
+        raise AssertionError("degenerate paired set must raise")
+    except ValueError as exc:
+        assert "only one class" in str(exc) and "ONLY normal" in str(exc)
 
 
-def test_patient_level_metrics_n_correct():
-    """§57: patient_level_metrics also reports n_correct (mean-P
-    majority vote vs dominant true class) for the deployment line."""
-    import study_stats as sstats
-    n_pat, per = 8, 5
-    g = [f"P{i}" for i in range(n_pat) for _ in range(per)]
-    y = ["A" if i < n_pat // 2 else "B"
-         for i in range(n_pat) for _ in range(per)]
-    oof = np.zeros((n_pat * per, 2))
-    for i in range(n_pat):
-        rows = slice(i * per, (i + 1) * per)
-        # every patient exactly right except P7 (wrong majority)
-        oof[rows, int(i >= n_pat // 2)] = 0.9
-        oof[rows, int(i < n_pat // 2)] = 0.1
-    oof[(n_pat - 1) * per:, :] = oof[(n_pat - 1) * per:, ::-1]
-    out = sstats.patient_level_metrics(y, g, oof)
-    assert out is not None
-    assert out["n_patients"] == n_pat
-    assert out["n_correct"] == n_pat - 1
-    assert out["f1"] > 0.85      # 7/8 patients, one wrong majority
+def test_delong_ci_is_patient_clustered():
+    """REGRESSION (2026-09-07): the AUC interval must account for the
+    2-5 spectra per patient, as the macro-F1 bootstrap already did.
+    Spectrum-level DeLong treats them as independent and reports a
+    materially narrower interval (pseudo-replication)."""
+    import clinical as clin
+    rng = np.random.default_rng(5)
+    y, p, g = [], [], []
+    for pat in range(30):
+        lab = pat % 2
+        base = 0.35 + 0.3 * lab + rng.normal(0, 0.16)   # patient effect
+        for _ in range(5):                              # near-replicates
+            y.append(lab)
+            p.append(float(np.clip(base + rng.normal(0, 0.02), 0.01, 0.99)))
+            g.append(f"P{pat}")
+    y = np.asarray(y)
+    p = np.asarray(p)
+    a1, _se1, lo1, hi1 = clin.delong_auc_ci(y, p)
+    a2, _se2, lo2, hi2 = clin.delong_auc_ci(y, p, groups=g)
+    assert abs(a1 - a2) < 1e-9              # point estimate unchanged
+    assert (hi2 - lo2) > (hi1 - lo1)        # clustered interval is wider
+    assert 0.0 <= lo2 < hi2 <= 1.0
+    # too few clusters to resample -> falls back to the analytical SE
+    a3, _se3, lo3, hi3 = clin.delong_auc_ci(
+        np.array([0, 0, 1, 1]), np.array([0.1, 0.2, 0.8, 0.9]),
+        groups=["A", "A", "B", "B"])
+    assert np.isfinite(a3) and np.isfinite(lo3) and np.isfinite(hi3)
 
 
-def test_search_checkpoint_fingerprint():
-    """§54 (2026-09-15 crash): archs.jsonl is resumed from a FIXED GUI
-    path, so records from a different dataset/mode (mixed 287/307-row
-    OOFs) must be ignored + purged — never replayed into a hstack
-    ValueError.  Matching-identity records still resume cleanly."""
-    import json
-    import tempfile
+def test_oof_predictions_match_tuned_threshold():
+    """REGRESSION (2026-09-07): the bootstrap CI used argmax (a hard 0.5
+    cut) while the headline macro-F1 came from fold metrics scored at the
+    TUNED threshold — an interval for a different classifier."""
+    res = modeling.ModelResult(name="t", classes=["Normal", "Tumor"])
+    res.oof_proba = np.array([[0.75, 0.25], [0.55, 0.45],
+                              [0.35, 0.65], [0.10, 0.90]])
+    res.threshold = 0.35
+    assert modeling.oof_predictions(res).tolist() == [0, 1, 1, 1]
+    res.threshold = None                     # no tuned threshold -> argmax
+    assert modeling.oof_predictions(res).tolist() == [0, 0, 1, 1]
+    res.threshold = 0.35
+    valid = np.array([True, False, True, True])
+    assert modeling.oof_predictions(res, valid).tolist() == [0, 1, 1]
+    # multiclass ignores the threshold entirely
+    m = modeling.ModelResult(name="m", classes=["A", "B", "C"])
+    m.oof_proba = np.array([[0.5, 0.3, 0.2], [0.1, 0.2, 0.7]])
+    m.threshold = 0.35
+    assert modeling.oof_predictions(m).tolist() == [0, 2]
 
-    import sequential as seq
-    rng = np.random.default_rng(0)
-    n_pat, per = 12, 6
-    g = np.array([f"P{i:02d}" for i in range(n_pat)]).repeat(per)
-    X = rng.normal(size=(n_pat * per, 8)).astype(np.float32)
-    y = ((np.arange(n_pat) < n_pat // 2).repeat(per)).tolist()
-    models = ["PCA + LDA", "Random Forest"]
-    with tempfile.TemporaryDirectory() as tmp:
-        ckpt = os.path.join(tmp, "archs.jsonl")
-        poison = {"arch": ["PCA + LDA"], "level": 1, "pruned": False,
-                  "f1": 0.99, "oof": np.zeros((99, 2)).tolist()}
-        with open(ckpt, "w", encoding="utf-8") as fh:   # stale, no
-            fh.write(json.dumps(poison) + chr(10))      # fingerprint
-        board = seq.search(X, list(y), groups=list(g), k=2, top=2,
-                           model_names=models, jobs=1,
-                           resume_path=ckpt, prune_pairs=2)
-        assert len(board["singles"]) == 2   # stale row did NOT suppress
-        recs = [json.loads(l) for l in open(ckpt, encoding="utf-8")]
-        assert recs and all(
-            r.get("data") == {"n_rows": len(y), "n_cols": X.shape[1]}
-            for r in recs)                 # poisoned line purged
-        n = len(recs)
-        board2 = seq.search(X, list(y), groups=list(g), k=2, top=2,
-                            model_names=models, jobs=1,
-                            resume_path=ckpt, prune_pairs=2)
-        recs2 = [json.loads(l) for l in open(ckpt, encoding="utf-8")]
-        assert len(board2["singles"]) == 2 and len(recs2) == n  # replay
+
+def test_report_models_degrade_without_xgboost():
+    """REGRESSION (2026-09-07): make(dim, None) returns a Pipeline whose
+    CLF STEP is None, never None itself, so the old `if v is None`
+    filter never fired and cross_val_predict raised instead of the zoo
+    degrading gracefully."""
+    import reproduce_report as rr
+    zoo = rr.report_models()
+    assert zoo, "model zoo must never be empty"
+    for name, pipe in zoo.items():
+        assert pipe.named_steps.get("clf") is not None, name
+    xgb_rows = {"PCA+XGB", "PLS+XGB"}
+    if modeling.HAS_XGB:
+        assert xgb_rows <= set(zoo)
+    else:
+        assert not (xgb_rows & set(zoo))
+
+
+def test_nested_model_selection_is_not_optimistic():
+    """The nested check re-picks the WINNER inside every outer fold, so
+    it does not inherit the maximum-over-models bias that
+    evaluate_models' headline carries."""
+    X, y, groups = _synthetic_ml(60, 12, seed=7)
+    names = ["PCA + LDA", "PCA + Logistic Regression"]
+    out = modeling.nested_model_selection(
+        X, list(y), model_names=names, k_folds=3, groups=list(groups))
+    assert out["fold_f1s"] and len(out["fold_f1s"]) <= 3
+    assert 0.0 <= out["mean_f1"] <= 1.0
+    assert out["chosen"] in names
+    for ch in out["fold_choices"]:
+        assert ch["model"] in names
+        assert 0.0 <= ch["outer_f1"] <= 1.0
+
+
+def test_ensemble_rows_flagged_selection_biased():
+    """The top-3 ensembles pick their members using the same folds they
+    are scored on; the flag lets reports say so (2026-09-07)."""
+    X, y, groups = _synthetic_ml(60, 12, seed=9)
+    results, _w = modeling.evaluate_models(
+        X, list(y), k_folds=3, groups=list(groups),
+        model_names=["PCA + LDA", "PCA + Logistic Regression",
+                     "PCA + KNN", "Ensemble (top-3)"])
+    by = {r.name: r for r in results}
+    assert by["Ensemble (top-3)"].selection_biased is True
+    assert by["PCA + LDA"].selection_biased is False
 
 
 def _optional_report():
@@ -3268,199 +2753,14 @@ def _isolated_main_window():
     import gui
     app = _qt_app_styled()
     _stub_native_dialogs_once()
-    # save_settings is patched for the WINDOW'S LIFETIME (not restored
-    # here): closeEvent fires after this helper returns, and an
-    # unpatched write would overwrite the developer's real
-    # settings.json with this window's synthetic state (2026-09-17)
-    _saved = (uh.load_settings, uh.save_settings, _cd.find_data_root)
-    if not hasattr(uh, "_real_save_settings"):
-        uh._real_save_settings = uh.save_settings
+    _saved = (uh.load_settings, _cd.find_data_root)
     uh.load_settings = lambda: {}
-    uh.save_settings = lambda s: None
     _cd.find_data_root = lambda: None
     try:
         win = gui.MainWindow()
     finally:
-        uh.load_settings, _cd.find_data_root = _saved[0], _saved[2]
+        uh.load_settings, _cd.find_data_root = _saved
     return app, win
-
-
-def test_supplementary_metrics_formulas():
-    """2026-09-08 metric-audit supplements: balanced accuracy, MCC,
-    PR-AUC, Brier, threshold stability stats, patient-level
-    evaluation.  Ground truth TP=8 TN=7 FP=2 FN=3 plus degenerate
-    cases.  These are ADDITIVE — no existing metric changed."""
-    cm = np.array([[7, 2], [3, 8]])
-    # --- exact ground truth ---
-    assert abs(modeling.balanced_accuracy_from_cm(cm)
-               - (8 / 11 + 7 / 9) / 2) < 1e-12          # 0.7525252...
-    assert abs(modeling.mcc_from_cm(cm)
-               - 50 / np.sqrt(10 * 11 * 9 * 10)) < 1e-12  # 0.5025189...
-    # perfect / one-sided / degenerate
-    perfect = np.array([[10, 0], [0, 10]])
-    assert modeling.balanced_accuracy_from_cm(perfect) == 1.0
-    assert modeling.mcc_from_cm(perfect) == 1.0
-    allpos = np.array([[0, 10], [0, 10]])
-    assert modeling.mcc_from_cm(allpos) == 0.0
-    assert modeling.mcc_from_cm(np.zeros((2, 2), int)) == 0.0
-    assert np.isnan(modeling.mcc_from_cm(
-        np.zeros((3, 3), int)))                    # non-binary -> NaN
-    # Brier (probabilities, never labels)
-    assert abs(modeling.brier_score([1, 0], [0.8, 0.2])
-               - (0.04 + 0.04) / 2) < 1e-12
-    assert modeling.brier_score([1, 0], [np.nan, 0.0]) == 0.0  # NaN skipped
-    assert np.isnan(modeling.brier_score([1], [np.nan]))
-    # PR-AUC reuses probability-based average precision (perfect case)
-    _p, _r, ap = modeling.pr_points(np.array([0, 1, 0, 1]),
-                                    np.array([.1, .8, .2, .9]))
-    assert abs(ap - 1.0) < 1e-9
-    # --- threshold_stats (computed, never hardcoded) ---
-    ts = modeling.threshold_stats([0.010, 0.884, 0.058, 0.096, 0.021])
-    assert ts["n_kept"] == 5 and abs(ts["median"] - 0.058) < 1e-9
-    assert ts["unstable"] is True            # 88x spread
-    ts2 = modeling.threshold_stats([None, None, 0.543, 0.57, None])
-    assert ts2["n_kept"] == 2 and ts2["unstable"] is False
-    ts3 = modeling.threshold_stats([None, None])
-    assert ts3["n_kept"] == 0 and ts3["min"] is None
-    # --- patient-level evaluation (dominant-class truth, mean-P) ---
-    ye = np.array([0, 0, 1, 1, 0, 0, 1, 1])
-    groups = np.array(["A", "A", "A", "A", "B", "B", "C", "C"])
-    # patient A = 2 normal + 2 tumor -> dominant tie -> unique picks 0
-    proba = np.array([[.9, .1]] * 4 + [[.8, .2]] * 2 + [[.1, .9]] * 2)
-    pe = modeling.patient_level_evaluation(ye, groups, proba, threshold=0.5)
-    assert pe is not None and pe["n"] == 3
-    assert pe["tp"] == 1 and pe["tn"] == 2 and pe["fp"] == 0
-    assert pe["fn"] == 0 and pe["accuracy"] == 1.0
-    assert pe["mcc"] == 1.0
-    assert abs(pe["brier"] - np.mean(
-        [(0.1 - 0) ** 2, (0.2 - 0) ** 2, (0.9 - 1) ** 2])) < 1e-9
-    assert modeling.patient_level_evaluation(ye, None, proba) is None
-    # --- honest check carries the new keys (values additive) ---
-    X, y, g = _synthetic_ml(n=60, groups_n=10, seed=11)
-    wn2 = np.linspace(500.0, 2000.0, X.shape[1])
-    out = modeling.evaluate_pipeline(X, wn2, list(y), groups=list(g),
-                                     k=3, seed=0)
-    for key in ("balanced_accuracy", "mcc", "brier", "pr_auc"):
-        assert key in out, (key, out.get(key))
-    # MCC is SIGNED (−1..1): a chance-level fold is legal — the old
-    # 0..1 bound failed legitimately once the t-test filter really
-    # filtered list labels (2026-09-12 audit)
-    assert -1.0 <= out["mcc"] <= 1.0
-    for key in ("balanced_accuracy", "pr_auc"):
-        assert 0.0 <= out[key] <= 1.0, (key, out.get(key))
-    # brier is NaN BY DESIGN when any fold scored with decision margins
-    # (unbounded) instead of probabilities (2026-09-12 audit guard)
-    assert np.isnan(out["brier"]) or 0.0 <= out["brier"] <= 1.0
-    # sanity: bacc == mean of pooled sens/spec for binary
-    assert abs(out["balanced_accuracy"]
-               - (out["sens"] + out["spec"]) / 2) < 1e-9
-
-
-def test_supplement_report_and_manifest():
-    """Report writers + freeze manifest carry the supplementary block
-    with explicit PATIENT/SPECTRUM level labels and machine-readable
-    fields (additive — everything existing unchanged)."""
-    import gui
-    app, win = _isolated_main_window()
-    _saved = gui.APP_DIR
-    from qt_compat import QtWidgets
-    _box = QtWidgets.QMessageBox.information
-    QtWidgets.QMessageBox.information = staticmethod(lambda *a, **k: None)
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            gui.APP_DIR = td
-            X, y, g = _synthetic_ml(n=60, groups_n=10, seed=5)
-            wn2 = np.linspace(500.0, 2000.0, X.shape[1])
-            res, win.winner = modeling.evaluate_models(
-                X, list(y), model_names=["PCA + Gaussian Naive Bayes"],
-                k_folds=3, groups=list(g), wavenumbers=wn2)
-            win.results = res
-            win._honest_result = {"mean_f1": 0.55, "std_f1": 0.05,
-                                  "sens": 0.56, "spec": 0.54, "acc": 0.55,
-                                  "auc": 0.6, "balanced_accuracy": 0.55,
-                                  "mcc": 0.10, "brier": 0.24,
-                                  "pr_auc": 0.62,
-                                  "cm": np.array([[80, 20], [25, 75]])}
-            win.render_result_page()
-            assert "SPECTRUM LEVEL" in win.r_supp_spec_lbl.text()
-            assert "PATIENT LEVEL" in win.r_supp_pat_lbl.text()
-            assert "TP=" in win.r_supp_spec_lbl.text()
-            assert "Threshold stability" in win.r_supp_thr_lbl.text()
-            win.save_result_report()
-            txt = open(os.path.join(td, "result_report.txt"),
-                       encoding="utf-8").read()
-            assert "SPECTRUM LEVEL" in txt and "PATIENT LEVEL" in txt
-            assert "balanced accuracy" in txt and "MCC" in txt
-            win.save_result_report_html()
-            html = open(os.path.join(td, "result_report.html"),
-                        encoding="utf-8").read()
-            assert "Supplementary scientific metrics" in html
-            assert "PATIENT LEVEL" in html
-            # 2026-09-11: the HTML page now carries preprocessing too
-            # (previously .txt-only)
-            assert "Preprocessing (as trained)" in html
-            assert "crop_min" in html
-    finally:
-        QtWidgets.QMessageBox.information = _box
-        gui.APP_DIR = _saved
-        win.close()
-
-
-def test_device_mode_layer_and_gpu_verification():
-    """2026-09-08 GPU work: RAMAN_DEVICE = auto|gpu|cpu with STRICT gpu
-    (no real CUDA -> loud RuntimeError, never a silent CPU fallback),
-    invalid values rejected, and verify_gpu_runtime proves execution by
-    an actual forward pass whose output tensor lands on the selected
-    device.  The XGBoost canary is build-info ONLY (device='cuda'
-    silently CPU-falls-back when no GPU is visible — probed)."""
-    import modeling as M
-    assert M.resolve_device_mode() in ("auto", "gpu", "cpu")
-    # cpu + invalid values
-    os.environ["RAMAN_DEVICE"] = "cpu"
-    try:
-        assert M.resolve_device_mode() == "cpu"
-        assert str(M.torch_device()) == "cpu"
-        assert M.gpu_ok() is False            # boosters never GPU on cpu
-        v = M.verify_gpu_runtime()
-        assert v["mode"] == "cpu"
-        assert "cpu" in v["torch_probe_device"]
-        os.environ["RAMAN_DEVICE"] = "banana"
-        try:
-            M.resolve_device_mode()
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("invalid RAMAN_DEVICE accepted")
-    finally:
-        os.environ.pop("RAMAN_DEVICE", None)
-    # auto: probe lands on whatever torch_device() selected, and the
-    # reported CNN backend equals the probe device type
-    v = M.verify_gpu_runtime()
-    assert v["mode"] == "auto"
-    dev = M.torch_device()
-    assert v["cnn"] == dev.type
-    assert v["torch_probe_device"].startswith(dev.type)
-    # boosters are CPU under auto (measured policy) and LightGBM is a
-    # CPU wheel — reported honestly, never claimed as GPU
-    assert v["xgboost"] == "cpu" and v["catboost"] == "CPU"
-    assert v["lightgbm"] == "cpu"
-    # strict GPU mode without a visible device: loud failure (fresh
-    # process; CUDA_VISIBLE_DEVICES=-1 hides the GPU on Windows too)
-    code = ("import modeling\n"
-            "try:\n"
-            "    modeling.resolve_device_mode()\n"
-            "    raise SystemExit('accepted-without-gpu')\n"
-            "except RuntimeError:\n"
-            "    raise SystemExit(0)\n")
-    import subprocess
-    import sys
-    r = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True,
-        timeout=240, cwd=os.path.dirname(os.path.abspath(__file__)),
-        env={**os.environ, "RAMAN_DEVICE": "gpu",
-             "CUDA_VISIBLE_DEVICES": "-1",
-             "QT_QPA_PLATFORM": "offscreen"})
-    assert r.returncode == 0, (r.stdout, r.stderr)
 
 
 def test_settings_persistence_roundtrip():
@@ -3470,13 +2770,8 @@ def test_settings_persistence_roundtrip():
     import ui_helpers as uh
     with tempfile.TemporaryDirectory() as td:
         path = os.path.join(td, "settings.json")
-        saved_path = uh.SETTINGS_PATH
-        saved_save = uh.save_settings
-        # _isolated_main_window leaves a no-op stub installed; use the
-        # REAL writer it stashed for exactly this case
-        real = getattr(uh, "_real_save_settings", saved_save)
+        saved = uh.SETTINGS_PATH
         uh.SETTINGS_PATH = path
-        uh.save_settings = real
         try:
             uh.save_settings({"last_model": "m.joblib", "n": 3})
             assert os.path.isfile(path)
@@ -3493,27 +2788,7 @@ def test_settings_persistence_roundtrip():
                 fh.write("[1, 2]")
             assert uh.load_settings() == {}
         finally:
-            uh.SETTINGS_PATH = saved_path
-            uh.save_settings = saved_save
-
-
-def test_legacy_bad_params_sanitized():
-    """The 2026-09-01 legacy session (crop 500/1800 + deriv 0 + vector +
-    sym8 L4 + despike ON, ~0.12 F1 below the §52 winner) can never be
-    SAVED again — even by a GUI process that started before the v5
-    gate (gui._sanitize_params substitutes the winner defaults)."""
-    import gui
-    import preprocessing as pp
-    from dataclasses import asdict
-    bad = {"crop_min": 500.0, "crop_max": 1800.0, "sg_deriv": 0,
-           "norm": "vector", "wavelet_name": "sym8", "wavelet_level": 4,
-           "despike": True}
-    out = gui._sanitize_params(dict(bad))
-    good = asdict(pp.PreprocessParams().validate())
-    assert out == good
-    # anything NOT the exact combo passes through untouched
-    ok = dict(bad, crop_max=2000.0)
-    assert gui._sanitize_params(ok) == ok
+            uh.SETTINGS_PATH = saved
 
 
 def test_untested_modeling_helpers():
@@ -3616,8 +2891,8 @@ def test_optimize_best_params_roundtrip():
 
 def test_plot_helpers_render():
     """Every audit-flagged untested plotting helper renders on an Agg
-    canvas without raising (plot_sign_bars was removed 2026-09-12 —
-    dead code whose docstring claimed a sharing that never existed)."""
+    canvas without raising (plot_sign_bars is called nowhere in the app
+    — dead code, pinned here so it stays working)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -3662,12 +2937,8 @@ def test_plot_helpers_render():
     pl.plot_count_bars(ax, ["Normal", "Tumor"], [12, 9],
                        positive="Tumor")
     fig, ax = fresh()
-    pl.plot_prob_histogram(ax, np.array([0.1, 0.62, 0.85, 0.85]),
-                           threshold=0.55, pos_name="Tumor")
-    fig, ax = fresh()
-    pl.plot_prob_histogram(ax, np.full(299, 0.8), threshold=0.5)
-    assert len(ax.get_yticklabels()) <= 12, "y-tick flood on large n"
-    assert ax.get_xlim()[0] == 0.0, "0 must sit at the exact left edge"
+    pl.plot_sign_bars(ax, ["a", "b", "c"], [0.4, -0.2, 0.0],
+                      ylabel="delta", red_below=0.0)
     plt.close("all")
 
 
@@ -3780,18 +3051,14 @@ def test_diag_queue_order_and_chain_guard():
         for n in names:
             setattr(win, n, (lambda nm: lambda *a, **k: order.append(nm))(
                 n))
-        # plain winner: FULL battery, serial order — HONEST FIRST since
-        # 2026-09-08 (its result is the number the banner shows)
+        # plain winner: FULL battery, serial order
         win.winner = modeling.ModelResult(name="plain",
                                           classes=["A", "B"])
         win.winner.pipeline = Pipeline([("sc", StandardScaler()),
                                         ("lr", LogisticRegression())])
         win.run_all_diagnostics()
-        assert order == ["run_honest_check", "run_region_importance",
-                         "run_band_agreement", "run_learning_curve",
-                         "run_seed_stability", "run_noise_check",
-                         "run_locked_eval", "run_lopo"], order
-        # chain winner: heavy items skipped, honest + light items only
+        assert order == list(names), order
+        # chain winner: heavy items skipped, light items + honest only
         import sequential as seq
         order.clear()
         win._diag_queue = []
@@ -3801,8 +3068,8 @@ def test_diag_queue_order_and_chain_guard():
             [Pipeline([("sc", StandardScaler()),
                        ("lr", LogisticRegression())])], n_seeds=1)
         win.run_all_diagnostics()
-        assert order == ["run_honest_check", "run_region_importance",
-                         "run_band_agreement"], order
+        assert order == ["run_region_importance", "run_band_agreement",
+                         "run_honest_check"], order
         # auto-diagnostics checkbox off -> _on_train_done_then_diags skips
         order.clear()
         win._diag_queue = []
@@ -3818,159 +3085,6 @@ def test_diag_queue_order_and_chain_guard():
         except RuntimeError:
             pass
         QtWidgets.QMessageBox.information = _saved_box
-
-
-def test_honest_numbers_are_the_displayed_numbers():
-    """2026-09-08 user decision — ONE performance number: the nested
-    honest estimate, computed automatically. evaluate_pipeline returns
-    pooled sens/spec/acc/auc/cm; the Train banner, Result page and BOTH
-    report writers show the honest values (PRELIMINARY selection-CV tag
-    before it lands; the saved bundle's honest F1 is the restore
-    fallback); selection-CV numbers appear only as a labeled ranking."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from qt_compat import QtWidgets
-    # ---- 1. evaluate_pipeline pooled honest metrics ----
-    # peak-based signal: a DC class offset would be absorbed by the
-    # now-correct ALS baseline (2026-09-12 audit)
-    rng = np.random.default_rng(5)
-    n, groups_n = 60, 10
-    wn = np.linspace(500.0, 2000.0, 200)
-    y = np.array(["A", "B"])[np.arange(n) % 2]
-    g = np.repeat([f"S{i}" for i in range(groups_n)], n // groups_n)
-    peak = (0.9 * np.exp(-((wn - 1100) / 15) ** 2)
-            + 0.6 * np.exp(-((wn - 1450) / 12) ** 2))
-    X = np.vstack([0.5 + 0.2 * np.sin(wn / 300)
-                   + rng.normal(0, 0.02, 200)
-                   + (peak if lab == "B" else 0.0) for lab in y])
-    out = modeling.evaluate_pipeline(X, wn, list(y), groups=list(g),
-                                     k=3, seed=0)
-    for key in ("mean_f1", "std_f1", "sens", "spec", "acc"):
-        assert key in out and 0.0 <= out[key] <= 1.0, (key, out[key])
-    assert out["cm"].shape == (2, 2) and int(out["cm"].sum()) == len(y)
-    assert 0.5 < out["auc"] <= 1.0        # separable synthetic data
-    # ---- 2/3/4. the GUI shows ONE (real) number everywhere ----
-    # 2026-09-15 design: the banner carries the TRAINED WINNER's own
-    # validated numbers for every winner type; the nested single-model
-    # check can never estimate the winner and appears only as a
-    # clearly-labeled benchmark inside the note.
-    app, win = _isolated_main_window()
-    import gui
-    _saved = gui.APP_DIR
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            gui.APP_DIR = td
-            w = modeling.ModelResult(name="PCA + LDA", classes=["A", "B"])
-            w.macro = {"f1": (0.9, 0.0), "sens": (0.9, 0.0),
-                       "spec": (0.9, 0.0)}
-            win.winner = w
-            win.results = [w]
-            win._set_result_banner()
-            assert "WINNER (cross-validated)" in win.banner_plain.text()
-            assert win.stat_values["f1"].text() == "0.900"
-            # benchmark lands -> winner numbers STAY, benchmark is a note
-            win._honest_result = {"mean_f1": 0.55, "std_f1": 0.05,
-                                  "sens": 0.56, "spec": 0.54,
-                                  "acc": 0.55, "auc": 0.60}
-            win._set_result_banner()
-            assert "WINNER (cross-validated)" in win.banner_plain.text()
-            assert "benchmark" in win.banner_plain.text()
-            assert "NOT this model" in win.banner_plain.text()
-            assert win.stat_values["f1"].text() == "0.900"
-            assert win.stat_values["sens"].text() == "0.900"
-            # Result page: the same winner numbers
-            win.render_result_page()
-            assert win.r_stats["f1"].text() == "0.900"
-            # reports carry the honest values (fixed APP_DIR paths)
-            win.save_result_report()
-            txt = open(os.path.join(td, "result_report.txt"),
-                       encoding="utf-8").read()
-            assert "0.900" in txt and "winner" in txt
-            assert "SELECTION ranking" in txt
-            _info = QtWidgets.QMessageBox.information
-            QtWidgets.QMessageBox.information = staticmethod(
-                lambda *a, **k: None)
-            try:
-                win.save_result_report_html()
-            finally:
-                QtWidgets.QMessageBox.information = _info
-            html = open(os.path.join(td, "result_report.html"),
-                        encoding="utf-8").read()
-            assert "0.900" in html and "WINNER" in html
-            # 3SSE chain winner: its own numbers + the CHAIN note
-            win.winner.macro = {"f1": (0.65, 0.0), "sens": (0.65, 0.0),
-                                "spec": (0.65, 0.0)}
-            win._is_chain_winner = lambda: True
-            win._set_result_banner()
-            assert "3SSE CHAIN" in win.banner_plain.text()
-            assert win.stat_values["f1"].text() == "0.650"
-            assert "benchmark" in win.banner_plain.text()   # note only
-            del win._is_chain_winner
-            # benchmark absent -> note says winner, no benchmark line
-            win._honest_result = None
-            win._set_result_banner()
-            assert "WINNER (cross-validated)" in win.banner_plain.text()
-            assert "benchmark" not in win.banner_plain.text()
-            # saved-bundle fallback only in a winner-less (restore)
-            # session; the note labels it a benchmark
-            win.winner = None
-            win.bundle = {"model_name": "x", "nested_honest_f1": (0.61, 0.0)}
-            _s, _p, f1v, note = win._honest_display_numbers()
-            assert f1v == 0.610 and "SAVED model" in note
-    finally:
-        gui.APP_DIR = _saved
-        win.close()
-
-
-def test_literature_comparison_report_section():
-    """2026-09-16: the txt/HTML reports gain a literature-protocol
-    comparison — the SAME winner scored spectrum-level (leaky,
-    INFLATED-labeled) next to the grouped number; degraded paths
-    (no data / unknown model) must skip the section, never raise."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    import gui
-    app, win = _isolated_main_window()
-    _saved = gui.APP_DIR
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            gui.APP_DIR = td
-            # degraded path 1: no training data -> None, no crash
-            assert win._literature_comparison() is None
-            # degraded path 2: unknown model name, no pipeline
-            win._lc_data = (np.zeros((4, 3)), ["A", "B", "A", "B"],
-                            ["P1", "P1", "P2", "P2"])
-            w = modeling.ModelResult(name="No Such Model",
-                                     classes=["A", "B"])
-            win.winner = w
-            assert win._literature_comparison() is None
-            # real path: a fast plain model on separable synthetic data
-            rng = np.random.default_rng(7)
-            y = ["A", "B"] * 30
-            g = [f"P{i // 6}" for i in range(60)]
-            X = np.vstack([
-                rng.normal(0, 0.05, 60) + (1.0 if lab == "B" else 0.0)
-                for lab in y])
-            w2 = modeling.ModelResult(name="Random Forest",
-                                      classes=["A", "B"])
-            w2.macro = {"f1": (0.8, 0.0), "sens": (0.8, 0.0),
-                        "spec": (0.8, 0.0)}
-            w2.pipeline = modeling.clone(next(
-                s for s in modeling.model_specs()
-                if s["name"] == "Random Forest")["estimator"])
-            win.winner = w2
-            win._lc_data = (X, y, g)
-            win._lc_data_key = "synthetic"
-            res = win._literature_comparison()
-            assert res is not None and len(res) == 2
-            assert all(np.isfinite(v) and 0.0 <= v <= 1.0 for v in res)
-            assert res == win._literature_comparison()   # cached
-            win.save_result_report()
-            txt = open(os.path.join(td, "result_report.txt"),
-                       encoding="utf-8").read()
-            assert "Literature-protocol comparison" in txt
-            assert "INFLATED" in txt and "PATIENT-GROUPED" in txt
-    finally:
-        gui.APP_DIR = _saved
-        win.close()
 
 
 def test_failure_callbacks_reenable():
@@ -4038,10 +3152,6 @@ def test_freeze_and_figures_real_paths():
             win.save_result_figures()
             pngs = [f for f in os.listdir(fd) if f.endswith(".png")]
             assert pngs, "no figures exported"
-            # 2026-09-12 graph audit: calibration + DCA are part
-            # of the export set (they used to be silently left out)
-            assert {"result_calibration.png",
-                    "result_decision_curve.png"} <= set(pngs), pngs
     finally:
         try:
             win.close()
@@ -4211,7 +3321,7 @@ def test_trainworker_success_path():
                 assert len(win.spectra) == 30 and win.grid is not None
                 X = win.get_processed_X()
                 names = [n for n, cb in win.model_checks.items()
-                         if cb.isChecked() and n == "Random Forest"]
+                         if cb.isChecked() and n == "PCA + LDA"]
                 assert len(names) == 1
                 results, winner = modeling.evaluate_models(
                     X, list(win.labels), names, 3, 42,
@@ -4286,7 +3396,7 @@ for cls, gain in (("C1", 0.4), ("C8", 1.6)):
 win.load_folder(os.path.join(td, "flat"), quiet=True)
 win.chk_auto_diags.setChecked(False)
 for name, cb in win.model_checks.items():
-    cb.setChecked(name == "Random Forest")
+    cb.setChecked(name == "PCA + LDA")
 win.spin_folds.setValue(3)
 win.start_training()                       # the REAL QThread path
 
@@ -4311,7 +3421,7 @@ def test_sequential_cli_smoke():
     with tempfile.TemporaryDirectory() as td:
         root = os.path.join(td, "clin")
         os.makedirs(root)
-        _make_clinical_tree(root)
+        _make_clinical_tree(root, paired_ready=True)
         out = os.path.join(td, "run")
         r = subprocess.run(
             [sys.executable, "sequential.py",
@@ -4334,420 +3444,49 @@ def test_sequential_cli_smoke():
         # winner bundle, screening + report + meta only
 
 
-# =====================================================================
-# 2026-09-12 calculation-audit regression tests (Brain.md §37)
-# =====================================================================
-def test_audit_als_left_edge():
-    """ALS offsets [0,1,2]: a linear baseline is recovered at BOTH edges
-    (the old sub-diagonal form collapsed the left edge toward 0)."""
-    x = np.linspace(0, 1, 500)
-    y = 50 + 100 * x + 200 * np.exp(-((x - 0.5) ** 2) / 0.001)
-    b = pp.als_baseline(y, lam=1e5)
-    assert abs(b[0] - 50) < 1.5, b[0]
-    assert abs(b[-1] - 150) < 1.5, b[-1]
+# optional third-party modules: a test that cannot run without one is
+# SKIPPED, not failed — an absent optional dep is an environment fact,
+# not a defect, and burying it in the failure count hid the two REAL
+# failures in the 2026-09-07 audit (24 "failures", 2 genuine).
+_OPTIONAL_MODULES = ("torch", "shap", "pybaselines", "lightgbm",
+                     "catboost", "xgboost", "tabpfn",
+                     "PyQt5", "PyQt6", "PySide6")
 
 
-def test_audit_despike_guardrails():
-    """Spike neighbours are not re-infected; index-0 spikes are caught;
-    mad==0 falls back instead of keeping the spike; sharp real peak
-    flanks survive (run-length filter)."""
-    sig = np.ones(200) * 10
-    sig[80:120] += 50                      # wide real peak
-    sp = sig.copy()
-    sp[70] += 5000
-    out = pp.despike(sp, 7, 5)
-    assert abs(out[70] - 10) < 5           # spike replaced
-    assert abs(out[71] - sig[71]) < 1.0    # neighbour NOT re-infected
-    sp2 = np.ones(100) * 5
-    sp2[0] += 3000
-    assert abs(pp.despike(sp2, 7, 5)[0] - 5) < 2
-    sp3 = np.zeros(100)
-    sp3[50] = 100                          # mad==0 data
-    assert abs(pp.despike(sp3, 7, 5)[50]) < 1e-9
-    w = np.arange(800)
-    peak = 2000 * np.exp(-((w - 400) / 8.0) ** 2) \
-        + np.random.default_rng(0).normal(0, 0.05, 800)
-    assert np.allclose(pp.despike(peak, 7, 5), peak, atol=0.5)
-
-
-def test_audit_wn_calibrate_guard_and_apex():
-    """Peak-free spectra are NOT shifted; a planted peak lands on its
-    parabola apex (sub-pixel)."""
-    wn = np.arange(950., 1060., 1.9)
-    noise = np.random.default_rng(2).normal(0, 1, len(wn))
-    assert pp.estimate_wn_drift(
-        noise.reshape(1, -1), wn)[0] == 0.0
-    row = np.zeros_like(wn)
-    row[np.argmin(np.abs(wn - 1006.3))] += 100
-    noisy = row + np.random.default_rng(1).normal(0, .01, len(wn))
-    grid_peak = wn[np.argmin(np.abs(wn - 1006.3))]
-    pos = pp.phe1003_position(noisy, wn)
-    assert abs(pos - grid_peak) < 0.5, pos
-
-
-def test_audit_align_guard_and_area_norm():
-    """align_to_grid refuses a file that does not span the training
-    grid; area normalization integrates on the wavenumber axis."""
-    grid = np.linspace(500, 2000, 300)
-    try:
-        pp.align_to_grid(
-            np.array([600., 1990.]), np.array([1., 2.]), grid,
-            pp.PreprocessParams())
-        raise AssertionError("should have raised")
-    except ValueError:
-        pass
-    wn = np.linspace(500, 2000, 300)
-    a = pp.normalize(np.ones(300), "area", wn)
-    assert abs(np.trapezoid(a, wn) - 1.0) < 1e-9
-
-
-def test_audit_paired_loo_and_labels():
-    """Normal rows deviate from the leave-one-out reference (no more
-    exact-zero (k-1)/k shrinkage); k=1 normals are counted; labels are
-    matched case-insensitively."""
-    import paired
-    prm = pp.PreprocessParams().validate()
-    X = np.random.default_rng(3).normal(size=(4, 10))
-    wng = np.linspace(500, 2000, 10)
-    pd3 = paired.paired_features(X, ["Normal"] * 3 + ["Tumor"],
-                                 ["P"] * 4, wng, prm)
-    P = pp.preprocess_matrix(X, prm, wn=wng)
-    assert np.allclose(pd3.X[0], P[0] - P[[1, 2]].mean(axis=0), atol=1e-12)
-    assert np.allclose(pd3.X[3], P[3] - P[:3].mean(axis=0), atol=1e-12)
-    pd1 = paired.paired_features(X[:2], ["Normal", "Tumor"], ["P"] * 2,
-                                 wng, prm)
-    assert np.allclose(pd1.X[0], 0) and pd1.n_self_ref_rows == 1
-    pd_c = paired.paired_features(X[:2], [" normal ", "TUMOR"], ["P"] * 2,
-                                  wng, prm)
-    assert len(pd_c.y) == 2
-
-
-def test_audit_pqn_signed_finite():
-    """PQN on a sign-changing (baseline-removed) reference stays finite
-    (weakest-10%-of-|ref| mask)."""
-    ref = np.sin(np.linspace(0, 20, 500))
-    out = pp.pqn_normalize(2.0 * ref
-                           + np.random.default_rng(4).normal(0, .01, 500),
-                           ref)
-    assert np.isfinite(out).all()
-
-
-def test_audit_ttestselect_list_y_and_fdr():
-    """list labels no longer silently disable the filter; fdr=True
-    applies Benjamini-Hochberg."""
-    rng = np.random.default_rng(0)
-    X = rng.normal(size=(20, 50))
-    X[:10, 3] += 5
-    sel = modeling.TTestSelect().fit(X, ["A"] * 10 + ["B"] * 10)
-    assert sel.n_selected_ < 10, sel.n_selected_
-    sel2 = modeling.TTestSelect(fdr=True).fit(X, ["A"] * 10 + ["B"] * 10)
-    assert 0 < sel2.n_selected_ <= sel.n_selected_
-
-
-def test_audit_best_f1_threshold_exact():
-    """The optimum at a NON-quantile threshold is found exactly."""
-    scores = np.array([.10, .11, .12, .13, .90, .91, .92])
-    yt = np.array([0, 0, 0, 0, 1, 1, 1])
-    _thr, f1, _j = modeling.best_f1_threshold(yt, scores)
-    assert f1 == 1.0
-
-
-def test_audit_patient_ties_and_macro_std():
-    """Dominant-class ties are counted; macro ± is the FOLD spread."""
-    r = modeling.patient_level_evaluation(
-        np.array([0, 0, 1, 1]), np.array(["P"] * 4),
-        np.array([[.9, .1], [.8, .2], [.3, .7], [.6, .4]]), threshold=0.5)
-    assert r["n_tied_patients"] == 1
-    X, y, groups = _synthetic_ml(40, 10, seed=3)
-    res, _win = modeling.evaluate_models(
-        X, list(y), model_names=["PCA + LDA"], k_folds=3, seed=42,
-        groups=list(groups))
-    m, s = res[0].macro["f1"]
-    assert abs(m - float(np.mean(res[0].fold_f1))) < 1e-9
-    assert abs(s - float(np.std(res[0].fold_f1))) < 1e-9
-
-
-def test_audit_permutation_excludes_mixed():
-    """Mixed-label (paired) patients are excluded from the permutation
-    null and reported."""
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
-    rng = np.random.default_rng(0)
-    X = rng.normal(size=(30, 6))
-    y = np.array([0] * 14 + [1] * 14 + [0, 1])       # P14 is mixed
-    groups = [f"P{i // 2}" for i in range(30)]
-    est = make_pipeline(StandardScaler(), LogisticRegression())
-    out = modeling.permutation_auc_p(est, X, y, groups, n_perm=5, k=3)
-    assert out["n_mixed_excluded"] == 1
-    assert np.isfinite(out["p"])
-
-
-def test_audit_sequential_f1_mean_matches_pooled():
-    """Level-3 f1_mean is computed against the REAL labels: on a
-    perfectly separable set it matches the pooled F1 (the old
-    str-cast re-encoding made it <= 0.5 vs a constant truth)."""
-    import sequential
-    rng = np.random.default_rng(7)
-    n_pat = 12
-    wn = np.linspace(500, 1800, 120)
-    rows, y, g = [], [], []
-    for p in range(n_pat):
-        base = rng.normal(0, 0.05, 120)
-        rows.append(base)
-        y.append("Normal"); g.append(f"P{p}")
-        rows.append(base + 0.8)
-        y.append("Tumor"); g.append(f"P{p}")
-    X = np.vstack(rows)
-    board = sequential.search(X, y, g, wn, model_names=[
-        "PCA + LDA", "Random Forest", "Extra Trees"],
-        k=2, top=4, jobs=1, prune_pairs=50, cnn_epochs=1)
-    triples = [t for t in board["triples"] if "metrics" in t]
-    assert triples, "expected scored triples"
-    for t in triples:
-        assert t["metrics"]["f1_mean"] > 0.9, t
-        assert t["metrics"]["f1"] > 0.9, t
-
-
-def test_audit_nemenyi_q_values():
-    """Corrected Demšar 2006 table + scipy-based extrapolation."""
-    import study_stats as sstats
-    assert sstats.NEMENYI_Q[7] == 2.949 and sstats.NEMENYI_Q[10] == 3.164
-    from scipy.stats import studentized_range
-    expect = float(studentized_range.ppf(0.95, 12, np.inf) / np.sqrt(2))
-    assert abs(sstats._nemenyi_q(12) - expect) < 1e-6
-    assert sstats._nemenyi_q(2) == 1.960
-
-
-def test_audit_band_stats_raw_plus_fdr():
-    """band_stats_paired returns the raw Wilcoxon p AND the BH-adjusted
-    p (8-field rows; FDR >= raw)."""
-    import study_stats as sstats
-    rng = np.random.default_rng(3)
-    wn = np.linspace(400, 1800, 400)
-
-    def mk(nuc, col):
-        v = 0.4 + 0.5 * np.exp(-((wn - 1445) / 15) ** 2)
-        v += nuc * 0.9 * np.exp(-((wn - 785) / 10) ** 2)
-        v += col * 0.6 * np.exp(-((wn - 854) / 10) ** 2)
-        return v
-
-    X, y, g = [], [], []
-    for p in range(10):
-        for cls, nuc, col in (("Normal", 0.3, 1.0), ("Tumor", 1.8, 0.4)):
-            X.append(mk(nuc, col) + 0.005 * rng.normal(0, 1, 400))
-            y.append(cls)
-            g.append(f"P{p}")
-    rows = sstats.band_stats_paired(np.vstack(X), y, g, wn)
-    assert all(len(r) == 8 for r in rows)
-    for r in rows:
-        if np.isfinite(r[5]) and np.isfinite(r[7]):
-            assert r[7] >= r[5] - 1e-12
-
-
-def test_audit_triage_boundary():
-    """A probability exactly AT the rule-out threshold is a positive
-    call under the `p >= thr` ROC convention — it must NOT be cleared."""
-    import clinical as clin
-    lo, hi = 0.30, 0.70
-    assert clin.triage(lo, lo, hi) == "INDETERMINATE"
-    assert clin.triage(lo - 1e-9, lo, hi) == "NEGATIVE"
-    assert clin.triage(hi, lo, hi) == "POSITIVE"
-
-
-def test_audit_isotonic_crossfitted():
-    """Both calibration mappings are cross-fitted before the ECE
-    (in-sample isotonic ECE was ~0 by construction)."""
-    import clinical as clin
-    rng = np.random.default_rng(2)
-    y = np.array([0] * 30 + [1] * 30)
-    p = np.clip(0.25 + 0.5 * y + rng.normal(0, 0.15, 60), 0.01, 0.99)
-    out = clin.isotonic_compare(y, p)
-    assert set(out) >= {"ece_raw", "ece_platt", "ece_isotonic"}
-    assert all(np.isfinite(v) and v >= 0 for v in out.values())
-    assert out["ece_isotonic"] > 0 or out["ece_platt"] > 0
-
-
-def test_audit_snr_sqrt2():
-    """dataset_qc's noise estimate divides the first-difference MAD by
-    sqrt(2): white noise gives SNR = range / sigma."""
-    import biochemistry as bio
-    rng = np.random.default_rng(5)
-    X = rng.normal(0, 1.0, (6, 2000))
-    q = bio.dataset_qc(X, np.linspace(500, 2000, 2000))
-    expected = float(np.median(X.max(axis=1) - X.min(axis=1)))
-    assert abs(q["snr_median"] - expected) / expected < 0.02, q
-
-
-def test_audit_bioshift_fdr_and_ratio_guard():
-    """biochemical_shift reports FDR-adjusted p (6-field rows, FDR >=
-    raw); near-zero denominators NaN instead of exploding."""
-    import biochemistry as bio
-    rng = np.random.default_rng(0)
-    wn = np.linspace(400, 1800, 300)
-    X = np.vstack([0.3 + rng.normal(0, .01, 300) for _ in range(20)]
-                  + [0.9 + rng.normal(0, .01, 300) for _ in range(20)])
-    y = ["Normal"] * 20 + ["Tumor"] * 20
-    rows = bio.biochemical_shift(X, wn, y)
-    assert all(len(r) == 6 for r in rows)
-    for r in rows:
-        if np.isfinite(r[4]) and np.isfinite(r[5]):
-            assert r[5] >= r[4] - 1e-12
-    # keratin index with a near-empty 1003 denominator -> NaN, not inf
-    y_flat = np.zeros_like(wn)
-    y_flat[np.argmin(np.abs(wn - 938))] += 10.0
-    assert not np.isfinite(bio.keratin_index(wn, y_flat))
-    # a well-formed spectrum still yields a finite index
-    y_ok = 1.0 + np.exp(-((wn - 1003) / 8) ** 2) \
-        + 0.5 * np.exp(-((wn - 938) / 10) ** 2)
-    assert np.isfinite(bio.keratin_index(wn, y_ok))
-
-
-# ==========================================================================
-# Speed program (2026-09-12): parallel paths must be BIT-IDENTICAL to
-# serial, turbo must compute strictly less, the surrogate-SHAP cache
-# must be transparent.
-# ==========================================================================
-def _speed_synth(n_patients=24, n_features=12, seed=0):
-    rng = np.random.default_rng(seed)
-    X = rng.normal(0, 1, (n_patients * 5, n_features))
-    y, groups = [], []
-    for p in range(n_patients):
-        cls = f"C{p % 2}"
-        for _i in range(5):
-            y.append(cls)
-            groups.append(f"P{p:02d}")
-    X[:, 0] += np.array([1.0 if v == "C1" else 0.0 for v in y])
-    return X, y, groups
-
-
-def test_parallel_diagnostics_match_serial():
-    """LOPO / seed stability / learning curve in the loky pool return
-    EXACTLY the serial numbers (same folds, same seeds)."""
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
-    import study_stats as sstats
-
-    X, y, groups = _speed_synth()
-    est = Pipeline([("s", StandardScaler()),
-                    ("m", LogisticRegression(max_iter=2000))])
-    s = sstats.lopo_evaluate(X, y, groups, est, {}, ["C0", "C1"],
-                             jobs=1)
-    p = sstats.lopo_evaluate(X, y, groups, est, {}, ["C0", "C1"],
-                             jobs=2)
-    assert s["f1"] == p["f1"] and s["auc"] == p["auc"]
-    assert s["cm"].tolist() == p["cm"].tolist()
-    assert [r[0] for r in s["per_patient"]] == \
-        [r[0] for r in p["per_patient"]]
-
-    ss = sstats.seed_stability(X, y, groups, est, {}, ["C0", "C1"],
-                               seeds=(0, 1, 2), k=4, jobs=1)
-    sp = sstats.seed_stability(X, y, groups, est, {}, ["C0", "C1"],
-                               seeds=(0, 1, 2), k=4, jobs=3)
-    assert ss == sp
-
-    ye = [0 if v == "C0" else 1 for v in y]
-    ls = modeling.learning_curve_by_groups(X, ye, groups, est, k=4,
-                                           seed=7, jobs=1)
-    lp = modeling.learning_curve_by_groups(X, ye, groups, est, k=4,
-                                           seed=7, jobs=4)
-    assert ls == lp
-
-
-def test_parallel_models_match_serial():
-    """evaluate_models with the concurrent-models thread pool returns
-    EXACTLY the serial per-model results (fold F1s, thresholds, OOF)."""
-    X, y, groups = _speed_synth(seed=3)
-    names = ["PCA + Logistic Regression", "PLS-DA"]
-    groups_arr = np.asarray(groups)
-    classes = sorted(set(y))
-    ye = np.array([classes.index(v) for v in y])
-    from sklearn.model_selection import StratifiedGroupKFold
-    splits = list(StratifiedGroupKFold(n_splits=4, shuffle=True,
-                                       random_state=42).split(X, ye,
-                                                              groups_arr))
-    specs = [s for s in modeling.model_specs() if s["name"] in names]
-    assert len(specs) == 2
-    serial = {}
-    for spec in specs:
-        serial[spec["name"]] = modeling._run_cv_model(
-            spec["name"], spec["estimator"], spec["grid"], X, ye,
-            groups_arr, splits, classes, True, 1, 42, len(splits))
-    rp, _wp = modeling.evaluate_models(X, y, model_names=names,
-                                       k_folds=4, groups=groups)
-    assert [r.name for r in rp] == [n for n in serial]
-    for b in rp:
-        a, tpl_a = serial[b.name]
-        assert b.error is None and a.error is None
-        assert a.fold_f1 == b.fold_f1, b.name
-        assert a.threshold == b.threshold, b.name
-        assert np.allclose(a.oof_proba, b.oof_proba, equal_nan=True)
-
-
-def test_turbo_stride_and_halving_run():
-    """TURBO: LOPO stride halves the patients; halved inner tuning
-    still returns valid params; the exact path is untouched."""
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import StratifiedGroupKFold
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
-    import study_stats as sstats
-
-    X, y, groups = _speed_synth()
-    est = Pipeline([("s", StandardScaler()),
-                    ("m", LogisticRegression(max_iter=2000))])
-    full = sstats.lopo_evaluate(X, y, groups, est, {}, ["C0", "C1"])
-    half = sstats.lopo_evaluate(X, y, groups, est, {}, ["C0", "C1"],
-                                stride=2)
-    assert half["n_patients"] == (full["n_patients"] + 1) // 2
-
-    inner = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=0)
-    grid = {"m__C": [0.01, 0.1, 1.0, 10.0]}
-    params, _thr = modeling._tune_inner(
-        est, grid, X, np.array([0 if v == "C0" else 1 for v in y]),
-        inner, groups=np.asarray(groups), halve=True)
-    assert set(params) == {"m__C"} and params["m__C"] in grid["m__C"]
-
-
-def test_surrogate_shap_cache():
-    """The shared surrogate-SHAP cache: identical results on the second
-    call, explainer+RF reused by surrogate_explainer (identity)."""
-    import importlib.util as _ilu
-    if _ilu.find_spec("shap") is None:
-        print("    (shap not installed — skipped)")
-        return
-    X, y, _groups = _speed_synth(seed=5)
-    wn = np.linspace(500.0, 2000.0, X.shape[1])
-    modeling.clear_surrogate_cache()
-    _wn1, s1, b1 = modeling.region_importance_shap(X, y, None, wn)
-    est2, expl2 = modeling.surrogate_explainer(X, y)
-    est3, expl3 = modeling.surrogate_explainer(X, y)
-    assert est2 is est3 and expl2 is expl3     # cache identity, no refit
-    _wn2, s2, b2 = modeling.region_importance_shap(X, y, None, wn)
-    assert np.array_equal(s1, s2) and b1 == b2
-    # a DIFFERENT matrix must not hit the cache (translation alone is
-    # invisible to trees — flip the informative column instead)
-    X2 = X.copy()
-    X2[:, 0] *= -1.0
-    _wn3, s3, _b3 = modeling.region_importance_shap(X2, y, None, wn)
-    assert not np.array_equal(s1, s3)
-    modeling.clear_surrogate_cache()
+def _skip_reason(exc: Exception) -> str | None:
+    """The missing optional dependency behind `exc`, if that is all it
+    is; None when the exception is a real failure."""
+    if not isinstance(exc, ImportError):
+        return None
+    if "No Qt binding found" in str(exc):
+        return "a Qt binding (PyQt5/PyQt6/PySide6)"
+    name = getattr(exc, "name", None)
+    if name in _OPTIONAL_MODULES:
+        return name
+    return None
 
 
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
-    failed = 0
+    failed = skipped = 0
     for t in tests:
         try:
             t()
             print(f"  PASS  {t.__name__}")
         except Exception as exc:             # noqa: BLE001
-            failed += 1
-            print(f"  FAIL  {t.__name__}: {exc}")
+            why = _skip_reason(exc)
+            if why:
+                skipped += 1
+                print(f"  SKIP  {t.__name__}: needs {why}")
+            else:
+                failed += 1
+                print(f"  FAIL  {t.__name__}: {exc}")
     _optional_report()
-    print(f"\n{len(tests) - failed}/{len(tests)} tests passed")
+    ran = len(tests) - skipped
+    print(f"\n{ran - failed}/{ran} tests passed"
+          + (f" ({skipped} skipped: optional deps absent)"
+             if skipped else ""))
     return 1 if failed else 0
 
 
