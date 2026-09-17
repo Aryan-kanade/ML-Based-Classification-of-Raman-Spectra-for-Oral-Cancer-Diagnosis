@@ -1,6 +1,0 @@
-{
-  "seed": 42,
-  "mask": 0.4,
-  "spectrum_f1_at_0.5": 0.5713432241362142,
-  "verdict": "SMAE pretrain->finetune spectrum F1 0.571 (baseline 0.753)"
-}

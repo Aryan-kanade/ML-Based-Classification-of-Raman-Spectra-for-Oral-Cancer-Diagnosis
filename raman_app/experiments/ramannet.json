@@ -1,6 +1,0 @@
-{
-  "seed": 42,
-  "spectrum_f1_at_0.5": 0.543765524093393,
-  "patient_f1": 0.3882717644019633,
-  "verdict": "RamanNet spectrum F1 0.544 \u00b7 patient F1 0.388 (our CNN was ~0.50)"
-}

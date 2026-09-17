@@ -1,7 +1,0 @@
-label-error review — 18:27:20
-arch: PLS + XGBoost -> Random Forest -> Extra Trees
-rows: 287 · flagged: 2
-  [WARN row map 268 != 287 — tail rows unnamed]
-
-REVIEW  Tumor/TDOC090 Spectra pro/12052026TDOC090TH02.csv given=0 p_self=0.168  looks like 1 p=0.832
-REVIEW  row1                         given=0 p_self=0.236  looks like 1 p=0.764
