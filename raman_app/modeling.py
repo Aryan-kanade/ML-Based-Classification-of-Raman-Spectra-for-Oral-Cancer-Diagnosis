@@ -1490,10 +1490,7 @@ class ModelResult:
     def summary_row(self) -> list[str]:
         def ms(key):
             m, s = self.macro.get(key, (float("nan"), 0.0))
-            # an exactly-zero std is the placeholder for "single pooled
-            # value, no fold spread" (3SSE/restored winners) — show a
-            # dash rather than implying zero variance
-            return f"{m:.3f} ± {s:.3f}" if s else f"{m:.3f} ± –"
+            return fmt_ms(m, s)
         return [self.name, ms("sens"), ms("spec"), ms("f1")]
 
 
@@ -1896,6 +1893,13 @@ def _run_cv_model(name: str, estimator, grid, X, ye, groups_arr,
         if progress:
             progress(f"{name}: FAILED")
     return res, best_tpl
+
+
+def fmt_ms(m: float, s: float) -> str:
+    """'mean ± std' with '–' for a placeholder zero std (a single
+    pooled value — restored / chain winners carry no fold spread), so
+    the screen never implies a variance that was never measured."""
+    return f"{m:.3f} ± {s:.3f}" if s else f"{m:.3f} ± –"
 
 
 def effective_folds(k_folds: int, y, groups=None) -> int:

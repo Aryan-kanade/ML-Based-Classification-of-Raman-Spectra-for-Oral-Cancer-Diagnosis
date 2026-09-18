@@ -2547,13 +2547,19 @@ class MainWindow(QtWidgets.QMainWindow):
         ntxt.setTextFormat(TEXT_RICH)
         nsv.addWidget(ntxt)
         left_col.addWidget(nums, 1)
+        # removed from screen (user request 2026-09-17): the card stays
+        # built (widgets referenced nowhere else) but hidden
+        nums.setVisible(False)
         columns.addLayout(left_col, 3)
 
         # ---- right ~40%: progress + quick actions -----------------------
         right_col = QtWidgets.QVBoxLayout()
         right_col.setSpacing(10)
         # Compute device card (2026-09-08 GPU work): REAL backends from
-        # device_report()/verify_gpu_runtime() — never hardcoded values
+        # device_report()/verify_gpu_runtime() — never hardcoded values.
+        # Removed from screen (user request 2026-09-17); the label is
+        # still updated by update_welcome so anything referencing it
+        # keeps working.
         devc, dv = self.card("Compute device")
         self.w_device_lbl = QtWidgets.QLabel("")
         self.w_device_lbl.setObjectName("CardHint")
@@ -2565,6 +2571,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "CUDA backend is usable).")
         dv.addWidget(self.w_device_lbl)
         right_col.addWidget(devc)
+        devc.setVisible(False)
         prog, pv = self.card("Your progress")
         self.w_lbl_data = QtWidgets.QLabel("")
         self.w_lbl_model = QtWidgets.QLabel("")
@@ -3519,6 +3526,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.b_model_lab.setEnabled(False)      # until data is loaded
         self.b_model_lab.clicked.connect(self.run_model_lab)
         cv.addWidget(self.b_model_lab)
+        # hidden (user request 2026-09-18); the ~15 setText/setEnabled
+        # references elsewhere keep working on the hidden button
+        self.b_model_lab.setVisible(False)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setValue(0)
         cv.addWidget(self.progress)
@@ -3857,6 +3867,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "ms/spectrum.")
         self.b_live.toggled.connect(self._toggle_live_watch)
         g2v.addWidget(self.b_live)
+        self.b_live.setVisible(False)   # hidden (user request 2026-09-18)
         left.addWidget(g2)
         # compact explainer fills the column instead of empty space
         pair, paiv = self.card("How Paired mode works")
@@ -4266,12 +4277,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 4. validation charts (confusion, ROC, calibration, DCA)
         charts, chv = self.card("Validation of the winning model",
-                                "Discrimination, calibration and clinical "
-                                "utility — the TRIPOD+AI triad. Confusion "
-                                "matrix + ROC (binary) or per-class "
-                                "metrics; calibration (reliability) and "
-                                "decision curve when out-of-fold "
-                                "probabilities are available.")
+                                "Confusion matrix + ROC (binary) or "
+                                "per-class metrics for the current "
+                                "winner.")
         grid = QtWidgets.QWidget()
         gl = QtWidgets.QGridLayout(grid)
         gl.setContentsMargins(0, 0, 0, 0)
@@ -4287,9 +4295,16 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.r_roc_canvas = canvas
                 elif (r, c) == (1, 0):
                     self.r_cal_canvas = canvas
+                    self.r_cal_holder = holder
                 else:
                     self.r_dca_canvas = canvas
+                    self.r_dca_holder = holder
         chv.addWidget(grid, 1)
+        # bottom row hidden (user request 2026-09-18): calibration +
+        # decision-curve charts off the screen; the drawing and report
+        # code keeps working (saved reports still embed both figures)
+        self.r_cal_holder.setVisible(False)
+        self.r_dca_holder.setVisible(False)
         v.addWidget(charts, 1)
 
         # 5. plain-language reading + save report
@@ -9955,8 +9970,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for r, c in enumerate(classes):
             per = w.per_class.get(c, {})
             vals = [c, str(int(row_sums[r]))] + [
-                f"{per.get(k, (float('nan'), 0))[0]:.3f} ± "
-                f"{per.get(k, (float('nan'), 0))[1]:.3f}"
+                modeling.fmt_ms(per.get(k, (float('nan'), 0))[0],
+                                per.get(k, (float('nan'), 0))[1])
                 for k in ("sens", "spec", "prec", "f1")]
             for col, v in enumerate(vals):
                 it = QtWidgets.QTableWidgetItem(v)

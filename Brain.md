@@ -4136,7 +4136,7 @@ filled so gui_test [5b]/[216] content + isHidden assertions pass
 All/None buttons kept (hint text references "All").  Gates: test_all
 132/132, gui_test PASS, ruff clean.
 
-## 80. 2026-09-18 — Fast screening DELETED: the search skips nothing
+## 81. 2026-09-18 — Fast screening DELETED: the search skips nothing
 ## (user directive: "no model to skip ... strictly what I give")
 
 User tightened the §77/§78 policy to its maximum: NO skipping at all.
@@ -4159,3 +4159,41 @@ fill logic keeps running behind it; deep_test scenario 9 updated to
 pin "rows fill, card stays hidden, hint text maintained" instead of
 the old visibility.
 Gates: ruff clean, test_all 132/132, gui_test PASS, deep_test 23/23.
+
+## 82. 2026-09-18 — Calibration + decision-curve charts hidden (user
+request)
+
+Screenshot pointed at the bottom row of the "Validation of the winning
+model" card on the Result page.  The (1,0)/(1,1) grid holders are now
+stored (r_cal_holder/r_dca_holder) and setVisible(False); the canvases
+stay alive so all drawing/report code (cal/DCA plot fills, figure
+saving, HTML report embeds) works unchanged.  Card subtitle trimmed to
+"Confusion matrix + ROC" to match what is visible.  (§81 renumbered
+from a duplicate §80 — parallel-session collision.)  Gates: ruff
+clean, test_all 132/132, gui_test PASS, deep_test 23/23.
+
+## 81. 2026-09-18 — d2 champion RE-JUDGED on the current tree: 0.696
+## ± 0.010 — the 0.757 does not survive the missing 50 spectra
+
+User asked whether the restored d2 banner (0.757) is accurate.  It is
+accurate FOR ITS TREE (287/64, verified to 3 decimals against
+winner.json/validated.json).  On the CURRENT 237/55 tree, the same
+architecture (PLS + XGBoost → Random Forest → Extra Trees) through the
+SAME nested-5-fold tuned protocol (validate_arch, seeds 42/43/44):
+seed 42 = 0.685, seed 43 = 0.703, seed 44 = 0.701 → **mean 0.696 ±
+0.010** (AUC 0.756/0.770/0.764).
+
+Comparison on the SAME tree/protocol:
+- d2 chain: 0.696 ± 0.010 (seed-42 draw 0.685)
+- k5 search winner (PCA + XGBoost → Extra Trees → Random Forest):
+  0.743 seed-42 / 0.734 ± 0.017 mean
+→ the new search's winner beats the d2 ARCHITECTURE by ~0.04-0.05 on
+today's data; and the missing ~50 spectra cost the d2 chain ~0.06
+(0.757 → 0.685 same-seed).  The GUI's d2 restore now UNDERSTATES the
+current tree's best: users should prefer a fresh search on the
+current data.  (One-off driver _rejudge_d2.py — not committed;
+protocol recorded here.)
+
+Also: per-class metrics table now uses modeling.fmt_ms — placeholder
+zero-stds render "± –" like the comparison table (was "± 0.000").
+Gates: ruff clean, test_all 132/132, gui_test PASS.
