@@ -1892,7 +1892,7 @@ def test_3sse_fair_singles_match_train_page():
     the Single Models tab shows the same number a plain training run
     shows in the same mode (2026-09-08 'why different values' fix).
     Results are an ADDITIVE metrics_fair key — error rows untouched,
-    fast screening skips the pass, the dialog ranks singles by it."""
+    the dialog ranks singles by it."""
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     _qt_app_styled()
     import gui
@@ -1935,12 +1935,6 @@ def test_3sse_fair_singles_match_train_page():
         [{**s, "metrics": s.get("metrics", {})} for s in singles
          if "error" not in s], 1)
     assert len(legacy) == 2 and legacy[0][3] == "0.200"
-    # fast screening skips the pass entirely
-    w_fast = gui.SeqSearchWorker(X, y, groups, None, model_names=names,
-                                 k=3, seed=7, fast=True)
-    fresh = [dict(s) for s in singles]
-    w_fast._fair_singles(fresh)
-    assert not any("metrics_fair" in r for r in fresh)
 
 
 def test_settings_mode_roundtrip():

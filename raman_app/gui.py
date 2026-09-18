@@ -357,14 +357,13 @@ class SeqSearchWorker(QtCore.QThread):
     failed = Signal(str)
 
     def __init__(self, X, y, groups, wavenumbers, model_names, k=3,
-                 seed=42, top=20, fast=False, resume_path=None,
+                 seed=42, top=20, resume_path=None,
                  repeats=1, parent=None):
         super().__init__(parent)
         self.X, self.y, self.groups = X, y, groups
         self.wavenumbers = wavenumbers
         self.model_names = model_names
         self.k, self.seed, self.top = k, seed, top
-        self.fast = fast
         self.resume_path = resume_path
         self.repeats = repeats
         self._cancel = threading.Event()
@@ -384,8 +383,6 @@ class SeqSearchWorker(QtCore.QThread):
         (screening) and is untouched. Pairs/triples stay screening
         estimates by design (nested-tuning the whole chain space would
         take days); their honest numbers live in the Winner tab."""
-        if self.fast:              # quick-estimate mode: skip the pass
-            return singles
         import modeling
         rows = [r for r in singles
                 if isinstance(r.get("arch"), list) and len(r["arch"]) == 1
@@ -449,16 +446,14 @@ class SeqSearchWorker(QtCore.QThread):
                 self.search_progress.emit(done, total, best, f1, eta)
 
             names = self.model_names
-            k_eff, cnn_eff = self.k, 15
-            if self.fast:               # quick screening preset
-                names = [n for n in names
-                         if n not in sequential.SLOW_MODELS]
-                k_eff, cnn_eff = 2, 8
+            # user directive 2026-09-18: the search takes EVERY checked
+            # model at EXACTLY the spinner folds — no fast preset, no
+            # model skipping, no fold cap anywhere
             board = sequential.search(
                 self.X, self.y, groups=self.groups,
-                wavenumbers=self.wavenumbers, k=k_eff, seed=self.seed,
+                wavenumbers=self.wavenumbers, k=self.k, seed=self.seed,
                 top=self.top, model_names=names,
-                cnn_epochs=cnn_eff, resume_path=self.resume_path,
+                cnn_epochs=15, resume_path=self.resume_path,
                 progress_cb=prog, cancel_check=self._cancel.is_set,
                 leaderboard_cb=lambda t5: self.leaderboard.emit(t5))
         except _cancelled:
@@ -467,14 +462,13 @@ class SeqSearchWorker(QtCore.QThread):
         except Exception:
             self.failed.emit(traceback.format_exc())
             return
-        if not self.fast:
+        try:
             # singles tab shows Train-page-identical numbers (fair
-            # nested+tuned CV); fast screening = quick estimates only
-            try:
-                board["singles"] = self._fair_singles(board.get("singles",
-                                                                []))
-            except Exception:
-                FILE_LOG.exception("fair singles pass failed (skipped)")
+            # nested+tuned CV)
+            board["singles"] = self._fair_singles(board.get("singles",
+                                                            []))
+        except Exception:
+            FILE_LOG.exception("fair singles pass failed (skipped)")
         try:
             validated = sequential.validate_top(
                 board, self.X, self.y, self.groups, self.wavenumbers,
@@ -482,7 +476,7 @@ class SeqSearchWorker(QtCore.QThread):
                 progress=lambda m: self.progress.emit(-1, m))
             winner = sequential.finalize_winner(
                 validated, self.X, self.y, self.groups,
-                self.wavenumbers, board=board, k=k_eff, seed=self.seed)
+                self.wavenumbers, board=board, k=self.k, seed=self.seed)
             sig = sequential.significance_of(
                 validated, winner, board, self.X, self.y, self.groups,
                 self.wavenumbers, seed=self.seed,
@@ -508,7 +502,7 @@ class SeqSearchWorker(QtCore.QThread):
                 except OSError:
                     pass
             self.done.emit({"board": board, "validated": validated,
-                            "winner": winner, "k": k_eff,
+                            "winner": winner, "k": self.k,
                             "seed": self.seed, "groups": self.groups,
                             "significance": sig,
                             "fair_failed": getattr(self, "fair_failed",
@@ -1334,7 +1328,8 @@ class SeqResultsDialog(QtWidgets.QDialog):
         # the Single Models tab provenance must match its numbers:
         # fair = re-scored with the Train-page protocol; restored =
         # the run's own nested-VALIDATED singles (not screening);
-        # otherwise (fast screening) they really are screening estimates
+        # otherwise (fair re-score failed) they really are screening
+        # estimates — the note above says so
         fair = any(isinstance(e.get("metrics_fair"), dict)
                    for e in board["singles"]) if board["singles"] else False
         restored_singles = bool(payload.get("restored"))
@@ -1352,9 +1347,9 @@ class SeqResultsDialog(QtWidgets.QDialog):
              "NESTED-VALIDATED numbers (tuned hyperparameters), not "
              "screening estimates."
              if restored_singles else
-             "Single Models tab: this run used FAST SCREENING — these "
-             "are screening estimates, not the Train-page-identical "
-             "nested numbers (run a full search for those).")
+             "Single Models tab: these are screening estimates at "
+             "default hyperparameters — run a full search to get the "
+             "Train-page-identical nested numbers for every model.")
             + (" A '*' marks a model whose fair re-score failed — its "
                "row shows the screening number instead."
                if fair and any(
@@ -3336,15 +3331,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # gui_test asserts its label and startup calls restore_last_3sse
         self.b_3sse_restore.setVisible(False)
         run_row = QtWidgets.QHBoxLayout()
-        self.chk_3sse_fast = QtWidgets.QCheckBox(
-            "Fast screening (skip slow models)")
-        self.chk_3sse_fast.setToolTip(
-            "Quick preset: 2-fold screening, the FOUR slowest models "
-            "skipped (both 1D-CNNs, CatBoost, XGBoost) and 8-epoch CNN "
-            "fits — several times faster, good for exploration; "
-            "uncheck for the full search.")
-        self.chk_3sse_fast.toggled.connect(self._update_seq_card)
-        run_row.addWidget(self.chk_3sse_fast)
         self.b_3sse_cancel = QtWidgets.QPushButton("Cancel search")
         self.b_3sse_cancel.setToolTip(
             "Stop the search. Finished architectures are kept in the "
@@ -3440,6 +3426,10 @@ class MainWindow(QtWidgets.QMainWindow):
             b.clicked.connect(
                 lambda _=False, p=preset: self._apply_model_preset(p))
             sel_row.addWidget(b)
+            # hidden (user request 2026-09-18): Classical/Proven/Fast off
+            # the screen; All/None stay (hint text references "All")
+            if preset not in ("all", "none"):
+                b.setVisible(False)
         # the 2026-09-08 protocol that DISPLAYED 0.83 (user request:
         # reproduce the old numbers) — one click sets mode, params,
         # folds/repeats and models; numbers land in the banner labeled
@@ -3457,6 +3447,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "spectra that run included.")
         b_legacy.clicked.connect(self._apply_legacy_preset)
         sel_row.addWidget(b_legacy)
+        b_legacy.setVisible(False)   # hidden (user request 2026-09-18)
         sel_row.addStretch(1)
         cv.addLayout(sel_row)
         self._models_changed()               # initial counter + 3SSE card
@@ -4152,6 +4143,8 @@ class MainWindow(QtWidgets.QMainWindow):
         tnowv.addWidget(self.r_tnow_hint)
         self.r_tnow_card = tnow
         v.addWidget(tnow)
+        self.r_tnow_card.setVisible(False)   # hidden (user request
+        # 2026-09-18); the table is still filled so reports/tests work
 
         # 2c. historical record card — the REAL 2026-09-08 numbers the
         # user remembers (imported from the archived copy), displayed
@@ -4183,7 +4176,8 @@ class MainWindow(QtWidgets.QMainWindow):
         histv.addWidget(self.r_hist_hint)
         self.r_hist_card = hist
         self._legacy_record = legacy
-        hist.setVisible(legacy is not None)
+        hist.setVisible(False)   # hidden (user request 2026-09-18);
+        # was setVisible(legacy is not None)                still filled
         v.addWidget(hist)
 
         # 3. prediction details + distribution chart
@@ -4267,6 +4261,8 @@ class MainWindow(QtWidgets.QMainWindow):
         patv.addWidget(self.r_pat_hint)
         self.r_pat_card = pat
         v.addWidget(pat, 1)
+        self.r_pat_card.setVisible(False)   # hidden (user request
+        # 2026-09-18); fill logic keeps running harmlessly
 
         # 4. validation charts (confusion, ROC, calibration, DCA)
         charts, chv = self.card("Validation of the winning model",
@@ -8942,7 +8938,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._seq_worker = SeqSearchWorker(
                 X, yy, gg, wn_for_models, model_names=names,
                 k=self.spin_folds.value(), seed=self.spin_seed.value(),
-                fast=self.chk_3sse_fast.isChecked(),
                 repeats=3 if self.chk_repeat.isChecked() else 1,
                 resume_path=os.path.join(APP_DIR, "study_run_3sse",
                                          "archs.jsonl"))
@@ -9409,18 +9404,14 @@ class MainWindow(QtWidgets.QMainWindow):
             cb.setChecked(pick(name))
 
     def _seq_effective_models(self) -> list[str]:
-        """Checked models, minus the fast-screening skips."""
-        import sequential
-        checked = [n for n, cb in self.model_checks.items()
-                   if cb.isChecked()]
-        if self.chk_3sse_fast.isChecked():
-            checked = [n for n in checked
-                       if n not in sequential.SLOW_MODELS]
-        return checked
+        """Every checked model — the search skips none of them
+        (user directive 2026-09-18: Fast screening removed)."""
+        return [n for n, cb in self.model_checks.items()
+                if cb.isChecked()]
 
     def _update_seq_card(self, *_args):
         """Refresh the 3SSE card: architecture counts + rough time
-        estimate for the currently checked (and fast-filtered) models."""
+        estimate for the currently checked models."""
         checked = self._seq_effective_models()
         base = [n for n in checked if n != "Ensemble (top-3)"]
         n = len(base) + (1 if "Ensemble (top-3)" in checked else 0)
@@ -9439,13 +9430,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.seq_counts.setStyleSheet("")
         self.b_3sse_run.setEnabled(True)
-        k = 2 if self.chk_3sse_fast.isChecked() else (
-            self.spin_folds.value()
-            if hasattr(self, "spin_folds") else 5)
+        k = (self.spin_folds.value()
+             if hasattr(self, "spin_folds") else 5)
         # calibrated on the measured full run (4,369 @ 2-FOLD screening
-        # ≈ 55 min → ~0.38 s per arch·fold) — screening now runs at the
-        # TRUE selected k (the old silent 2-fold cap is gone), so the
-        # honest divisor is 159, rounded to 160.  Validation adds ~25.
+        # ≈ 55 min → ~0.38 s per arch·fold) — screening runs at the
+        # TRUE selected k, so the honest divisor is 159, rounded to 160.
+        # Validation adds ~25.
         est_min = total_arch * k / 160 + 60 * 0.4
         data_note = {
             "standard": "UNPAIRED standard spectra",
@@ -9454,8 +9444,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if (self.data_mode() != "standard"
                 and self.groups is None):
             data_note += " — no patient groups loaded, training would stop"
-        fast_note = (" · FAST: 2-fold, slow models skipped"
-                     if self.chk_3sse_fast.isChecked() else "")
         # measured cost of the weak families (§57/§62): an all-25
         # Paired+PQN search wasted hours on the CNNs/TabPFN and picked
         # a 0.63 chain — say so BEFORE the hours are spent
@@ -9475,7 +9463,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"(ordered, no repeats; probabilities chained between "
             f"layers, patient-grouped OOF; three-model evaluation is "
             f"beamed to the top 50 pairs). Will run on {data_note}"
-            f"{fast_note}{weak_note}.")
+            f"{weak_note} at exactly {k} folds — every checked model "
+            "runs, none skipped.")
         self.seq_estimate.setText(
             f"Rough time estimate: ≈ {est_min:.0f} min "
             "(screening + nested validation + significance tests; "
