@@ -4123,3 +4123,39 @@ this tree.  Artifacts: study_run_3sse_k5/{report.txt, validated.json,
 winner.json, winner.joblib, significance.json, screening.jsonl,
 run_meta.json}.  GUI auto-restore still prefers d2 (0.757 > 0.743) —
 different-tree comparison, restore labels it.
+
+## 80. 2026-09-18 — Four more UI elements hidden (user request)
+
+Screenshots pointed at: the Train preset row (Classical/⭐Proven/Fast/
+⏳Legacy), "Then vs now" card, "Historical record (2026-09-08)" card,
+"Patient verdicts" card.  All hidden setVisible(False), nothing
+deleted: preset handlers stay (tests call them directly; ⭐Proven is
+still the checkbox startup default), tnow/hist/pat tables keep being
+filled so gui_test [5b]/[216] content + isHidden assertions pass
+(hist was already conditional on a legacy file; now always hidden).
+All/None buttons kept (hint text references "All").  Gates: test_all
+132/132, gui_test PASS, ruff clean.
+
+## 80. 2026-09-18 — Fast screening DELETED: the search skips nothing
+## (user directive: "no model to skip ... strictly what I give")
+
+User tightened the §77/§78 policy to its maximum: NO skipping at all.
+The "Fast screening (skip slow models)" checkbox and the entire
+SeqSearchWorker fast path are REMOVED (commit a997620 + deep_test fix):
+- The GUI 3SSE search now ALWAYS runs every checked model at EXACTLY
+  the Train-page folds spinner value (screening k = k_outer = spinner;
+  cnn_epochs 15; fair-singles re-score always runs).  Worker payload
+  k=self.k; finalize_winner(k=self.k).
+- Previously Fast = 2-fold screening, both CNNs + CatBoost + XGBoost
+  dropped from the space, 8-epoch CNNs — an opt-in but still a skip.
+- The "Fast" preset BUTTON stays (it only pre-selects checkboxes
+  visibly; the user sees and controls the set — like Classical).
+- test_all: the fast-skip assertion block removed; dialog fallback
+  note reworded (no longer blames "FAST SCREENING").
+Swept in the same commit (user's own live edit, confirmed intended):
+Result-page per-patient verdicts CARD hidden at construction
+(r_pat_card.setVisible(False), "hidden (user request 2026-09-18)") —
+fill logic keeps running behind it; deep_test scenario 9 updated to
+pin "rows fill, card stays hidden, hint text maintained" instead of
+the old visibility.
+Gates: ruff clean, test_all 132/132, gui_test PASS, deep_test 23/23.

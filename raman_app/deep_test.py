@@ -434,17 +434,22 @@ def main() -> int:
         got = [win.r_pred_table.item(r, 2).text() for r in range(4)]
         assert got == expect, (got, expect, lo, hi)
         assert win.r_pat_table.rowCount() == 2
-        assert win.r_pat_table.isVisibleTo(win.stack)
+        # the per-patient verdicts CARD is hidden (user request
+        # 2026-09-18) — fill logic keeps running behind it; assert the
+        # table stays populated and the card stays hidden
+        assert not win.r_pat_card.isVisibleTo(win.stack)
+        assert win.r_pat_table.rowCount() == 2
         assert win.r_spec_card.isVisibleTo(win.stack)
         bar = win.r_pred_table.cellWidget(0, 3)
         assert isinstance(bar, QtWidgets.QProgressBar)
         assert bar.value() == 950
         assert win.r_cal_canvas is not None        # calibration chart exists
-        # empty patients -> table hidden, hint kept (flat-folder case)
+        # empty patients -> rows cleared, hint text maintained, card
+        # still hidden (flat-folder case)
         win._patient_rows = []
         win.render_result_page()
         assert not win.r_pat_table.isVisibleTo(win.stack)
-        assert win.r_pat_hint.isVisibleTo(win.stack)
+        assert win.r_pat_hint.text()
         # no full probs -> meter hidden again, spectra overlay stays
         win._pred_probs = []
         win.render_result_page()
