@@ -4172,7 +4172,7 @@ saving, HTML report embeds) works unchanged.  Card subtitle trimmed to
 from a duplicate §80 — parallel-session collision.)  Gates: ruff
 clean, test_all 132/132, gui_test PASS, deep_test 23/23.
 
-## 81. 2026-09-18 — d2 champion RE-JUDGED on the current tree: 0.696
+## 83. 2026-09-18 — d2 champion RE-JUDGED on the current tree: 0.696
 ## ± 0.010 — the 0.757 does not survive the missing 50 spectra
 
 User asked whether the restored d2 banner (0.757) is accurate.  It is
@@ -4197,3 +4197,28 @@ protocol recorded here.)
 Also: per-class metrics table now uses modeling.fmt_ms — placeholder
 zero-stds render "± –" like the comparison table (was "± 0.000").
 Gates: ruff clean, test_all 132/132, gui_test PASS.
+
+## 84. 2026-09-18 — Model Lab + Live folder buttons hidden (user
+request)
+
+"⚡ Model Lab (one click)" (b_model_lab, Train page) and "⏺ Live
+folder" (b_live, Predict page) now setVisible(False) right after
+construction.  Nothing deleted: the ~15 b_model_lab setText/
+setEnabled state sites keep working on the hidden button (cancel
+semantics intact if ever re-shown), b_live's only other reference is
+setChecked(False) inside _toggle_live_watch, and test_all:4146
+exercises that handler directly.  Model Lab's GUI entry is now solely
+this hidden button (restored-run panels unaffected).  (§83 renumbered
+from a duplicate §81 — second parallel-session collision.)  Gates:
+ruff clean, test_all 132/132, gui_test PASS, deep_test 23/23.
+
+## 74. 2026-09-17 — Start page: Compute device + "Which number is
+## which?" cards removed from screen (user request)
+
+Both cards hidden at construction (setVisible(False), hide-not-delete
+convention): the Compute device label is still updated by
+update_welcome (device probing unchanged — RAMAN_DEVICE/auto/gpu
+behavior intact, just not displayed), and the numbers explainer stays
+in the code.  Verified visibility-correct offscreen (isVisible, not
+findChildren); Walkthrough card unaffected.  Gates: 132/132, gui
+PASS, deep 23/23, ruff clean.
