@@ -4291,8 +4291,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 gl.addWidget(holder, r, c)
                 if (r, c) == (0, 0):
                     self.r_cm_canvas = canvas
+                    self.r_cm_holder = holder
                 elif (r, c) == (0, 1):
                     self.r_roc_canvas = canvas
+                    self.r_roc_holder = holder
                 elif (r, c) == (1, 0):
                     self.r_cal_canvas = canvas
                     self.r_cal_holder = holder
@@ -4305,6 +4307,20 @@ class MainWindow(QtWidgets.QMainWindow):
         # code keeps working (saved reports still embed both figures)
         self.r_cal_holder.setVisible(False)
         self.r_dca_holder.setVisible(False)
+        # prediction graph replaces the trained-model charts on screen
+        # (user request 2026-09-18): the distribution canvas moves into
+        # the top row; cm/ROC canvases stay alive for reports/figures
+        self.r_cm_holder.setVisible(False)
+        self.r_roc_holder.setVisible(False)
+        gl.addWidget(dh, 0, 0, 1, 2)
+        dist.setVisible(False)          # shell emptied by the move above
+        for _lbl in charts.findChildren(QtWidgets.QLabel):
+            if _lbl.objectName() == "CardHeader":
+                _lbl.setText("Prediction distribution")
+            elif _lbl.objectName() == "CardHint":
+                _lbl.setText("Left: predicted class counts · right: "
+                             "per-spectrum P(positive) with the decision "
+                             "threshold (binary models).")
         v.addWidget(charts, 1)
 
         # 5. plain-language reading + save report
@@ -8878,8 +8894,8 @@ class MainWindow(QtWidgets.QMainWindow):
             n_before = len(yy)
             X = np.vstack([X[rows].mean(axis=0)
                            for rows in agg.values()])
-            yy = [lab for (_pat, lab) in agg.keys()]
-            gg = [pat for (pat, _lab) in agg.keys()]
+            yy = [lab for (_pat, lab) in agg]
+            gg = [pat for (pat, _lab) in agg]
             self.log(f"Averaged replicates: {len(agg)} (patient, class) "
                      f"rows from {n_before} spectra")
         # OOF-row -> Data-table-row map for the label-error review: only

@@ -4222,3 +4222,52 @@ behavior intact, just not displayed), and the numbers explainer stays
 in the code.  Verified visibility-correct offscreen (isVisible, not
 findChildren); Walkthrough card unaffected.  Gates: 132/132, gui
 PASS, deep 23/23, ruff clean.
+
+## 85. 2026-09-18 — Prediction graph replaces the trained-model
+charts on the Result page (user request)
+
+User: "show graph on prediction, not on trained model".  The
+prediction-distribution canvas (dh/dist_canvas) moved out of its
+side card into the top row of the "Validation" card's chart grid
+(gl.addWidget(dh, 0, 0, 1, 2)); cm/ROC holders (r_cm_holder/
+r_roc_holder now stored) hidden like cal/DCA before them — all four
+trained-model canvases stay alive so plot fills, Save figures and
+the HTML report embeds are unchanged.  The emptied "Prediction
+distribution" card shell is hidden; the chart card is retitled
+"Prediction distribution" (CardHeader/CardHint setText), which also
+auto-skips the "Validation" anchor pill.  Gates: ruff clean,
+test_all 132/132, gui_test PASS, deep_test 23/23.
+
+## 82. 2026-09-18 — test-campaign fixes: AveragedChain bundles, bench
+## protocol, silent-error logging (5-terminal campaign follow-up)
+
+From TEST_REPORT_2026-09-18.md (5 terminals: units+coverage 132/132
+@71%, CLI sweep, static, gui/deep suites, stress A PASS — commit
+38fbfe7 + this):
+- **F1 (bug, fixed)**: modeling.load_bundle registered only
+  SequentialChain/_SpectralSlice on __main__; finalize_winner now
+  builds AveragedChain → every CLI-saved winner.joblib (incl. the k5
+  run) crashed validate_external with AttributeError.  Fixed +
+  regression test that replays the exact __main__-pickled bytes.
+- **F6**: effective_folds + fmt_ms have direct tests.  Suite 132→134.
+- **F2 (partially fixed)**: bench passed k=5 → since §77 that is
+  really 5 folds (was silently 2).  Now passes k=2 explicitly,
+  restoring its documented 2-fold-ladder protocol AND score
+  comparability.  MEASURED on the current tree: baselines stage alone
+  27.6 min (CatBoost grid dominates), screening at k=2 >33 min when
+  killed (the 2026-09-12 warm-cutoff removal runs every beam triple at
+  full folds) — bench quick is a ~1 h benchmark; docstring says so.
+  The old "~2-4 min" claim predates both changes.  Deeper bench
+  redesign (subsampled triples / --quick) deliberately NOT done —
+  it would change the fixed protocol.
+- **F3 (targeted)**: report-writer except:pass handlers +
+  ui_helpers.save_settings now print what they skipped (silently
+  missing report sections / invisible settings-save failures).  The
+  remaining ~57 except:pass sites were reviewed and are deliberate
+  control-flow probes (optional imports, attribute probes, best-effort
+  cleanup) — left as-is on purpose.
+- **F4 partial**: 3 safe ruff auto-fixes (SIM118/SIM300).  The other
+  ~107 strict findings (E741 names, SIM105/115) left — churn without
+  behavior gain.  **F5** session.log rotation race: real fix is a
+  logging redesign; suites stay serialized (known limitation).
+Gates: ruff clean, test_all 134/134, gui_test PASS, deep_test 23/23.

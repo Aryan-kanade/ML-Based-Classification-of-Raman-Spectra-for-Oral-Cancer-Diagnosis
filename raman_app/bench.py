@@ -7,11 +7,14 @@ records its measured delta here (see Brain.md §13).
 Usage:
     python bench.py             # baselines (5 models, 5-fold) +
                                 # 3SSE screening (10 models, 2-fold
-                                # ladder, beam 50) — expect 15-30 min
-                                # on the current tree (2026-09-18
-                                # campaign measurement; the old
-                                # "~2-4 min" claim was never true
-                                # on this machine)
+                                # ladder, beam 50) — MEASURED on the
+                                # 2026-09-18 tree: baselines alone
+                                # 27.6 min (CatBoost grid dominates),
+                                # screening >33 min when killed
+                                # (2026-09-12 warm-cutoff removal
+                                # runs every beam triple at full
+                                # folds) — budget ~1 h.  The original
+                                # "~2-4 min" claim predates both.
     python bench.py --full      # + nested validation + LOPO + winner
 Writes bench/latest.json (and prints the table).
 """
