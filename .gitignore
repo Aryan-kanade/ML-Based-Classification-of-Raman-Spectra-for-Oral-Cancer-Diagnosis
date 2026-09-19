@@ -49,3 +49,6 @@ pro_fixed/
 # external reference clones (kept on disk, not part of the repo)
 ponytail/
 strix/
+
+# coverage test artifact
+.coverage

@@ -3096,6 +3096,59 @@ def test_standard_tuned_preset_and_defaults():
     assert st.norm == "none" and st.wn_calibrate
 
 
+def test_load_bundle_registers_cli_chain_classes():
+    """CLI-saved bundles (python sequential.py) pickle their chain
+    classes as __main__.* — load_bundle must register ALL of them,
+    including AveragedChain (2026-09-18 campaign: the k5 winner.joblib
+    crashed validate_external with AttributeError because only
+    SequentialChain/_SpectralSlice were registered)."""
+    import io
+    import pickle
+    import joblib
+    import __main__ as _main
+    import modeling
+    import sequential as seq
+    for name in ("SequentialChain", "_SpectralSlice", "AveragedChain"):
+        assert hasattr(seq, name), name
+        if hasattr(_main, name):
+            delattr(_main, name)
+    bundle_path = os.path.join(tempfile.mkdtemp(), "cli_bundle.joblib")
+    joblib.dump({"model_name": "cli-sim"}, bundle_path)
+    modeling.load_bundle(bundle_path)
+    for name in ("SequentialChain", "_SpectralSlice", "AveragedChain"):
+        assert getattr(_main, name) is getattr(seq, name), name
+    # end-to-end: a pickle that records the class as __main__.AveragedChain
+    # (exactly what a `python sequential.py` save produces) must load
+    chain = seq.AveragedChain([], k=2, seed=1)
+    raw = io.BytesIO()
+    pickle.dump(chain, raw, protocol=5)
+    cli_bytes = raw.getvalue().replace(
+        b"\x8c\nsequential\x94\x8c\rAveragedChain\x94",
+        b"\x8c\x08__main__\x94\x8c\rAveragedChain\x94")
+    assert b"\x8c\x08__main__\x94\x8c\rAveragedChain\x94" in cli_bytes
+    cli_path = os.path.join(os.path.dirname(bundle_path), "cli_chain.joblib")
+    with open(cli_path, "wb") as fh:
+        fh.write(cli_bytes)
+    loaded = modeling.load_bundle(cli_path)
+    assert isinstance(loaded, seq.AveragedChain)
+
+
+def test_effective_folds_and_fmt_ms():
+    """The GUI's fold-honesty helper mirrors evaluate_models' clip, and
+    fmt_ms renders placeholder zero-stds as a dash (2026-09-17/18)."""
+    y = ["A"] * 3 + ["B"] * 30            # smallest class has 3
+    assert modeling.effective_folds(10, y) == 3
+    assert modeling.effective_folds(2, y) == 2
+    assert modeling.effective_folds(10, y + y[:2], groups=None) == 5
+    yy = ["A"] * 20 + ["B"] * 20
+    gg = [f"P{i}" for i in range(4)] * 10
+    assert modeling.effective_folds(10, yy, gg) == 4      # subject-limited
+    assert modeling.effective_folds(5, yy, gg) == 4
+    assert modeling.effective_folds(3, yy, gg) == 3
+    assert modeling.fmt_ms(0.7568, 0.014) == "0.757 ± 0.014"
+    assert modeling.fmt_ms(0.7568, 0.0) == "0.757 ± –"
+
+
 def test_proven_preset_and_stability_defaults():
     """§57 (2026-09-15): '⭐ Proven' checks exactly the d2-proven
     families (registry minus the measured-weak 7); Repeat-CV ×3 and

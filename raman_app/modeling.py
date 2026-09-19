@@ -2638,7 +2638,8 @@ def load_bundle(path: str) -> dict:
     except ImportError:
         _seq = None
     if _seq is not None:
-        for _name in ("SequentialChain", "_SpectralSlice"):
+        for _name in ("SequentialChain", "_SpectralSlice",
+                      "AveragedChain"):
             if hasattr(_seq, _name) and not hasattr(_main, _name):
                 setattr(_main, _name, getattr(_seq, _name))
     return joblib.load(path)
@@ -3199,13 +3200,15 @@ def export_model_card(path: str, winner, params=None,
                       "\n".join(f"{k} = {v}" for k, v in
                                 _asdict(params.validate()).items()),
                       "```", ""]
-        except Exception:
-            pass
+        except Exception as exc:
+            # a silently-missing section reads as data loss — say the
+            # section was skipped and why (§82 campaign fix)
+            print(f"[report] Preprocessing section skipped: {exc}")
     lines += ["## Performance (out-of-fold, pooled)"]
     try:
         lines.append(f"- macro-F1: **{w.macro_f1():.3f}**")
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[report] headline-F1 line skipped: {exc}")
     if nested is not None:
         lines.append(
             f"- Honest (nested) macro-F1: **{nested[0]:.3f} ± "
@@ -3225,8 +3228,8 @@ def export_model_card(path: str, winner, params=None,
                 lines.append(
                     f"  - **{cls}**: sens {_ms(m, 'sens')} · "
                     f"spec {_ms(m, 'spec')} · F1 {_ms(m, 'f1')}")
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[report] per-class section skipped: {exc}")
     try:
         ye = np.asarray(w.y_true_encoded)
         valid = ~np.isnan(w.oof_proba[:, 1])
@@ -3247,8 +3250,8 @@ def export_model_card(path: str, winner, params=None,
             f"- AUC power: detectable AUC at 80% power = "
             f"{pw['detectable_auc_80pct']:.3f} "
             f"(n+ {n_pos} / n− {n_neg}; {n_txt})")
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[report] AUC-power section skipped: {exc}")
     lines += ["", "## Limitations",
               "- Single-center development; no external cohort "
               "validation yet (TRIPOD+AI gap).",

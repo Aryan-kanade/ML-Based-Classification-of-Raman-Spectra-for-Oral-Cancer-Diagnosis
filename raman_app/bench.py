@@ -5,7 +5,13 @@ before/after deltas are apples-to-apples.  Every change in the program
 records its measured delta here (see Brain.md §13).
 
 Usage:
-    python bench.py             # quick: ~2-4 min — baselines + screening
+    python bench.py             # baselines (5 models, 5-fold) +
+                                # 3SSE screening (10 models, 2-fold
+                                # ladder, beam 50) — expect 15-30 min
+                                # on the current tree (2026-09-18
+                                # campaign measurement; the old
+                                # "~2-4 min" claim was never true
+                                # on this machine)
     python bench.py --full      # + nested validation + LOPO + winner
 Writes bench/latest.json (and prints the table).
 """
@@ -117,8 +123,12 @@ def main(argv=None) -> int:
 
     # ---- 3SSE screening with the speed engine (beam, 2-fold ladder) ---
     def _screen():
+        # k=2 IS bench's documented protocol (see the section comment).
+        # Before the 2026-09-17 honest-folds fix, k=5 silently screened
+        # at 2 folds; passing 2 explicitly keeps the same numbers AND
+        # the same runtime (Brain.md §82).
         return seq.search(X, list(y), groups=g, wavenumbers=wn,
-                          k=5, seed=args.seed, top=10,
+                          k=2, seed=args.seed, top=10,
                           model_names=SEARCH_MODELS)
     board = _stage(out, f"3SSE screening ({len(SEARCH_MODELS)} models, "
                         f"beam 50)", _screen)

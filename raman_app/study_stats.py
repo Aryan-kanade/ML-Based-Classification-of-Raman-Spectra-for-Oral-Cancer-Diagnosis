@@ -536,7 +536,7 @@ def patient_level_metrics(y, groups, oof_proba) -> dict | None:
     P = np.vstack(p_pat)
     Y = np.array(y_pat)
     out = {"n_patients": int(len(Y)),
-           "n_correct": int((Y == P.argmax(axis=1)).sum()),
+           "n_correct": int((P.argmax(axis=1) == Y).sum()),
            "f1": float(f1_score(Y, P.argmax(axis=1), average="macro"))}
     if len(classes) == 2 and len(set(Y.tolist())) == 2:
         try:

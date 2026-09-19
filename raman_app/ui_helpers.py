@@ -447,5 +447,7 @@ def save_settings(settings: dict) -> None:
     try:
         with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
             json.dump(settings, fh, indent=2)
-    except Exception:
-        pass
+    except OSError as exc:
+        # a failed save must not be invisible: the user believes their
+        # session persists when it does not (§82 campaign fix)
+        print(f"[settings] save failed: {exc}")
